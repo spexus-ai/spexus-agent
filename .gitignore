@@ -1,0 +1,10 @@
+bin/
+task-reports/
+
+*.db
+*.sqlite
+*.sqlite3
+
+.DS_Store
+
+.codex
