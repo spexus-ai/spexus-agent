@@ -92,8 +92,8 @@ func TestCLIAdapterEnsuresAndReusesSessionForPromptDispatch(t *testing.T) {
 		t.Fatalf("runner calls = %d, want %d", got, want)
 	}
 
-	wantEnsure := []string{"--format", "json", "--json-strict", "codex", "sessions", "ensure", "--name", "slack-1713686400.000100"}
-	wantPrompt := []string{"--format", "json", "--json-strict", "codex", "prompt", "-s", "slack-1713686400.000100", "root message"}
+	wantEnsure := []string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "ensure", "--name", "slack-1713686400.000100"}
+	wantPrompt := []string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", "slack-1713686400.000100", "root message"}
 	if fmt.Sprint(runner.calls[0].args) != fmt.Sprint(wantEnsure) {
 		t.Fatalf("first call args = %#v, want %#v", runner.calls[0].args, wantEnsure)
 	}
@@ -109,7 +109,7 @@ func TestCLIAdapterEnsuresAndReusesSessionForPromptDispatch(t *testing.T) {
 	if fmt.Sprint(runner.calls[2].args) != fmt.Sprint(wantEnsure) {
 		t.Fatalf("third call args = %#v, want %#v", runner.calls[2].args, wantEnsure)
 	}
-	if fmt.Sprint(runner.calls[3].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "codex", "prompt", "-s", "slack-1713686400.000100", "thread reply"}) {
+	if fmt.Sprint(runner.calls[3].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", "slack-1713686400.000100", "thread reply"}) {
 		t.Fatalf("fourth call args = %#v, want thread reply prompt", runner.calls[3].args)
 	}
 }
@@ -143,10 +143,10 @@ func TestCLIAdapterStatusAndCancelResolveThreadSession(t *testing.T) {
 		t.Fatalf("runner calls = %d, want %d", got, want)
 	}
 
-	if fmt.Sprint(runner.calls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "codex", "status", "-s", "slack-1713686400.000100"}) {
+	if fmt.Sprint(runner.calls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "status", "-s", "slack-1713686400.000100"}) {
 		t.Fatalf("status call args = %#v, want status session args", runner.calls[0].args)
 	}
-	if fmt.Sprint(runner.calls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "codex", "cancel", "-s", "slack-1713686400.000100"}) {
+	if fmt.Sprint(runner.calls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "cancel", "-s", "slack-1713686400.000100"}) {
 		t.Fatalf("cancel call args = %#v, want cancel session args", runner.calls[1].args)
 	}
 }

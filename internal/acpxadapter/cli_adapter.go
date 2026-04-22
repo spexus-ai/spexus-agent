@@ -145,7 +145,9 @@ func (a *CLIAdapter) run(ctx context.Context, dir string, args ...string) (strin
 		runner = execRunner{}
 	}
 
-	commandArgs := append([]string{"--format", "json", "--json-strict"}, args...)
+	// Slack runtime runs ACPX non-interactively, so command/tool permissions must
+	// be pre-approved or ACPX will fail the turn with PERMISSION_DENIED.
+	commandArgs := append([]string{"--format", "json", "--json-strict", "--approve-all"}, args...)
 	return runner.Run(ctx, a.binary, commandArgs, dir)
 }
 

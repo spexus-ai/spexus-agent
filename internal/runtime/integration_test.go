@@ -249,19 +249,19 @@ func TestSlackEventDispatchPersistsSQLiteStateAndRendersACPXOutput(t *testing.T)
 	if got, want := len(gotCalls), 4; got != want {
 		t.Fatalf("ACPX runner call count = %d, want %d", got, want)
 	}
-	if fmt.Sprint(gotCalls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "codex", "sessions", "ensure", "--name", rootPrepared.SessionName}) {
+	if fmt.Sprint(gotCalls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "ensure", "--name", rootPrepared.SessionName}) {
 		t.Fatalf("first ACPX call args = %#v, want session ensure for root", gotCalls[0].args)
 	}
 	if gotCalls[0].dir != project.LocalPath {
 		t.Fatalf("first ACPX call dir = %q, want %q", gotCalls[0].dir, project.LocalPath)
 	}
-	if fmt.Sprint(gotCalls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "codex", "prompt", "-s", rootPrepared.SessionName, "root prompt"}) {
+	if fmt.Sprint(gotCalls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", rootPrepared.SessionName, "root prompt"}) {
 		t.Fatalf("second ACPX call args = %#v, want root prompt", gotCalls[1].args)
 	}
-	if fmt.Sprint(gotCalls[2].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "codex", "sessions", "ensure", "--name", rootPrepared.SessionName}) {
+	if fmt.Sprint(gotCalls[2].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "ensure", "--name", rootPrepared.SessionName}) {
 		t.Fatalf("third ACPX call args = %#v, want session ensure for reply", gotCalls[2].args)
 	}
-	if fmt.Sprint(gotCalls[3].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "codex", "prompt", "-s", rootPrepared.SessionName, "thread reply"}) {
+	if fmt.Sprint(gotCalls[3].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", rootPrepared.SessionName, "thread reply"}) {
 		t.Fatalf("fourth ACPX call args = %#v, want reply prompt", gotCalls[3].args)
 	}
 
