@@ -3,6 +3,7 @@ package acpxadapter
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -33,7 +34,11 @@ var _ Adapter = (*CLIAdapter)(nil)
 
 func NewCLIAdapter(binary string, runner commandRunner) *CLIAdapter {
 	if strings.TrimSpace(binary) == "" {
-		binary = "acpx"
+		if override := strings.TrimSpace(os.Getenv("SPEXUS_AGENT_ACPX_BIN")); override != "" {
+			binary = override
+		} else {
+			binary = "acpx"
+		}
 	}
 	if runner == nil {
 		runner = execRunner{}

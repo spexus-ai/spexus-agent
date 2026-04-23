@@ -191,3 +191,12 @@ func TestCLIAdapterPropagatesRunnerErrors(t *testing.T) {
 		t.Fatalf("Status() error = nil, want non-nil")
 	}
 }
+
+func TestNewCLIAdapterUsesACPXBinaryEnvOverride(t *testing.T) {
+	t.Setenv("SPEXUS_AGENT_ACPX_BIN", "/opt/acpx/bin/acpx")
+
+	adapter := NewCLIAdapter("", &fakeRunner{})
+	if adapter.binary != "/opt/acpx/bin/acpx" {
+		t.Fatalf("adapter binary = %q, want /opt/acpx/bin/acpx", adapter.binary)
+	}
+}

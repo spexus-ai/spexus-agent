@@ -195,6 +195,8 @@ To enable raw Slack websocket frame logging as well:
 SPEXUS_AGENT_DEBUG_RAW_SOCKET=1 ./bin/spexus-agent runtime start --debug
 ```
 
+If you wrap the runtime with a user-level systemd service, remember that it will not automatically inherit your interactive shell environment. Rebuild the service environment after exporting variables such as `MCP_BEARER_AUTH`, `CODEX_HOME`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`, otherwise MCP and model access may work in a terminal session but fail in Slack-triggered turns.
+
 Check current runtime status:
 
 ```bash
