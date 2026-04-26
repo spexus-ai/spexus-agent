@@ -55,14 +55,14 @@ func (f *fakeExecutionStore) SaveEventDedupe(_ context.Context, dedupe EventDedu
 	if f.saveEventErr != nil {
 		return f.saveEventErr
 	}
-	f.dedupe[dedupe.SlackEventID] = dedupe
+	f.dedupe[dedupe.SourceType+":"+dedupe.DeliveryID] = dedupe
 	return nil
 }
 
-func (f *fakeExecutionStore) LoadEventDedupe(_ context.Context, slackEventID string) (EventDedupe, error) {
+func (f *fakeExecutionStore) LoadEventDedupe(_ context.Context, sourceType, deliveryID string) (EventDedupe, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	dedupe, ok := f.dedupe[slackEventID]
+	dedupe, ok := f.dedupe[sourceType+":"+deliveryID]
 	if !ok {
 		return EventDedupe{}, ErrNotFound
 	}
@@ -105,16 +105,19 @@ func TestSlackTurnCoordinatorSkipsDuplicateSlackEvent(t *testing.T) {
 	t.Parallel()
 
 	store := newFakeExecutionStore()
-	store.dedupe["Ev123"] = EventDedupe{
-		SlackEventID: "Ev123",
-		ReceivedAt:   time.Now().UTC(),
-		Status:       "processed",
+	store.dedupe["mention:Ev123"] = EventDedupe{
+		SourceType: "mention",
+		DeliveryID: "Ev123",
+		ReceivedAt: time.Now().UTC(),
+		Status:     "processed",
 	}
 
 	coordinator := NewSlackTurnCoordinator(store, "runtime-1")
 	prepared := PreparedSlackEvent{
-		Event:    slack.Event{ID: "Ev123"},
-		ThreadTS: "1713686400.000100",
+		SourceType: "mention",
+		DeliveryID: "Ev123",
+		Event:      slack.Event{ID: "Ev123"},
+		ThreadTS:   "1713686400.000100",
 		ThreadState: ThreadState{
 			ThreadTS:    "1713686400.000100",
 			ChannelID:   "C12345678",
@@ -153,8 +156,10 @@ func TestSlackTurnCoordinatorSerializesThreadExecution(t *testing.T) {
 	events := make(chan string, 4)
 
 	firstPrepared := PreparedSlackEvent{
-		Event:    slack.Event{ID: "Ev1"},
-		ThreadTS: "1713686400.000100",
+		SourceType: "mention",
+		DeliveryID: "Ev1",
+		Event:      slack.Event{ID: "Ev1"},
+		ThreadTS:   "1713686400.000100",
 		ThreadState: ThreadState{
 			ThreadTS:    "1713686400.000100",
 			ChannelID:   "C12345678",
@@ -163,8 +168,10 @@ func TestSlackTurnCoordinatorSerializesThreadExecution(t *testing.T) {
 		},
 	}
 	secondPrepared := PreparedSlackEvent{
-		Event:    slack.Event{ID: "Ev2"},
-		ThreadTS: "1713686400.000100",
+		SourceType: "mention",
+		DeliveryID: "Ev2",
+		Event:      slack.Event{ID: "Ev2"},
+		ThreadTS:   "1713686400.000100",
 		ThreadState: ThreadState{
 			ThreadTS:    "1713686400.000100",
 			ChannelID:   "C12345678",
@@ -228,7 +235,7 @@ func TestSlackTurnCoordinatorSerializesThreadExecution(t *testing.T) {
 			t.Fatalf("execution order = %#v, want %#v", ordered, want)
 		}
 	}
-	if got := store.dedupe["Ev1"].Status; got != "processed" {
+	if got := store.dedupe["mention:Ev1"].Status; got != "processed" {
 		t.Fatalf("dedupe status for first execution = %q, want processed", got)
 	}
 	if got := store.threadStates["1713686400.000100"].LastStatus; got != "processed" {
@@ -249,8 +256,10 @@ func TestSlackTurnCoordinatorFailsClosedOnPersistenceError(t *testing.T) {
 
 	coordinator := NewSlackTurnCoordinator(store, "runtime-1")
 	prepared := PreparedSlackEvent{
-		Event:    slack.Event{ID: "Ev123"},
-		ThreadTS: "1713686400.000100",
+		SourceType: "mention",
+		DeliveryID: "Ev123",
+		Event:      slack.Event{ID: "Ev123"},
+		ThreadTS:   "1713686400.000100",
 		ThreadState: ThreadState{
 			ThreadTS:    "1713686400.000100",
 			ChannelID:   "C12345678",

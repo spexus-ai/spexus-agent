@@ -26,28 +26,99 @@ func NewHTTPClient(token string) *HTTPClient {
 	}
 }
 
+func (c *HTTPClient) PostMessage(ctx context.Context, message Message) (PostedMessage, error) {
+	response, err := c.postMessage(ctx, message)
+	if err != nil {
+		return PostedMessage{}, err
+	}
+	return response, nil
+}
+
 func (c *HTTPClient) PostThreadMessage(ctx context.Context, message Message) error {
+	_, err := c.postMessage(ctx, message)
+	return err
+}
+
+func (c *HTTPClient) PostResponseURLMessage(ctx context.Context, message ResponseURLMessage) error {
 	if c == nil {
 		return fmt.Errorf("slack http client is nil")
 	}
-	if strings.TrimSpace(message.ChannelID) == "" {
-		return fmt.Errorf("channel id is required")
+
+	responseURL := strings.TrimSpace(message.ResponseURL)
+	if responseURL == "" {
+		return fmt.Errorf("response url is required")
+	}
+	if c.client == nil {
+		c.client = &http.Client{}
 	}
 
 	payload := map[string]string{
-		"channel":   message.ChannelID,
-		"text":      message.Text,
-		"thread_ts": message.ThreadTS,
+		"text": message.Text,
+	}
+	if responseType := strings.TrimSpace(message.ResponseType); responseType != "" {
+		payload["response_type"] = responseType
 	}
 
-	var response slackAPIResponse
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode slack response_url request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, responseURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create slack response_url request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+
+	res, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("call slack response_url: %w", err)
+	}
+	defer res.Body.Close()
+
+	if _, err := io.ReadAll(res.Body); err != nil {
+		return fmt.Errorf("read slack response_url response: %w", err)
+	}
+	if res.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("slack response_url request failed with status %s", res.Status)
+	}
+
+	return nil
+}
+
+func (c *HTTPClient) postMessage(ctx context.Context, message Message) (PostedMessage, error) {
+	if c == nil {
+		return PostedMessage{}, fmt.Errorf("slack http client is nil")
+	}
+	if strings.TrimSpace(message.ChannelID) == "" {
+		return PostedMessage{}, fmt.Errorf("channel id is required")
+	}
+
+	payload := map[string]string{
+		"channel": message.ChannelID,
+		"text":    message.Text,
+	}
+	if threadTS := strings.TrimSpace(message.ThreadTS); threadTS != "" {
+		payload["thread_ts"] = threadTS
+	}
+
+	var response struct {
+		slackAPIResponse
+		Timestamp string `json:"ts"`
+	}
 	if err := c.do(ctx, "chat.postMessage", payload, &response); err != nil {
-		return err
+		return PostedMessage{}, err
 	}
 	if !response.OK {
-		return fmt.Errorf("slack chat.postMessage request failed: %s", response.Error)
+		return PostedMessage{}, fmt.Errorf("slack chat.postMessage request failed: %s", response.Error)
 	}
-	return nil
+	if strings.TrimSpace(response.Timestamp) == "" {
+		return PostedMessage{}, fmt.Errorf("slack chat.postMessage response is missing ts")
+	}
+	return PostedMessage{
+		ChannelID: strings.TrimSpace(message.ChannelID),
+		Timestamp: strings.TrimSpace(response.Timestamp),
+	}, nil
 }
 
 func (c *HTTPClient) CreateChannel(ctx context.Context, request CreateChannelRequest) (Channel, error) {

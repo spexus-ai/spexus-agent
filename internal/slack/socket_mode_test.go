@@ -93,3 +93,50 @@ func TestSocketModeMessageCarriesBotIdentifiers(t *testing.T) {
 		t.Fatalf("Normalize() event = %#v", event)
 	}
 }
+
+// Test: app_mention payloads normalize into the shared inbound invocation shape used by mention routing.
+// Validates: AC-1815 (REQ-1180 - mention invocations resolve registered project channels), AC-1823 (REQ-1193 - invocation sources classify as mention)
+func TestSocketModeMessageNormalizeInboundMention(t *testing.T) {
+	t.Parallel()
+
+	invocation, err := (SocketModeMessage{
+		EventID:   "Ev125",
+		Type:      SocketModeAppMentionType,
+		ChannelID: "C12345678",
+		Timestamp: "1713686420.000300",
+		UserID:    "U123",
+		Text:      "<@Ubot> status",
+	}).NormalizeInbound()
+	if err != nil {
+		t.Fatalf("NormalizeInbound() error = %v", err)
+	}
+	if invocation.SourceType != InboundSourceMention {
+		t.Fatalf("NormalizeInbound() source = %q, want %q", invocation.SourceType, InboundSourceMention)
+	}
+	if invocation.DeliveryID != "Ev125" || invocation.ChannelID != "C12345678" || invocation.ThreadTS != "1713686420.000300" {
+		t.Fatalf("NormalizeInbound() invocation = %#v", invocation)
+	}
+}
+
+// Test: slash command payloads normalize into the shared inbound invocation shape without thread metadata.
+// Validates: AC-1818 (REQ-1185 - slash invocations resolve channel context), AC-1824 (REQ-1193 - invocation sources classify as slash)
+func TestSocketModeSlashCommandNormalizeInbound(t *testing.T) {
+	t.Parallel()
+
+	invocation, err := (SocketModeSlashCommand{
+		Command:     "/spexus",
+		ChannelID:   "C12345678",
+		UserID:      "U123",
+		Text:        "status",
+		ResponseURL: "https://hooks.slack.test/response",
+	}).NormalizeInbound("3-fwdc2")
+	if err != nil {
+		t.Fatalf("NormalizeInbound() error = %v", err)
+	}
+	if invocation.SourceType != InboundSourceSlash {
+		t.Fatalf("NormalizeInbound() source = %q, want %q", invocation.SourceType, InboundSourceSlash)
+	}
+	if invocation.DeliveryID != "3-fwdc2" || invocation.AckEnvelopeID != "3-fwdc2" || invocation.ThreadTS != "" {
+		t.Fatalf("NormalizeInbound() invocation = %#v", invocation)
+	}
+}

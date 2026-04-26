@@ -20,6 +20,19 @@ type Message struct {
 	Text      string
 }
 
+const ResponseTypeEphemeral = "ephemeral"
+
+type ResponseURLMessage struct {
+	ResponseURL  string `json:"response_url,omitempty"`
+	Text         string `json:"text"`
+	ResponseType string `json:"response_type,omitempty"`
+}
+
+type PostedMessage struct {
+	ChannelID string
+	Timestamp string
+}
+
 type Event struct {
 	ID        string
 	ChannelID string
@@ -27,6 +40,22 @@ type Event struct {
 	Timestamp string
 	UserID    string
 	Text      string
+}
+
+const (
+	InboundSourceMention = "mention"
+	InboundSourceSlash   = "slash"
+)
+
+type InboundInvocation struct {
+	SourceType    string
+	DeliveryID    string
+	ChannelID     string
+	UserID        string
+	CommandText   string
+	ThreadTS      string
+	ResponseURL   string
+	AckEnvelopeID string
 }
 
 type Channel struct {
@@ -39,14 +68,24 @@ type CreateChannelRequest struct {
 }
 
 type Client interface {
+	PostMessage(context.Context, Message) (PostedMessage, error)
 	PostThreadMessage(context.Context, Message) error
 	CreateChannel(context.Context, CreateChannelRequest) (Channel, error)
 	FindChannelByName(context.Context, string) (Channel, error)
 	Close() error
 }
 
+type ResponseURLClient interface {
+	PostResponseURLMessage(context.Context, ResponseURLMessage) error
+}
+
 type EventSource interface {
 	Events(context.Context) (<-chan Event, error)
+	Close() error
+}
+
+type InboundInvocationSource interface {
+	InboundInvocations(context.Context) (<-chan InboundInvocation, error)
 	Close() error
 }
 

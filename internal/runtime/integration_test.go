@@ -53,6 +53,17 @@ type recordingSlackClient struct {
 	messages []slack.Message
 }
 
+func (c *recordingSlackClient) PostMessage(_ context.Context, message slack.Message) (slack.PostedMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.messages = append(c.messages, message)
+	return slack.PostedMessage{
+		ChannelID: message.ChannelID,
+		Timestamp: "1713686400.000100",
+	}, nil
+}
+
 func (c *recordingSlackClient) PostThreadMessage(_ context.Context, message slack.Message) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -87,8 +98,8 @@ func (s sqliteRuntimeStore) SaveEventDedupe(ctx context.Context, dedupe runtime.
 	return s.store.Runtime().SaveEventDedupe(ctx, dedupe)
 }
 
-func (s sqliteRuntimeStore) LoadEventDedupe(ctx context.Context, slackEventID string) (runtime.EventDedupe, error) {
-	return s.store.Runtime().LoadEventDedupe(ctx, slackEventID)
+func (s sqliteRuntimeStore) LoadEventDedupe(ctx context.Context, sourceType, deliveryID string) (runtime.EventDedupe, error) {
+	return s.store.Runtime().LoadEventDedupe(ctx, sourceType, deliveryID)
 }
 
 func (s sqliteRuntimeStore) SaveThreadLock(ctx context.Context, lock runtime.ThreadLock) error {
@@ -167,14 +178,12 @@ func TestSlackEventDispatchPersistsSQLiteStateAndRendersACPXOutput(t *testing.T)
 
 	runner := &recordingCommandRunner{
 		outputs: []string{
-			"session ensured for root",
 			`{"jsonrpc":"2.0","id":2,"method":"session/new","result":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7"}}
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"tool_call","toolCallId":"call_1","title":"Run grep","kind":"execute","status":"in_progress"}}}
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"completed"}}}
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"root"}}}}
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" final answer"}}}}
 {"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}`,
-			"session ensured for reply",
 			`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply final answer"}}}}
 {"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}`,
 		},
@@ -246,23 +255,17 @@ func TestSlackEventDispatchPersistsSQLiteStateAndRendersACPXOutput(t *testing.T)
 	runner.mu.Lock()
 	gotCalls := append([]recordedCommandCall(nil), runner.calls...)
 	runner.mu.Unlock()
-	if got, want := len(gotCalls), 4; got != want {
+	if got, want := len(gotCalls), 2; got != want {
 		t.Fatalf("ACPX runner call count = %d, want %d", got, want)
-	}
-	if fmt.Sprint(gotCalls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "ensure", "--name", rootPrepared.SessionName}) {
-		t.Fatalf("first ACPX call args = %#v, want session ensure for root", gotCalls[0].args)
 	}
 	if gotCalls[0].dir != project.LocalPath {
 		t.Fatalf("first ACPX call dir = %q, want %q", gotCalls[0].dir, project.LocalPath)
 	}
-	if fmt.Sprint(gotCalls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", rootPrepared.SessionName, "root prompt"}) {
-		t.Fatalf("second ACPX call args = %#v, want root prompt", gotCalls[1].args)
+	if fmt.Sprint(gotCalls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", rootPrepared.SessionName, "root prompt"}) {
+		t.Fatalf("first ACPX call args = %#v, want root prompt", gotCalls[0].args)
 	}
-	if fmt.Sprint(gotCalls[2].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "ensure", "--name", rootPrepared.SessionName}) {
-		t.Fatalf("third ACPX call args = %#v, want session ensure for reply", gotCalls[2].args)
-	}
-	if fmt.Sprint(gotCalls[3].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", rootPrepared.SessionName, "thread reply"}) {
-		t.Fatalf("fourth ACPX call args = %#v, want reply prompt", gotCalls[3].args)
+	if fmt.Sprint(gotCalls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", rootPrepared.SessionName, "thread reply"}) {
+		t.Fatalf("second ACPX call args = %#v, want reply prompt", gotCalls[1].args)
 	}
 
 	client.mu.Lock()
@@ -286,7 +289,7 @@ func TestSlackEventDispatchPersistsSQLiteStateAndRendersACPXOutput(t *testing.T)
 		}
 	}
 
-	loadedDedupe, err := store.Runtime().LoadEventDedupe(ctx, "Ev-root")
+	loadedDedupe, err := store.Runtime().LoadEventDedupe(ctx, "mention", "Ev-root")
 	if err != nil {
 		t.Fatalf("LoadEventDedupe(root) error = %v", err)
 	}
@@ -294,7 +297,7 @@ func TestSlackEventDispatchPersistsSQLiteStateAndRendersACPXOutput(t *testing.T)
 		t.Fatalf("LoadEventDedupe(root) = %#v, want processed", loadedDedupe)
 	}
 
-	loadedReplyDedupe, err := store.Runtime().LoadEventDedupe(ctx, "Ev-reply")
+	loadedReplyDedupe, err := store.Runtime().LoadEventDedupe(ctx, "mention", "Ev-reply")
 	if err != nil {
 		t.Fatalf("LoadEventDedupe(reply) error = %v", err)
 	}
@@ -427,7 +430,7 @@ func TestSlackTurnCoordinatorSerializesConcurrentSlackEventsWithSQLiteStore(t *t
 		t.Fatalf("LoadThreadState() = %#v, want final processed second-prompt state", loadedState)
 	}
 
-	firstDedupe, err := store.Runtime().LoadEventDedupe(ctx, "Ev-1")
+	firstDedupe, err := store.Runtime().LoadEventDedupe(ctx, "mention", "Ev-1")
 	if err != nil {
 		t.Fatalf("LoadEventDedupe(first) error = %v", err)
 	}
@@ -435,7 +438,7 @@ func TestSlackTurnCoordinatorSerializesConcurrentSlackEventsWithSQLiteStore(t *t
 		t.Fatalf("LoadEventDedupe(first) = %#v, want processed", firstDedupe)
 	}
 
-	secondDedupe, err := store.Runtime().LoadEventDedupe(ctx, "Ev-2")
+	secondDedupe, err := store.Runtime().LoadEventDedupe(ctx, "mention", "Ev-2")
 	if err != nil {
 		t.Fatalf("LoadEventDedupe(second) error = %v", err)
 	}
@@ -445,5 +448,97 @@ func TestSlackTurnCoordinatorSerializesConcurrentSlackEventsWithSQLiteStore(t *t
 
 	if _, err := store.Runtime().LoadThreadLock(ctx, firstPrepared.ThreadTS); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("LoadThreadLock() error = %v, want not found", err)
+	}
+}
+
+// Test: registered slash invocations reuse the same channel_id -> project resolution path as mention events without creating thread state yet.
+// Validates: AC-1818 (REQ-1185 - slash invocations resolve the project by channel_id)
+func TestPrepareSlackInvocationResolvesRegisteredSlashChannelFromSQLite(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	workspacePath := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(filepath.Join(workspacePath, "alpha"), 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(workspacePath, "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C12345678",
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	prepared, err := runtime.PrepareSlackInvocation(ctx, store.Projects(), slack.InboundInvocation{
+		SourceType:    slack.InboundSourceSlash,
+		DeliveryID:    "3-fwdc2",
+		ChannelID:     project.SlackChannelID,
+		UserID:        "U123",
+		CommandText:   "status",
+		ResponseURL:   "https://hooks.slack.test/response",
+		AckEnvelopeID: "3-fwdc2",
+	})
+	if err != nil {
+		t.Fatalf("PrepareSlackInvocation() error = %v", err)
+	}
+
+	if prepared.Project.Name != "alpha" || prepared.Project.LocalPath != project.LocalPath {
+		t.Fatalf("PrepareSlackInvocation() project = %#v, want %#v", prepared.Project, project)
+	}
+	if prepared.ThreadTS != "" || prepared.SessionName != "" {
+		t.Fatalf("PrepareSlackInvocation() thread/session = (%q, %q), want empty for slash", prepared.ThreadTS, prepared.SessionName)
+	}
+}
+
+// Test: unregistered slash invocations are rejected before execution and return an ephemeral contract from the shared prepare layer.
+// Validates: AC-1822 (REQ-1190 - unregistered channels reject before execution starts), AC-1822 (REQ-1192 - slash rejections are ephemeral)
+func TestPrepareSlackInvocationRejectsUnregisteredSlashChannelFromSQLite(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	_, err = runtime.PrepareSlackInvocation(ctx, store.Projects(), slack.InboundInvocation{
+		SourceType:    slack.InboundSourceSlash,
+		DeliveryID:    "3-fwdc2",
+		ChannelID:     "C99999999",
+		UserID:        "U123",
+		CommandText:   "status",
+		ResponseURL:   "https://hooks.slack.test/response",
+		AckEnvelopeID: "3-fwdc2",
+	})
+	if !errors.Is(err, runtime.ErrUnregisteredSlackChannel) {
+		t.Fatalf("PrepareSlackInvocation() error = %v, want ErrUnregisteredSlackChannel", err)
+	}
+
+	var rejectionErr *runtime.RejectedSlackInvocationError
+	if !errors.As(err, &rejectionErr) {
+		t.Fatalf("PrepareSlackInvocation() error = %v, want RejectedSlackInvocationError", err)
+	}
+	if !rejectionErr.Rejection.Ephemeral || rejectionErr.Rejection.ResponseURL != "https://hooks.slack.test/response" {
+		t.Fatalf("slash rejection = %#v, want ephemeral response contract", rejectionErr.Rejection)
 	}
 }

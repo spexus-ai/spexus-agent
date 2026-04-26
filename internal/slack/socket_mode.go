@@ -7,8 +7,10 @@ import (
 )
 
 const (
-	SocketModeMessageType    = "message"
-	SocketModeAppMentionType = "app_mention"
+	SocketModeEnvelopeEventsAPI     = "events_api"
+	SocketModeEnvelopeSlashCommands = "slash_commands"
+	SocketModeMessageType           = "message"
+	SocketModeAppMentionType        = "app_mention"
 )
 
 var ErrSocketModeEventUnsupported = errors.New("unsupported slack socket mode event")
@@ -24,6 +26,14 @@ type SocketModeMessage struct {
 	AppID     string `json:"app_id,omitempty"`
 	Text      string `json:"text,omitempty"`
 	Subtype   string `json:"subtype,omitempty"`
+}
+
+type SocketModeSlashCommand struct {
+	Command     string `json:"command,omitempty"`
+	ChannelID   string `json:"channel_id,omitempty"`
+	UserID      string `json:"user_id,omitempty"`
+	Text        string `json:"text,omitempty"`
+	ResponseURL string `json:"response_url,omitempty"`
 }
 
 func (e SocketModeMessage) Normalize() (Event, error) {
@@ -46,5 +56,52 @@ func (e SocketModeMessage) Normalize() (Event, error) {
 		Timestamp: strings.TrimSpace(e.Timestamp),
 		UserID:    strings.TrimSpace(e.UserID),
 		Text:      e.Text,
+	}, nil
+}
+
+func (e SocketModeMessage) NormalizeInbound() (InboundInvocation, error) {
+	switch strings.TrimSpace(e.Type) {
+	case SocketModeMessageType, SocketModeAppMentionType:
+	default:
+		return InboundInvocation{}, ErrSocketModeEventUnsupported
+	}
+	if strings.TrimSpace(e.ChannelID) == "" {
+		return InboundInvocation{}, fmt.Errorf("slack event channel id is required")
+	}
+	if strings.TrimSpace(e.UserID) == "" {
+		return InboundInvocation{}, fmt.Errorf("slack event user id is required")
+	}
+
+	threadTS := strings.TrimSpace(e.ThreadTS)
+	if threadTS == "" {
+		threadTS = strings.TrimSpace(e.Timestamp)
+	}
+
+	return InboundInvocation{
+		SourceType:  InboundSourceMention,
+		DeliveryID:  strings.TrimSpace(e.EventID),
+		ChannelID:   strings.TrimSpace(e.ChannelID),
+		UserID:      strings.TrimSpace(e.UserID),
+		CommandText: e.Text,
+		ThreadTS:    threadTS,
+	}, nil
+}
+
+func (e SocketModeSlashCommand) NormalizeInbound(envelopeID string) (InboundInvocation, error) {
+	if strings.TrimSpace(e.ChannelID) == "" {
+		return InboundInvocation{}, fmt.Errorf("slack slash command channel id is required")
+	}
+	if strings.TrimSpace(e.UserID) == "" {
+		return InboundInvocation{}, fmt.Errorf("slack slash command user id is required")
+	}
+
+	return InboundInvocation{
+		SourceType:    InboundSourceSlash,
+		DeliveryID:    strings.TrimSpace(envelopeID),
+		ChannelID:     strings.TrimSpace(e.ChannelID),
+		UserID:        strings.TrimSpace(e.UserID),
+		CommandText:   e.Text,
+		ResponseURL:   strings.TrimSpace(e.ResponseURL),
+		AckEnvelopeID: strings.TrimSpace(envelopeID),
 	}, nil
 }

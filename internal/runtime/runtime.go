@@ -22,10 +22,11 @@ type ThreadState struct {
 }
 
 type EventDedupe struct {
-	SlackEventID string     `json:"slackEventId"`
-	ReceivedAt   time.Time  `json:"receivedAt"`
-	ProcessedAt  *time.Time `json:"processedAt,omitempty"`
-	Status       string     `json:"status,omitempty"`
+	SourceType  string     `json:"sourceType"`
+	DeliveryID  string     `json:"deliveryId"`
+	ReceivedAt  time.Time  `json:"receivedAt"`
+	ProcessedAt *time.Time `json:"processedAt,omitempty"`
+	Status      string     `json:"status,omitempty"`
 }
 
 type ThreadLock struct {
@@ -82,7 +83,7 @@ type Store interface {
 	SaveThreadState(context.Context, ThreadState) error
 	LoadThreadState(context.Context, string) (ThreadState, error)
 	SaveEventDedupe(context.Context, EventDedupe) error
-	LoadEventDedupe(context.Context, string) (EventDedupe, error)
+	LoadEventDedupe(context.Context, string, string) (EventDedupe, error)
 	SaveThreadLock(context.Context, ThreadLock) error
 	LoadThreadLock(context.Context, string) (ThreadLock, error)
 	DeleteThreadLock(context.Context, string) error

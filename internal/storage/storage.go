@@ -151,11 +151,14 @@ func (s *Store) bootstrap(ctx context.Context) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slack_channel_id ON projects(slack_channel_id) WHERE slack_channel_id <> ''`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slack_channel_name ON projects(slack_channel_name) WHERE slack_channel_name <> ''`,
 		`CREATE TABLE IF NOT EXISTS events_dedupe (
-			slack_event_id TEXT PRIMARY KEY,
+			source_type TEXT NOT NULL,
+			delivery_id TEXT NOT NULL,
 			received_at TEXT NOT NULL,
 			processed_at TEXT,
-			status TEXT NOT NULL DEFAULT ''
+			status TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(source_type, delivery_id)
 		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_source_delivery ON events_dedupe(source_type, delivery_id)`,
 		`CREATE TABLE IF NOT EXISTS threads (
 			thread_ts TEXT PRIMARY KEY,
 			channel_id TEXT NOT NULL,
@@ -191,6 +194,10 @@ func (s *Store) bootstrap(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("bootstrap schema: %w", err)
 		}
+	}
+
+	if err := migrateEventDedupeTable(ctx, tx); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -484,8 +491,11 @@ func (r *RuntimeRepository) SaveEventDedupe(ctx context.Context, dedupe runtimem
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if dedupe.SlackEventID == "" {
-		return fmt.Errorf("slack event id is required")
+	if dedupe.SourceType == "" {
+		return fmt.Errorf("slack source type is required")
+	}
+	if dedupe.DeliveryID == "" {
+		return fmt.Errorf("slack delivery id is required")
 	}
 
 	if dedupe.ReceivedAt.IsZero() {
@@ -494,59 +504,63 @@ func (r *RuntimeRepository) SaveEventDedupe(ctx context.Context, dedupe runtimem
 
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO events_dedupe (
-			slack_event_id, received_at, processed_at, status
-		) VALUES (?, ?, ?, ?)
-		ON CONFLICT(slack_event_id) DO UPDATE SET
+			source_type, delivery_id, received_at, processed_at, status
+		) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(source_type, delivery_id) DO UPDATE SET
 			received_at = excluded.received_at,
 			processed_at = excluded.processed_at,
 			status = excluded.status
 	`,
-		dedupe.SlackEventID,
+		dedupe.SourceType,
+		dedupe.DeliveryID,
 		dedupe.ReceivedAt.UTC().Format(time.RFC3339Nano),
 		formatNullableTime(dedupe.ProcessedAt),
 		dedupe.Status,
 	)
 	if err != nil {
-		return fmt.Errorf("save event dedupe %q: %w", dedupe.SlackEventID, err)
+		return fmt.Errorf("save event dedupe %s/%q: %w", dedupe.SourceType, dedupe.DeliveryID, err)
 	}
 
 	return nil
 }
 
-func (r *RuntimeRepository) LoadEventDedupe(ctx context.Context, slackEventID string) (runtimemodel.EventDedupe, error) {
+func (r *RuntimeRepository) LoadEventDedupe(ctx context.Context, sourceType, deliveryID string) (runtimemodel.EventDedupe, error) {
 	if err := ctx.Err(); err != nil {
 		return runtimemodel.EventDedupe{}, err
 	}
-	if slackEventID == "" {
-		return runtimemodel.EventDedupe{}, fmt.Errorf("slack event id is required")
+	if sourceType == "" {
+		return runtimemodel.EventDedupe{}, fmt.Errorf("slack source type is required")
+	}
+	if deliveryID == "" {
+		return runtimemodel.EventDedupe{}, fmt.Errorf("slack delivery id is required")
 	}
 
 	row := r.db.QueryRowContext(ctx, `
-		SELECT slack_event_id, received_at, processed_at, status
+		SELECT source_type, delivery_id, received_at, processed_at, status
 		FROM events_dedupe
-		WHERE slack_event_id = ?
-	`, slackEventID)
+		WHERE source_type = ? AND delivery_id = ?
+	`, sourceType, deliveryID)
 
 	var dedupe runtimemodel.EventDedupe
 	var receivedAtText string
 	var processedAtText sql.NullString
-	if err := row.Scan(&dedupe.SlackEventID, &receivedAtText, &processedAtText, &dedupe.Status); err != nil {
+	if err := row.Scan(&dedupe.SourceType, &dedupe.DeliveryID, &receivedAtText, &processedAtText, &dedupe.Status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return runtimemodel.EventDedupe{}, ErrNotFound
 		}
-		return runtimemodel.EventDedupe{}, fmt.Errorf("load event dedupe %q: %w", slackEventID, err)
+		return runtimemodel.EventDedupe{}, fmt.Errorf("load event dedupe %s/%q: %w", sourceType, deliveryID, err)
 	}
 
 	receivedAt, err := parseTime(receivedAtText)
 	if err != nil {
-		return runtimemodel.EventDedupe{}, fmt.Errorf("parse received_at for event %q: %w", slackEventID, err)
+		return runtimemodel.EventDedupe{}, fmt.Errorf("parse received_at for %s/%q: %w", sourceType, deliveryID, err)
 	}
 	dedupe.ReceivedAt = receivedAt
 
 	if processedAtText.Valid {
 		processedAt, err := parseTime(processedAtText.String)
 		if err != nil {
-			return runtimemodel.EventDedupe{}, fmt.Errorf("parse processed_at for event %q: %w", slackEventID, err)
+			return runtimemodel.EventDedupe{}, fmt.Errorf("parse processed_at for %s/%q: %w", sourceType, deliveryID, err)
 		}
 		dedupe.ProcessedAt = &processedAt
 	}
@@ -566,6 +580,84 @@ func (r *RuntimeRepository) CountEventDedupe(ctx context.Context) (int, error) {
 	}
 
 	return count, nil
+}
+
+func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
+	hasSourceType, err := tableColumnExists(ctx, tx, "events_dedupe", "source_type")
+	if err != nil {
+		return fmt.Errorf("inspect events_dedupe source_type column: %w", err)
+	}
+	hasDeliveryID, err := tableColumnExists(ctx, tx, "events_dedupe", "delivery_id")
+	if err != nil {
+		return fmt.Errorf("inspect events_dedupe delivery_id column: %w", err)
+	}
+	if hasSourceType && hasDeliveryID {
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS events_dedupe_v2 (
+			source_type TEXT NOT NULL,
+			delivery_id TEXT NOT NULL,
+			received_at TEXT NOT NULL,
+			processed_at TEXT,
+			status TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(source_type, delivery_id)
+		)
+	`); err != nil {
+		return fmt.Errorf("create events_dedupe_v2: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR REPLACE INTO events_dedupe_v2 (source_type, delivery_id, received_at, processed_at, status)
+		SELECT 'mention', slack_event_id, received_at, processed_at, status
+		FROM events_dedupe
+	`); err != nil {
+		return fmt.Errorf("copy events_dedupe rows into v2: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DROP TABLE events_dedupe`); err != nil {
+		return fmt.Errorf("drop legacy events_dedupe: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE events_dedupe_v2 RENAME TO events_dedupe`); err != nil {
+		return fmt.Errorf("rename events_dedupe_v2: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_source_delivery ON events_dedupe(source_type, delivery_id)`); err != nil {
+		return fmt.Errorf("create events_dedupe source/delivery index: %w", err)
+	}
+
+	return nil
+}
+
+func tableColumnExists(ctx context.Context, tx *sql.Tx, tableName, columnName string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			valueType string
+			notNull   int
+			defaults  sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &valueType, &notNull, &defaults, &pk); err != nil {
+			return false, err
+		}
+		if name == columnName {
+			return true, nil
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+
+	return false, nil
 }
 
 func (r *RuntimeRepository) SaveThreadLock(ctx context.Context, lock ThreadLock) error {

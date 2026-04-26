@@ -20,7 +20,7 @@ func (execRunner) Run(ctx context.Context, binary string, args []string, dir str
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return string(output), fmt.Errorf("run %s %s: %w", binary, strings.Join(args, " "), err)
+		return string(output), fmt.Errorf("run %s %s: %w%s", binary, strings.Join(args, " "), err, formatCommandOutput(output))
 	}
 	return string(output), nil
 }
@@ -81,22 +81,37 @@ func (a *CLIAdapter) SendPrompt(ctx context.Context, req SessionRequest) (Sessio
 	if err := ctx.Err(); err != nil {
 		return SessionResult{}, err
 	}
+	if strings.TrimSpace(req.ProjectPath) == "" {
+		return SessionResult{}, fmt.Errorf("project path is required")
+	}
 	if strings.TrimSpace(req.Prompt) == "" {
 		return SessionResult{}, fmt.Errorf("prompt is required")
 	}
 
-	session, err := a.EnsureSession(ctx, req)
+	sessionName, err := validateThreadSession(req.ThreadTS)
 	if err != nil {
 		return SessionResult{}, err
 	}
 
-	output, err := a.run(ctx, req.ProjectPath, "codex", "prompt", "-s", session.SessionName, req.Prompt)
+	output, err := a.run(ctx, req.ProjectPath, "codex", "prompt", "-s", sessionName, req.Prompt)
 	if err != nil {
-		return SessionResult{}, fmt.Errorf("send prompt to session %q: %w", session.SessionName, err)
+		if !isRecoverablePromptError(err) {
+			return SessionResult{}, fmt.Errorf("send prompt to session %q: %w", sessionName, err)
+		}
+		if recreateErr := a.createSession(ctx, req.ProjectPath, sessionName); recreateErr != nil {
+			return SessionResult{}, fmt.Errorf("send prompt to session %q: %w", sessionName, err)
+		}
+
+		output, err = a.run(ctx, req.ProjectPath, "codex", "prompt", "-s", sessionName, req.Prompt)
+		if err != nil {
+			return SessionResult{}, fmt.Errorf("send prompt to session %q: %w", sessionName, err)
+		}
 	}
 
-	session.Output = output
-	return session, nil
+	return SessionResult{
+		SessionName: sessionName,
+		Output:      output,
+	}, nil
 }
 
 func (a *CLIAdapter) Status(ctx context.Context, threadTS string) (SessionResult, error) {
@@ -156,6 +171,33 @@ func (a *CLIAdapter) run(ctx context.Context, dir string, args ...string) (strin
 	return runner.Run(ctx, a.binary, commandArgs, dir)
 }
 
+func (a *CLIAdapter) createSession(ctx context.Context, dir, sessionName string) error {
+	if _, err := a.run(ctx, dir, "codex", "sessions", "new", "--name", sessionName); err != nil {
+		return fmt.Errorf("create session %q: %w", sessionName, err)
+	}
+	return nil
+}
+
+func isRecoverablePromptError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	message := strings.ToLower(err.Error())
+	recoverable := []string{
+		"no session",
+		"resource not found",
+		"session queue owner failed to start",
+		"queue owner unavailable",
+	}
+	for _, token := range recoverable {
+		if strings.Contains(message, token) {
+			return true
+		}
+	}
+	return false
+}
+
 func validateThreadSession(threadTS string) (string, error) {
 	threadTS = strings.TrimSpace(threadTS)
 	if threadTS == "" {
@@ -163,4 +205,12 @@ func validateThreadSession(threadTS string) (string, error) {
 	}
 
 	return SessionName(threadTS), nil
+}
+
+func formatCommandOutput(output []byte) string {
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return ""
+	}
+	return ": " + trimmed
 }
