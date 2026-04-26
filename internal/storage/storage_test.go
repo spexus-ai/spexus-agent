@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -71,6 +72,122 @@ func TestOpenBootstrapsSchemaAndProjectRepository(t *testing.T) {
 	}
 	if len(projects) != 1 {
 		t.Fatalf("List() len = %d, want 1", len(projects))
+	}
+}
+
+// Test: storage bootstrap migrates pre-async-runtime SQLite files that have older project, dedupe, thread, and lock schemas.
+// Validates: EP-154 runtime startup can open existing user databases after async execution persistence columns are introduced.
+func TestOpenMigratesLegacyRuntimeSchema(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "storage.sqlite3")
+
+	db, err := sql.Open("sqlite3", storageDSN(path))
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	legacyStmts := []string{
+		`CREATE TABLE projects (
+			name TEXT PRIMARY KEY,
+			local_path TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`INSERT INTO projects (name, local_path, created_at, updated_at)
+			VALUES ('alpha', '/workspace/alpha', '` + now + `', '` + now + `')`,
+		`CREATE TABLE events_dedupe (
+			slack_event_id TEXT PRIMARY KEY,
+			received_at TEXT NOT NULL,
+			processed_at TEXT,
+			status TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO events_dedupe (slack_event_id, received_at, status)
+			VALUES ('EvLegacy', '` + now + `', 'processed')`,
+		`CREATE TABLE threads (
+			thread_ts TEXT PRIMARY KEY,
+			channel_id TEXT NOT NULL,
+			project_name TEXT NOT NULL,
+			session_name TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE thread_locks (
+			thread_ts TEXT PRIMARY KEY,
+			lock_owner TEXT NOT NULL,
+			locked_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+	}
+	for _, stmt := range legacyStmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			_ = db.Close()
+			t.Fatalf("legacy schema exec error = %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("legacy db Close() error = %v", err)
+	}
+
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open() legacy schema error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	if err := store.Projects().Upsert(ctx, registry.Project{
+		Name:             "alpha",
+		GitRemote:        "git@github.com:org/alpha.git",
+		LocalPath:        "/workspace/alpha",
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C12345678",
+	}); err != nil {
+		t.Fatalf("Upsert() after migration error = %v", err)
+	}
+
+	dedupe, err := store.Runtime().LoadEventDedupe(ctx, "mention", "EvLegacy")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe() migrated legacy row error = %v", err)
+	}
+	if dedupe.SourceType != "mention" || dedupe.DeliveryID != "EvLegacy" || dedupe.Status != "processed" {
+		t.Fatalf("LoadEventDedupe() = %#v, want migrated mention/EvLegacy processed row", dedupe)
+	}
+
+	state := runtimemodel.ThreadState{
+		ThreadTS:      "1713686400.000100",
+		ChannelID:     "C12345678",
+		ProjectName:   "alpha",
+		SessionName:   "slack-1713686400.000100",
+		LastStatus:    "processed",
+		LastRequestID: "req-legacy",
+	}
+	if err := store.Runtime().SaveThreadState(ctx, state); err != nil {
+		t.Fatalf("SaveThreadState() after migration error = %v", err)
+	}
+	loaded, err := store.Runtime().LoadThreadState(ctx, state.ThreadTS)
+	if err != nil {
+		t.Fatalf("LoadThreadState() after migration error = %v", err)
+	}
+	if loaded.LastStatus != state.LastStatus || loaded.LastRequestID != state.LastRequestID {
+		t.Fatalf("LoadThreadState() = %#v, want migrated status/request columns", loaded)
+	}
+
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
+		ExecutionID: "mention:EvMigrated",
+		SourceType:  "mention",
+		DeliveryID:  "EvMigrated",
+		ProjectName: "alpha",
+		ChannelID:   "C12345678",
+		ThreadTS:    state.ThreadTS,
+		SessionName: state.SessionName,
+		Status:      runtimemodel.ExecutionStatusQueued,
+	}); err != nil {
+		t.Fatalf("SaveExecutionState() after migration error = %v", err)
 	}
 }
 

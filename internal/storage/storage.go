@@ -138,7 +138,7 @@ func (s *Store) bootstrap(ctx context.Context) error {
 		return fmt.Errorf("set busy timeout: %w", err)
 	}
 
-	stmts := []string{
+	tableStmts := []string{
 		`CREATE TABLE IF NOT EXISTS projects (
 			name TEXT PRIMARY KEY,
 			git_remote TEXT NOT NULL DEFAULT '',
@@ -148,9 +148,6 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_local_path ON projects(local_path)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slack_channel_id ON projects(slack_channel_id) WHERE slack_channel_id <> ''`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slack_channel_name ON projects(slack_channel_name) WHERE slack_channel_name <> ''`,
 		`CREATE TABLE IF NOT EXISTS events_dedupe (
 			source_type TEXT NOT NULL,
 			delivery_id TEXT NOT NULL,
@@ -159,7 +156,6 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			status TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY(source_type, delivery_id)
 		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_source_delivery ON events_dedupe(source_type, delivery_id)`,
 		`CREATE TABLE IF NOT EXISTS threads (
 			thread_ts TEXT PRIMARY KEY,
 			channel_id TEXT NOT NULL,
@@ -171,8 +167,6 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			updated_at TEXT NOT NULL,
 			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_threads_channel_id ON threads(channel_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_threads_project_name ON threads(project_name)`,
 		`CREATE TABLE IF NOT EXISTS thread_locks (
 			thread_ts TEXT PRIMARY KEY,
 			lock_owner TEXT NOT NULL,
@@ -202,6 +196,15 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			publisher_checkpoint_at TEXT,
 			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
 		)`,
+	}
+
+	indexStmts := []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_local_path ON projects(local_path)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slack_channel_id ON projects(slack_channel_id) WHERE slack_channel_id <> ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slack_channel_name ON projects(slack_channel_name) WHERE slack_channel_name <> ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_source_delivery ON events_dedupe(source_type, delivery_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_threads_channel_id ON threads(channel_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_threads_project_name ON threads(project_name)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_source_delivery ON executions(source_type, delivery_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_executions_thread_ts ON executions(thread_ts) WHERE thread_ts <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_executions_session_name ON executions(session_name) WHERE session_name <> ''`,
@@ -215,7 +218,7 @@ func (s *Store) bootstrap(ctx context.Context) error {
 		_ = tx.Rollback()
 	}()
 
-	for _, stmt := range stmts {
+	for _, stmt := range tableStmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("bootstrap schema: %w", err)
 		}
@@ -223,6 +226,15 @@ func (s *Store) bootstrap(ctx context.Context) error {
 
 	if err := migrateEventDedupeTable(ctx, tx); err != nil {
 		return err
+	}
+	if err := migrateAdditiveColumns(ctx, tx); err != nil {
+		return err
+	}
+
+	for _, stmt := range indexStmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("bootstrap indexes: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -927,6 +939,38 @@ func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_source_delivery ON events_dedupe(source_type, delivery_id)`); err != nil {
 		return fmt.Errorf("create events_dedupe source/delivery index: %w", err)
+	}
+
+	return nil
+}
+
+func migrateAdditiveColumns(ctx context.Context, tx *sql.Tx) error {
+	migrations := []struct {
+		table  string
+		column string
+		sql    string
+	}{
+		{table: "projects", column: "git_remote", sql: `ALTER TABLE projects ADD COLUMN git_remote TEXT NOT NULL DEFAULT ''`},
+		{table: "projects", column: "slack_channel_name", sql: `ALTER TABLE projects ADD COLUMN slack_channel_name TEXT NOT NULL DEFAULT ''`},
+		{table: "projects", column: "slack_channel_id", sql: `ALTER TABLE projects ADD COLUMN slack_channel_id TEXT NOT NULL DEFAULT ''`},
+		{table: "events_dedupe", column: "processed_at", sql: `ALTER TABLE events_dedupe ADD COLUMN processed_at TEXT`},
+		{table: "events_dedupe", column: "status", sql: `ALTER TABLE events_dedupe ADD COLUMN status TEXT NOT NULL DEFAULT ''`},
+		{table: "threads", column: "last_status", sql: `ALTER TABLE threads ADD COLUMN last_status TEXT NOT NULL DEFAULT ''`},
+		{table: "threads", column: "last_request_id", sql: `ALTER TABLE threads ADD COLUMN last_request_id TEXT NOT NULL DEFAULT ''`},
+		{table: "thread_locks", column: "lease_expires_at", sql: `ALTER TABLE thread_locks ADD COLUMN lease_expires_at TEXT`},
+	}
+
+	for _, migration := range migrations {
+		exists, err := tableColumnExists(ctx, tx, migration.table, migration.column)
+		if err != nil {
+			return fmt.Errorf("inspect %s.%s column: %w", migration.table, migration.column, err)
+		}
+		if exists {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, migration.sql); err != nil {
+			return fmt.Errorf("add %s.%s column: %w", migration.table, migration.column, err)
+		}
 	}
 
 	return nil
