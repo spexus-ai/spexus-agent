@@ -13,6 +13,10 @@ type fakeChannelClient struct {
 	err      error
 }
 
+func (f *fakeChannelClient) PostMessage(context.Context, Message) (PostedMessage, error) {
+	return PostedMessage{ChannelID: "C12345678", Timestamp: "1713686400.000100"}, nil
+}
+
 func (f *fakeChannelClient) PostThreadMessage(context.Context, Message) error { return nil }
 
 func (f *fakeChannelClient) CreateChannel(_ context.Context, request CreateChannelRequest) (Channel, error) {

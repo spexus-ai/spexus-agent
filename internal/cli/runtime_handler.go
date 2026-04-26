@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -365,7 +366,7 @@ func (h *runtimeCommandHandler) debugf(format string, args ...any) {
 }
 
 type foregroundRuntimeStarter struct {
-	source      slack.EventSource
+	source      slack.InboundInvocationSource
 	client      slack.Client
 	renderer    runtime.SlackThreadRenderer
 	adapter     acpxadapter.Adapter
@@ -402,7 +403,7 @@ func (s *foregroundRuntimeStarter) Start(ctx context.Context, _ runtime.Status) 
 		}
 	}()
 
-	events, err := s.source.Events(ctx)
+	invocations, err := s.source.InboundInvocations(ctx)
 	if err != nil {
 		return err
 	}
@@ -414,79 +415,239 @@ func (s *foregroundRuntimeStarter) Start(ctx context.Context, _ runtime.Status) 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case event, ok := <-events:
+		case invocation, ok := <-invocations:
 			if !ok {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				return errors.New("slack event source stopped")
+				return errors.New("slack invocation source stopped")
 			}
 			s.logf(
-				"runtime.loop: received slack event id=%s channel=%s thread=%s user=%s text=%q",
-				event.ID,
-				event.ChannelID,
-				event.ThreadTimestamp(),
-				event.UserID,
-				strings.TrimSpace(event.Text),
+				"runtime.loop: received slack invocation delivery=%s source=%s channel=%s thread=%s user=%s text=%q",
+				invocation.DeliveryID,
+				invocation.SourceType,
+				invocation.ChannelID,
+				strings.TrimSpace(invocation.ThreadTS),
+				invocation.UserID,
+				strings.TrimSpace(invocation.CommandText),
 			)
 
-			prepared, err := runtime.PrepareSlackEvent(ctx, s.projectRepo, event)
-			if err != nil {
-				s.logf("runtime.loop: ignored slack event id=%s: %v", event.ID, err)
-				continue
-			}
-
-			result, err := coordinator.Execute(ctx, prepared, func(ctx context.Context, prepared runtime.PreparedSlackEvent) error {
-				s.logf(
-					"runtime.loop: dispatching event id=%s project=%s session=%s",
-					prepared.Event.ID,
-					prepared.Project.Name,
-					prepared.SessionName,
-				)
-
-				session, err := s.adapter.SendPrompt(ctx, acpxadapter.SessionRequest{
-					ProjectPath: prepared.Project.LocalPath,
-					ThreadTS:    prepared.ThreadTS,
-					Prompt:      prepared.Event.Text,
-				})
-				if err != nil {
-					return err
+			switch invocation.SourceType {
+			case slack.InboundSourceMention:
+				if err := s.handleMentionInvocation(ctx, coordinator, invocation); err != nil {
+					s.logf("runtime.loop: mention failed delivery=%s: %v", invocation.DeliveryID, err)
 				}
-
-				s.logf(
-					"runtime.loop: acpx completed session=%s output_bytes=%d",
-					session.SessionName,
-					len(session.Output),
-				)
-				s.logf(
-					"runtime.loop: acpx output session=%s payload=%s",
-					session.SessionName,
-					summarizeACPXOutput(session.Output, 4000),
-				)
-
-				if err := runtime.RenderACPXTurnOutput(ctx, s.renderer, runtime.SlackThreadRenderRequest{
-					ChannelID:   prepared.Project.SlackChannelID,
-					ThreadTS:    prepared.ThreadTS,
-					SessionName: session.SessionName,
-				}, session.Output); err != nil {
-					return err
+			case slack.InboundSourceSlash:
+				if err := s.handleSlashInvocation(ctx, coordinator, invocation); err != nil {
+					s.logf("runtime.loop: slash failed delivery=%s: %v", invocation.DeliveryID, err)
 				}
-
-				s.logf("runtime.loop: rendered slack reply thread=%s session=%s", prepared.ThreadTS, session.SessionName)
-				return nil
-			})
-			if err != nil {
-				s.logf("runtime.loop: event failed id=%s: %v", event.ID, err)
-				_ = s.postTurnError(ctx, prepared, err)
-				continue
+			default:
+				s.logf("runtime.loop: ignored slack invocation delivery=%s source=%s", invocation.DeliveryID, invocation.SourceType)
 			}
-			if result.Duplicate {
-				s.logf("runtime.loop: duplicate slack event skipped id=%s", event.ID)
-				continue
-			}
-			s.logf("runtime.loop: event processed id=%s session=%s", event.ID, prepared.SessionName)
 		}
 	}
+}
+
+func (s *foregroundRuntimeStarter) handleMentionInvocation(ctx context.Context, coordinator *runtime.SlackTurnCoordinator, invocation slack.InboundInvocation) error {
+	prepared, err := runtime.PrepareSlackMentionEvent(ctx, s.projectRepo, invocation)
+	if err != nil {
+		return s.handleInvocationRejection(ctx, invocation, err)
+	}
+	command := runtime.ParseSlackCommand(prepared.Event.Text)
+
+	result, err := coordinator.Execute(ctx, prepared, func(ctx context.Context, prepared runtime.PreparedSlackEvent) error {
+		s.logLifecycle("execution_started", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "processing", "session="+prepared.SessionName)
+		s.logf(
+			"runtime.loop: dispatching mention delivery=%s project=%s session=%s",
+			prepared.Event.ID,
+			prepared.Project.Name,
+			prepared.SessionName,
+		)
+
+		if !command.ShouldExecute() {
+			if err := s.client.PostThreadMessage(ctx, slack.Message{
+				ChannelID: prepared.Project.SlackChannelID,
+				ThreadTS:  prepared.ThreadTS,
+				Text:      mentionUsageText(),
+			}); err != nil {
+				return err
+			}
+			s.logf("runtime.loop: rendered mention usage thread=%s", prepared.ThreadTS)
+			return nil
+		}
+
+		session, err := s.adapter.SendPrompt(ctx, acpxadapter.SessionRequest{
+			ProjectPath: prepared.Project.LocalPath,
+			ThreadTS:    prepared.ThreadTS,
+			Prompt:      command.ACPXPrompt(),
+		})
+		if err != nil {
+			return err
+		}
+
+		s.logf(
+			"runtime.loop: acpx completed session=%s output_bytes=%d",
+			session.SessionName,
+			len(session.Output),
+		)
+		s.logf(
+			"runtime.loop: acpx output session=%s payload=%s",
+			session.SessionName,
+			summarizeACPXOutput(session.Output, 4000),
+		)
+
+		if err := runtime.RenderACPXTurnOutput(ctx, s.renderer, runtime.SlackThreadRenderRequest{
+			ChannelID:   prepared.Project.SlackChannelID,
+			ThreadTS:    prepared.ThreadTS,
+			SessionName: session.SessionName,
+		}, session.Output); err != nil {
+			return err
+		}
+
+		s.logf("runtime.loop: rendered slack reply thread=%s session=%s", prepared.ThreadTS, session.SessionName)
+		return nil
+	})
+	if err != nil {
+		s.logLifecycle("execution_completed", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "failed", "session="+prepared.SessionName, "error="+strconv.Quote(err.Error()))
+		_ = s.postTurnError(ctx, prepared, err)
+		return err
+	}
+	if result.Duplicate {
+		s.logLifecycle("duplicate_skipped", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "duplicate")
+		s.logf("runtime.loop: duplicate mention skipped delivery=%s", invocation.DeliveryID)
+		return nil
+	}
+	s.logLifecycle("execution_completed", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "processed", "session="+prepared.SessionName)
+	s.logf("runtime.loop: mention processed delivery=%s session=%s", invocation.DeliveryID, prepared.SessionName)
+	return nil
+}
+
+func (s *foregroundRuntimeStarter) handleSlashInvocation(ctx context.Context, coordinator *runtime.SlackTurnCoordinator, invocation slack.InboundInvocation) error {
+	prepared, err := runtime.PrepareSlackInvocation(ctx, s.projectRepo, invocation)
+	if err != nil {
+		return s.handleInvocationRejection(ctx, invocation, err)
+	}
+	claim, err := coordinator.ClaimDelivery(ctx, prepared.Invocation.SourceType, prepared.Invocation.DeliveryID)
+	if err != nil {
+		return err
+	}
+	if claim.Duplicate {
+		s.logLifecycle("duplicate_skipped", prepared.Invocation.SourceType, prepared.Invocation.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "duplicate")
+		s.logf("runtime.loop: duplicate slash skipped delivery=%s", prepared.Invocation.DeliveryID)
+		return nil
+	}
+
+	s.logLifecycle("ack_sent", prepared.Invocation.SourceType, prepared.Invocation.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "acked")
+	s.logf("runtime.loop: slash ack sent delivery=%s", prepared.Invocation.DeliveryID)
+	go s.executeSlashInvocation(ctx, coordinator, prepared)
+	return nil
+}
+
+func (s *foregroundRuntimeStarter) executeSlashInvocation(ctx context.Context, coordinator *runtime.SlackTurnCoordinator, prepared runtime.PreparedSlackInvocation) {
+	command := runtime.ParseSlackCommand(prepared.Invocation.CommandText)
+	rawCommand := strings.TrimSpace(prepared.Invocation.CommandText)
+
+	rootMessage, err := s.client.PostMessage(ctx, slack.Message{
+		ChannelID: prepared.Project.SlackChannelID,
+		Text:      slashStartText(rawCommand),
+	})
+	if err != nil {
+		s.markDeliveryCompleted(ctx, prepared.Invocation.SourceType, prepared.Invocation.DeliveryID, "failed")
+		s.logLifecycle("execution_completed", prepared.Invocation.SourceType, prepared.Invocation.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "failed", "error="+strconv.Quote(err.Error()))
+		s.logf("runtime.loop: slash start message failed delivery=%s: %v", prepared.Invocation.DeliveryID, err)
+		return
+	}
+
+	threadTS := strings.TrimSpace(rootMessage.Timestamp)
+	sessionName := acpxadapter.SessionName(threadTS)
+	preparedEvent := runtime.PreparedSlackEvent{
+		SourceType: prepared.Invocation.SourceType,
+		DeliveryID: prepared.Invocation.DeliveryID,
+		Event: slack.Event{
+			ID:        prepared.Invocation.DeliveryID,
+			ChannelID: prepared.Project.SlackChannelID,
+			ThreadTS:  threadTS,
+			Timestamp: threadTS,
+			UserID:    prepared.Invocation.UserID,
+			Text:      rawCommand,
+		},
+		Project:     prepared.Project,
+		ThreadTS:    threadTS,
+		SessionName: sessionName,
+		ThreadState: runtime.ThreadState{
+			ThreadTS:    threadTS,
+			ChannelID:   prepared.Project.SlackChannelID,
+			ProjectName: prepared.Project.Name,
+			SessionName: sessionName,
+		},
+	}
+
+	s.logf(
+		"runtime.loop: dispatching slash delivery=%s project=%s session=%s thread=%s",
+		prepared.Invocation.DeliveryID,
+		prepared.Project.Name,
+		sessionName,
+		threadTS,
+	)
+
+	result, err := coordinator.ExecuteClaimed(ctx, preparedEvent, func(ctx context.Context, prepared runtime.PreparedSlackEvent) error {
+		s.logLifecycle("execution_started", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "processing", "session="+prepared.SessionName)
+		if !command.ShouldExecute() {
+			if err := s.client.PostThreadMessage(ctx, slack.Message{
+				ChannelID: prepared.Project.SlackChannelID,
+				ThreadTS:  prepared.ThreadTS,
+				Text:      slashUsageText(),
+			}); err != nil {
+				return err
+			}
+			s.logf("runtime.loop: rendered slash usage thread=%s", prepared.ThreadTS)
+			return nil
+		}
+
+		session, err := s.adapter.SendPrompt(ctx, acpxadapter.SessionRequest{
+			ProjectPath: prepared.Project.LocalPath,
+			ThreadTS:    prepared.ThreadTS,
+			Prompt:      command.ACPXPrompt(),
+		})
+		if err != nil {
+			return err
+		}
+
+		s.logf(
+			"runtime.loop: acpx completed session=%s output_bytes=%d",
+			session.SessionName,
+			len(session.Output),
+		)
+		s.logf(
+			"runtime.loop: acpx output session=%s payload=%s",
+			session.SessionName,
+			summarizeACPXOutput(session.Output, 4000),
+		)
+
+		if err := runtime.RenderACPXTurnOutput(ctx, s.renderer, runtime.SlackThreadRenderRequest{
+			ChannelID:   prepared.Project.SlackChannelID,
+			ThreadTS:    prepared.ThreadTS,
+			SessionName: session.SessionName,
+		}, session.Output); err != nil {
+			return err
+		}
+
+		s.logf("runtime.loop: rendered slash reply thread=%s session=%s", prepared.ThreadTS, session.SessionName)
+		return nil
+	})
+	if err != nil {
+		s.logLifecycle("execution_completed", preparedEvent.SourceType, preparedEvent.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "failed", "session="+preparedEvent.SessionName, "error="+strconv.Quote(err.Error()))
+		s.logf("runtime.loop: slash async failed delivery=%s: %v", prepared.Invocation.DeliveryID, err)
+		_ = s.postTurnError(ctx, preparedEvent, err)
+		return
+	}
+	if result.Duplicate {
+		s.logLifecycle("duplicate_skipped", preparedEvent.SourceType, preparedEvent.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "duplicate")
+		s.logf("runtime.loop: duplicate slash skipped delivery=%s", prepared.Invocation.DeliveryID)
+		return
+	}
+	s.logLifecycle("execution_completed", preparedEvent.SourceType, preparedEvent.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "processed", "session="+preparedEvent.SessionName)
+	s.logf("runtime.loop: slash processed delivery=%s session=%s", prepared.Invocation.DeliveryID, preparedEvent.SessionName)
 }
 
 func (s *foregroundRuntimeStarter) postTurnError(ctx context.Context, prepared runtime.PreparedSlackEvent, err error) error {
@@ -509,12 +670,136 @@ func (s *foregroundRuntimeStarter) logf(format string, args ...any) {
 	}
 }
 
+func (s *foregroundRuntimeStarter) logLifecycle(event, sourceType, deliveryID, channelID, project, status string, fields ...string) {
+	line := fmt.Sprintf(
+		"runtime.loop: lifecycle event=%s source=%s delivery_id=%s channel_id=%s project=%s status=%s",
+		event,
+		sourceType,
+		deliveryID,
+		channelID,
+		project,
+		status,
+	)
+	if len(fields) > 0 {
+		line += " " + strings.Join(fields, " ")
+	}
+	s.logf("%s", line)
+}
+
+func (s *foregroundRuntimeStarter) logInvocationRejection(invocation slack.InboundInvocation, err error) {
+	var rejectionErr *runtime.RejectedSlackInvocationError
+	if errors.As(err, &rejectionErr) {
+		sourceType := rejectionErr.Rejection.SourceType
+		if sourceType == "" {
+			sourceType = invocation.SourceType
+		}
+		channelID := rejectionErr.Rejection.ChannelID
+		if channelID == "" {
+			channelID = invocation.ChannelID
+		}
+		s.logLifecycle("execution_rejected", sourceType, invocation.DeliveryID, channelID, "unknown", "rejected", "error="+strconv.Quote(err.Error()))
+	}
+	s.logf("runtime.loop: rejected slack invocation delivery=%s: %v", invocation.DeliveryID, err)
+}
+
+func (s *foregroundRuntimeStarter) handleInvocationRejection(ctx context.Context, invocation slack.InboundInvocation, err error) error {
+	s.logInvocationRejection(invocation, err)
+
+	var rejectionErr *runtime.RejectedSlackInvocationError
+	if !errors.As(err, &rejectionErr) {
+		return nil
+	}
+	if renderErr := s.renderSlackInvocationRejection(ctx, rejectionErr.Rejection); renderErr != nil {
+		return fmt.Errorf("render slack rejection delivery=%s: %w", invocation.DeliveryID, renderErr)
+	}
+
+	sourceType := rejectionErr.Rejection.SourceType
+	if sourceType == "" {
+		sourceType = invocation.SourceType
+	}
+	channelID := rejectionErr.Rejection.ChannelID
+	if channelID == "" {
+		channelID = invocation.ChannelID
+	}
+	s.logf(
+		"runtime.loop: rendered slack rejection delivery=%s source=%s channel=%s ephemeral=%t",
+		invocation.DeliveryID,
+		sourceType,
+		channelID,
+		rejectionErr.Rejection.Ephemeral,
+	)
+	return nil
+}
+
+func (s *foregroundRuntimeStarter) renderSlackInvocationRejection(ctx context.Context, rejection runtime.SlackInvocationRejection) error {
+	if s == nil || s.client == nil {
+		return errors.New("slack client is required")
+	}
+
+	if rejection.Ephemeral {
+		client, ok := s.client.(slack.ResponseURLClient)
+		if !ok {
+			return errors.New("slack response_url client is required")
+		}
+		return client.PostResponseURLMessage(ctx, slack.ResponseURLMessage{
+			ResponseURL:  strings.TrimSpace(rejection.ResponseURL),
+			Text:         rejection.Message,
+			ResponseType: slack.ResponseTypeEphemeral,
+		})
+	}
+
+	message := slack.Message{
+		ChannelID: strings.TrimSpace(rejection.ChannelID),
+		ThreadTS:  strings.TrimSpace(rejection.ThreadTS),
+		Text:      rejection.Message,
+	}
+	if message.ChannelID == "" {
+		return errors.New("slack rejection channel id is required")
+	}
+	if message.ThreadTS != "" {
+		return s.client.PostThreadMessage(ctx, message)
+	}
+	_, err := s.client.PostMessage(ctx, message)
+	return err
+}
+
+func (s *foregroundRuntimeStarter) markDeliveryCompleted(ctx context.Context, sourceType, deliveryID, status string) {
+	if s == nil || s.runtimeRepo == nil {
+		return
+	}
+
+	dedupe, err := s.runtimeRepo.LoadEventDedupe(ctx, sourceType, deliveryID)
+	if err != nil {
+		return
+	}
+	completedAt := time.Now().UTC()
+	dedupe.Status = status
+	dedupe.ProcessedAt = &completedAt
+	_ = s.runtimeRepo.SaveEventDedupe(ctx, dedupe)
+}
+
 func summarizeACPXOutput(output string, limit int) string {
 	output = strings.TrimSpace(output)
 	if limit <= 0 || len(output) <= limit {
 		return output
 	}
 	return output[:limit] + "...(truncated)"
+}
+
+func mentionUsageText() string {
+	return runtime.SlackCommandHelpText(runtime.SlackCommandSurfaceMention)
+}
+
+func slashUsageText() string {
+	return runtime.SlackCommandHelpText(runtime.SlackCommandSurfaceSlash)
+}
+
+func slashStartText(command string) string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return "Received `/spexus` command."
+	}
+	return fmt.Sprintf("Running `/spexus %s` in a new execution thread.", command)
 }
 
 func (h *runtimeCommandHandler) loadStartupSnapshot(ctx context.Context) (runtimeSnapshot, error) {

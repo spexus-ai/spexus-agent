@@ -13,6 +13,13 @@ type fakeThreadMessageClient struct {
 	err      error
 }
 
+func (f *fakeThreadMessageClient) PostMessage(_ context.Context, message slack.Message) (slack.PostedMessage, error) {
+	if f.err != nil {
+		return slack.PostedMessage{}, f.err
+	}
+	return slack.PostedMessage{ChannelID: message.ChannelID, Timestamp: "1713686400.000100"}, nil
+}
+
 func (f *fakeThreadMessageClient) PostThreadMessage(_ context.Context, message slack.Message) error {
 	f.messages = append(f.messages, message)
 	if f.err != nil {

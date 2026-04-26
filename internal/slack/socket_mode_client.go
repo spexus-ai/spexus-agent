@@ -52,8 +52,21 @@ func (c *SocketModeClient) Events(ctx context.Context) (<-chan Event, error) {
 	}
 
 	events := make(chan Event)
-	go c.run(ctx, events)
+	go c.runEvents(ctx, events)
 	return events, nil
+}
+
+func (c *SocketModeClient) InboundInvocations(ctx context.Context) (<-chan InboundInvocation, error) {
+	if c == nil {
+		return nil, fmt.Errorf("slack socket mode client is nil")
+	}
+	if strings.TrimSpace(c.appToken) == "" {
+		return nil, fmt.Errorf("slack app token is required")
+	}
+
+	invocations := make(chan InboundInvocation)
+	go c.runInvocations(ctx, invocations)
+	return invocations, nil
 }
 
 func (c *SocketModeClient) Close() error {
@@ -68,7 +81,7 @@ func (c *SocketModeClient) Close() error {
 	return err
 }
 
-func (c *SocketModeClient) run(ctx context.Context, out chan<- Event) {
+func (c *SocketModeClient) runEvents(ctx context.Context, out chan<- Event) {
 	defer close(out)
 
 	backoff := time.Second
@@ -82,7 +95,33 @@ func (c *SocketModeClient) run(ctx context.Context, out chan<- Event) {
 			continue
 		}
 
-		if err := c.readLoop(ctx, socketURL, out); err != nil && ctx.Err() == nil {
+		if err := c.readEventLoop(ctx, socketURL, out); err != nil && ctx.Err() == nil {
+			if !sleepWithContext(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff)
+			continue
+		}
+
+		backoff = time.Second
+	}
+}
+
+func (c *SocketModeClient) runInvocations(ctx context.Context, out chan<- InboundInvocation) {
+	defer close(out)
+
+	backoff := time.Second
+	for ctx.Err() == nil {
+		socketURL, err := c.openConnection(ctx)
+		if err != nil {
+			if !sleepWithContext(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff)
+			continue
+		}
+
+		if err := c.readInvocationLoop(ctx, socketURL, out); err != nil && ctx.Err() == nil {
 			if !sleepWithContext(ctx, backoff) {
 				return
 			}
@@ -134,7 +173,7 @@ func (c *SocketModeClient) openConnection(ctx context.Context) (string, error) {
 	return response.URL, nil
 }
 
-func (c *SocketModeClient) readLoop(ctx context.Context, socketURL string, out chan<- Event) error {
+func (c *SocketModeClient) readEventLoop(ctx context.Context, socketURL string, out chan<- Event) error {
 	conn, _, err := c.dialerOrDefault().DialContext(ctx, socketURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial slack socket mode websocket: %w", err)
@@ -204,6 +243,82 @@ func (c *SocketModeClient) readLoop(ctx context.Context, socketURL string, out c
 	}
 }
 
+func (c *SocketModeClient) readInvocationLoop(ctx context.Context, socketURL string, out chan<- InboundInvocation) error {
+	conn, _, err := c.dialerOrDefault().DialContext(ctx, socketURL, nil)
+	if err != nil {
+		return fmt.Errorf("dial slack socket mode websocket: %w", err)
+	}
+	c.logf("runtime.socket: websocket connected url=%s", socketURL)
+	c.setConn(conn)
+	defer func() {
+		_ = c.Close()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("read slack socket mode message: %w", err)
+		}
+		c.logf("runtime.socket: raw recv %s", strings.TrimSpace(string(data)))
+
+		envelope, err := decodeSocketModeEnvelope(data)
+		if err != nil {
+			c.logf("runtime.socket: envelope decode failed: %v", err)
+			continue
+		}
+		c.logf("runtime.socket: envelope type=%s envelope_id=%s", envelope.Type, envelope.EnvelopeID)
+
+		if envelope.EnvelopeID != "" {
+			if err := conn.WriteJSON(map[string]string{"envelope_id": envelope.EnvelopeID}); err != nil {
+				return fmt.Errorf("ack slack socket mode envelope: %w", err)
+			}
+			c.logf("runtime.socket: ack envelope_id=%s", envelope.EnvelopeID)
+		}
+
+		invocation, ok, err := invocationFromSocketModeEnvelope(envelope)
+		if err != nil {
+			c.logf("runtime.socket: inbound extraction failed: %v", err)
+			if envelope.Type == "disconnect" {
+				return nil
+			}
+			continue
+		}
+		if !ok {
+			c.logf("runtime.socket: envelope ignored type=%s", envelope.Type)
+			if envelope.Type == "disconnect" {
+				return nil
+			}
+			continue
+		}
+		c.logf(
+			"runtime.socket: normalized inbound delivery=%s source=%s channel=%s thread=%s",
+			invocation.DeliveryID,
+			invocation.SourceType,
+			invocation.ChannelID,
+			invocation.ThreadTS,
+		)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case out <- invocation:
+		}
+	}
+}
+
 type socketModeEnvelope struct {
 	EnvelopeID string          `json:"envelope_id,omitempty"`
 	Type       string          `json:"type,omitempty"`
@@ -235,7 +350,7 @@ func decodeSocketModeEnvelope(data []byte) (socketModeEnvelope, error) {
 }
 
 func eventFromSocketModeEnvelope(envelope socketModeEnvelope) (Event, bool, error) {
-	if strings.TrimSpace(envelope.Type) != "events_api" {
+	if strings.TrimSpace(envelope.Type) != SocketModeEnvelopeEventsAPI {
 		return Event{}, false, nil
 	}
 
@@ -268,6 +383,54 @@ func eventFromSocketModeEnvelope(envelope socketModeEnvelope) (Event, bool, erro
 		return Event{}, false, err
 	}
 	return event, true, nil
+}
+
+func invocationFromSocketModeEnvelope(envelope socketModeEnvelope) (InboundInvocation, bool, error) {
+	switch strings.TrimSpace(envelope.Type) {
+	case SocketModeEnvelopeEventsAPI:
+		var payload socketModeEventsPayload
+		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+			return InboundInvocation{}, false, err
+		}
+		if payload.Type != "" && strings.TrimSpace(payload.Type) != "event_callback" {
+			return InboundInvocation{}, false, nil
+		}
+
+		message := SocketModeMessage{
+			EventID:   payload.EventID,
+			Type:      payload.Event.Type,
+			ChannelID: payload.Event.ChannelID,
+			ThreadTS:  payload.Event.ThreadTS,
+			Timestamp: payload.Event.Timestamp,
+			UserID:    payload.Event.UserID,
+			BotID:     payload.Event.BotID,
+			AppID:     payload.Event.AppID,
+			Text:      payload.Event.Text,
+			Subtype:   payload.Event.Subtype,
+		}
+		if strings.TrimSpace(message.Subtype) != "" || strings.TrimSpace(message.BotID) != "" || strings.TrimSpace(message.AppID) != "" {
+			return InboundInvocation{}, false, nil
+		}
+
+		invocation, err := message.NormalizeInbound()
+		if err != nil {
+			return InboundInvocation{}, false, err
+		}
+		return invocation, true, nil
+	case SocketModeEnvelopeSlashCommands:
+		var payload SocketModeSlashCommand
+		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+			return InboundInvocation{}, false, err
+		}
+
+		invocation, err := payload.NormalizeInbound(envelope.EnvelopeID)
+		if err != nil {
+			return InboundInvocation{}, false, err
+		}
+		return invocation, true, nil
+	default:
+		return InboundInvocation{}, false, nil
+	}
 }
 
 func (c *SocketModeClient) httpClientOrDefault() *http.Client {

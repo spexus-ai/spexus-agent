@@ -241,19 +241,20 @@ func TestRuntimeRepositoryPersistsThreadStateAndDedupeMetadata(t *testing.T) {
 
 	processedAt := time.Now().UTC().Add(time.Minute)
 	if err := runtimeRepo.SaveEventDedupe(ctx, runtimemodel.EventDedupe{
-		SlackEventID: "Ev123",
-		ReceivedAt:   time.Now().UTC(),
-		ProcessedAt:  &processedAt,
-		Status:       "processed",
+		SourceType:  "mention",
+		DeliveryID:  "Ev123",
+		ReceivedAt:  time.Now().UTC(),
+		ProcessedAt: &processedAt,
+		Status:      "processed",
 	}); err != nil {
 		t.Fatalf("SaveEventDedupe() error = %v", err)
 	}
 
-	loadedDedupe, err := runtimeRepo.LoadEventDedupe(ctx, "Ev123")
+	loadedDedupe, err := runtimeRepo.LoadEventDedupe(ctx, "mention", "Ev123")
 	if err != nil {
 		t.Fatalf("LoadEventDedupe() error = %v", err)
 	}
-	if loadedDedupe.SlackEventID != "Ev123" || loadedDedupe.Status != "processed" || loadedDedupe.ProcessedAt == nil {
+	if loadedDedupe.SourceType != "mention" || loadedDedupe.DeliveryID != "Ev123" || loadedDedupe.Status != "processed" || loadedDedupe.ProcessedAt == nil {
 		t.Fatalf("LoadEventDedupe() = %#v", loadedDedupe)
 	}
 

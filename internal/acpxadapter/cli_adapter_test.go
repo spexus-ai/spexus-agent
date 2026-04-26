@@ -13,10 +13,14 @@ type recordedCall struct {
 	dir    string
 }
 
+type runnerResult struct {
+	output string
+	err    error
+}
+
 type fakeRunner struct {
 	calls   []recordedCall
-	outputs []string
-	err     error
+	results []runnerResult
 }
 
 func (f *fakeRunner) Run(_ context.Context, binary string, args []string, dir string) (string, error) {
@@ -26,15 +30,12 @@ func (f *fakeRunner) Run(_ context.Context, binary string, args []string, dir st
 		dir:    dir,
 	}
 	f.calls = append(f.calls, call)
-	if f.err != nil {
-		return "", f.err
-	}
-	if len(f.outputs) == 0 {
+	if len(f.results) == 0 {
 		return "", nil
 	}
-	output := f.outputs[0]
-	f.outputs = f.outputs[1:]
-	return output, nil
+	result := f.results[0]
+	f.results = f.results[1:]
+	return result.output, result.err
 }
 
 // Test: session names are derived deterministically from Slack thread timestamps.
@@ -54,7 +55,12 @@ func TestCLIAdapterEnsuresAndReusesSessionForPromptDispatch(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{
-		outputs: []string{"ensured", "prompted", "ensured-again", "prompted-again"},
+		results: []runnerResult{
+			{err: errors.New("no session")},
+			{output: "created"},
+			{output: "prompted"},
+			{output: "prompted-again"},
+		},
 	}
 	adapter := NewCLIAdapter("acpx", runner)
 
@@ -92,22 +98,22 @@ func TestCLIAdapterEnsuresAndReusesSessionForPromptDispatch(t *testing.T) {
 		t.Fatalf("runner calls = %d, want %d", got, want)
 	}
 
-	wantEnsure := []string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "ensure", "--name", "slack-1713686400.000100"}
 	wantPrompt := []string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", "slack-1713686400.000100", "root message"}
-	if fmt.Sprint(runner.calls[0].args) != fmt.Sprint(wantEnsure) {
-		t.Fatalf("first call args = %#v, want %#v", runner.calls[0].args, wantEnsure)
+	wantCreate := []string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "new", "--name", "slack-1713686400.000100"}
+	if fmt.Sprint(runner.calls[0].args) != fmt.Sprint(wantPrompt) {
+		t.Fatalf("first call args = %#v, want %#v", runner.calls[0].args, wantPrompt)
 	}
 	if runner.calls[0].dir != "/workspace/alpha" {
 		t.Fatalf("first call dir = %q, want /workspace/alpha", runner.calls[0].dir)
 	}
-	if fmt.Sprint(runner.calls[1].args) != fmt.Sprint(wantPrompt) {
-		t.Fatalf("second call args = %#v, want %#v", runner.calls[1].args, wantPrompt)
+	if fmt.Sprint(runner.calls[1].args) != fmt.Sprint(wantCreate) {
+		t.Fatalf("second call args = %#v, want %#v", runner.calls[1].args, wantCreate)
 	}
 	if runner.calls[1].dir != "/workspace/alpha" {
 		t.Fatalf("second call dir = %q, want /workspace/alpha", runner.calls[1].dir)
 	}
-	if fmt.Sprint(runner.calls[2].args) != fmt.Sprint(wantEnsure) {
-		t.Fatalf("third call args = %#v, want %#v", runner.calls[2].args, wantEnsure)
+	if fmt.Sprint(runner.calls[2].args) != fmt.Sprint(wantPrompt) {
+		t.Fatalf("third call args = %#v, want %#v", runner.calls[2].args, wantPrompt)
 	}
 	if fmt.Sprint(runner.calls[3].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", "slack-1713686400.000100", "thread reply"}) {
 		t.Fatalf("fourth call args = %#v, want thread reply prompt", runner.calls[3].args)
@@ -120,7 +126,7 @@ func TestCLIAdapterStatusAndCancelResolveThreadSession(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{
-		outputs: []string{"ok"},
+		results: []runnerResult{{output: "ok"}},
 	}
 	adapter := NewCLIAdapter("acpx", runner)
 
@@ -183,7 +189,7 @@ func TestCLIAdapterRejectsEmptyPrompt(t *testing.T) {
 func TestCLIAdapterPropagatesRunnerErrors(t *testing.T) {
 	t.Parallel()
 
-	runner := &fakeRunner{err: errors.New("boom")}
+	runner := &fakeRunner{results: []runnerResult{{err: errors.New("boom")}}}
 	adapter := NewCLIAdapter("acpx", runner)
 
 	_, err := adapter.Status(context.Background(), "1713686400.000100")
@@ -198,5 +204,36 @@ func TestNewCLIAdapterUsesACPXBinaryEnvOverride(t *testing.T) {
 	adapter := NewCLIAdapter("", &fakeRunner{})
 	if adapter.binary != "/opt/acpx/bin/acpx" {
 		t.Fatalf("adapter binary = %q, want /opt/acpx/bin/acpx", adapter.binary)
+	}
+}
+
+func TestCLIAdapterRetriesPromptAfterQueueOwnerStartupFailure(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{
+		results: []runnerResult{
+			{err: errors.New("Session queue owner failed to start")},
+			{output: "created"},
+			{output: "prompted"},
+		},
+	}
+	adapter := NewCLIAdapter("acpx", runner)
+
+	result, err := adapter.SendPrompt(context.Background(), SessionRequest{
+		ProjectPath: "/workspace/alpha",
+		ThreadTS:    "1713686400.000100",
+		Prompt:      "recover session",
+	})
+	if err != nil {
+		t.Fatalf("SendPrompt() error = %v", err)
+	}
+	if result.Output != "prompted" {
+		t.Fatalf("SendPrompt() output = %q, want prompted", result.Output)
+	}
+	if got, want := len(runner.calls), 3; got != want {
+		t.Fatalf("runner calls = %d, want %d", got, want)
+	}
+	if fmt.Sprint(runner.calls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "new", "--name", "slack-1713686400.000100"}) {
+		t.Fatalf("recreate call args = %#v, want sessions new", runner.calls[1].args)
 	}
 }

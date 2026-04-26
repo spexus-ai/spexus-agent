@@ -128,3 +128,218 @@ func TestPrepareSlackEventRejectsUnregisteredChannel(t *testing.T) {
 		t.Fatalf("GetByChannelID() calls = %d, want 1", resolver.calls)
 	}
 }
+
+// Test: shared invocation preparation resolves registered slash commands by channel without requiring thread context.
+// Validates: AC-1818 (REQ-1185 - slash invocations resolve the project by channel_id)
+func TestPrepareSlackInvocationResolvesRegisteredSlashChannelContext(t *testing.T) {
+	t.Parallel()
+
+	resolver := &fakeProjectContextResolver{
+		project: registry.Project{
+			Name:             "alpha",
+			LocalPath:        "/workspace/alpha",
+			SlackChannelID:   "C12345678",
+			SlackChannelName: "spexus-alpha",
+		},
+	}
+
+	prepared, err := PrepareSlackInvocation(context.Background(), resolver, slack.InboundInvocation{
+		SourceType:    slack.InboundSourceSlash,
+		DeliveryID:    "3-fwdc2",
+		ChannelID:     "C12345678",
+		UserID:        "U123",
+		CommandText:   "status",
+		ResponseURL:   "https://hooks.slack.test/response",
+		AckEnvelopeID: "3-fwdc2",
+	})
+	if err != nil {
+		t.Fatalf("PrepareSlackInvocation() error = %v", err)
+	}
+
+	if resolver.calls != 1 {
+		t.Fatalf("GetByChannelID() calls = %d, want 1", resolver.calls)
+	}
+	if prepared.Project.Name != "alpha" {
+		t.Fatalf("PrepareSlackInvocation() project = %#v, want alpha", prepared.Project)
+	}
+	if prepared.ThreadTS != "" || prepared.SessionName != "" {
+		t.Fatalf("PrepareSlackInvocation() thread/session = (%q, %q), want empty for slash", prepared.ThreadTS, prepared.SessionName)
+	}
+	if prepared.Invocation.SourceType != slack.InboundSourceSlash {
+		t.Fatalf("PrepareSlackInvocation() source = %q, want slash", prepared.Invocation.SourceType)
+	}
+}
+
+// Test: unregistered mention invocations produce a human-readable Slack message rejection before ACPX can start.
+// Validates: AC-1821 (REQ-1190 - unregistered channels reject before execution starts), AC-1821 (REQ-1191 - mention rejections are regular Slack messages)
+func TestPrepareSlackInvocationRejectsUnregisteredMentionChannel(t *testing.T) {
+	t.Parallel()
+
+	resolver := &fakeProjectContextResolver{err: registry.ErrNotFound}
+
+	_, err := PrepareSlackInvocation(context.Background(), resolver, slack.InboundInvocation{
+		SourceType:  slack.InboundSourceMention,
+		DeliveryID:  "Ev126",
+		ChannelID:   "C99999999",
+		UserID:      "U123",
+		CommandText: "<@Ubot> status",
+		ThreadTS:    "1713686400.000100",
+	})
+	if !errors.Is(err, ErrUnregisteredSlackChannel) {
+		t.Fatalf("PrepareSlackInvocation() error = %v, want ErrUnregisteredSlackChannel", err)
+	}
+
+	var rejectionErr *RejectedSlackInvocationError
+	if !errors.As(err, &rejectionErr) {
+		t.Fatalf("PrepareSlackInvocation() error = %v, want RejectedSlackInvocationError", err)
+	}
+	if rejectionErr.Rejection.Ephemeral {
+		t.Fatalf("mention rejection = %#v, want non-ephemeral rejection", rejectionErr.Rejection)
+	}
+	if rejectionErr.Rejection.ThreadTS != "1713686400.000100" {
+		t.Fatalf("mention rejection thread ts = %q, want invocation thread ts", rejectionErr.Rejection.ThreadTS)
+	}
+	if rejectionErr.Rejection.Message == "" {
+		t.Fatalf("mention rejection message = %q, want human-readable message", rejectionErr.Rejection.Message)
+	}
+}
+
+// Test: unregistered slash invocations produce an ephemeral rejection contract before ACPX can start.
+// Validates: AC-1822 (REQ-1190 - unregistered channels reject before execution starts), AC-1822 (REQ-1192 - slash rejections are ephemeral)
+func TestPrepareSlackInvocationRejectsUnregisteredSlashChannel(t *testing.T) {
+	t.Parallel()
+
+	resolver := &fakeProjectContextResolver{err: registry.ErrNotFound}
+
+	_, err := PrepareSlackInvocation(context.Background(), resolver, slack.InboundInvocation{
+		SourceType:    slack.InboundSourceSlash,
+		DeliveryID:    "3-fwdc2",
+		ChannelID:     "C99999999",
+		UserID:        "U123",
+		CommandText:   "status",
+		ResponseURL:   "https://hooks.slack.test/response",
+		AckEnvelopeID: "3-fwdc2",
+	})
+	if !errors.Is(err, ErrUnregisteredSlackChannel) {
+		t.Fatalf("PrepareSlackInvocation() error = %v, want ErrUnregisteredSlackChannel", err)
+	}
+
+	var rejectionErr *RejectedSlackInvocationError
+	if !errors.As(err, &rejectionErr) {
+		t.Fatalf("PrepareSlackInvocation() error = %v, want RejectedSlackInvocationError", err)
+	}
+	if !rejectionErr.Rejection.Ephemeral {
+		t.Fatalf("slash rejection = %#v, want ephemeral rejection", rejectionErr.Rejection)
+	}
+	if rejectionErr.Rejection.ResponseURL != "https://hooks.slack.test/response" {
+		t.Fatalf("slash rejection response url = %q, want response url", rejectionErr.Rejection.ResponseURL)
+	}
+	if rejectionErr.Rejection.ThreadTS != "" {
+		t.Fatalf("slash rejection thread ts = %q, want empty", rejectionErr.Rejection.ThreadTS)
+	}
+}
+
+// Test: root app_mention invocations strip the leading mention token and keep the root message timestamp as the execution thread anchor.
+// Validates: AC-1815 (REQ-1181 - root mentions start a new thread-oriented execution context), AC-1815 (REQ-1183 - mention command text is parsed from the payload)
+func TestPrepareSlackMentionEventResolvesRootMentionCommand(t *testing.T) {
+	t.Parallel()
+
+	resolver := &fakeProjectContextResolver{
+		project: registry.Project{
+			Name:             "alpha",
+			LocalPath:        "/workspace/alpha",
+			SlackChannelID:   "C12345678",
+			SlackChannelName: "spexus-alpha",
+		},
+	}
+
+	prepared, err := PrepareSlackMentionEvent(context.Background(), resolver, slack.InboundInvocation{
+		SourceType:  slack.InboundSourceMention,
+		DeliveryID:  "Ev127",
+		ChannelID:   "C12345678",
+		UserID:      "U123",
+		CommandText: "<@Ubot> status",
+		ThreadTS:    "1713686400.000100",
+	})
+	if err != nil {
+		t.Fatalf("PrepareSlackMentionEvent() error = %v", err)
+	}
+
+	if prepared.ThreadTS != "1713686400.000100" {
+		t.Fatalf("PrepareSlackMentionEvent() thread ts = %q, want root anchor", prepared.ThreadTS)
+	}
+	if prepared.Event.Text != "status" {
+		t.Fatalf("PrepareSlackMentionEvent() text = %q, want stripped command text", prepared.Event.Text)
+	}
+	if prepared.SessionName != "slack-1713686400.000100" {
+		t.Fatalf("PrepareSlackMentionEvent() session name = %q, want derived slack session name", prepared.SessionName)
+	}
+}
+
+// Test: threaded app_mention invocations reuse the existing thread anchor and parse the command body after the mention token.
+// Validates: AC-1816 (REQ-1182 - threaded mentions continue the existing Slack thread), AC-1816 (REQ-1183 - mention command text is parsed from the payload)
+func TestPrepareSlackMentionEventResolvesThreadedMentionCommand(t *testing.T) {
+	t.Parallel()
+
+	resolver := &fakeProjectContextResolver{
+		project: registry.Project{
+			Name:             "alpha",
+			LocalPath:        "/workspace/alpha",
+			SlackChannelID:   "C12345678",
+			SlackChannelName: "spexus-alpha",
+		},
+	}
+
+	prepared, err := PrepareSlackMentionEvent(context.Background(), resolver, slack.InboundInvocation{
+		SourceType:  slack.InboundSourceMention,
+		DeliveryID:  "Ev128",
+		ChannelID:   "C12345678",
+		UserID:      "U123",
+		CommandText: "<@Ubot> ask summarize current project state",
+		ThreadTS:    "1713686400.000100",
+	})
+	if err != nil {
+		t.Fatalf("PrepareSlackMentionEvent() error = %v", err)
+	}
+
+	if prepared.ThreadTS != "1713686400.000100" {
+		t.Fatalf("PrepareSlackMentionEvent() thread ts = %q, want existing thread anchor", prepared.ThreadTS)
+	}
+	if prepared.Event.Text != "ask summarize current project state" {
+		t.Fatalf("PrepareSlackMentionEvent() text = %q, want stripped threaded command", prepared.Event.Text)
+	}
+}
+
+// Test: empty app_mention invocations normalize to an empty command string so runtime can render usage without crashing.
+// Validates: AC-1817 (REQ-1184 - empty mention invocations return usage-oriented guidance)
+func TestPrepareSlackMentionEventLeavesEmptyCommandForUsageHandling(t *testing.T) {
+	t.Parallel()
+
+	resolver := &fakeProjectContextResolver{
+		project: registry.Project{
+			Name:             "alpha",
+			LocalPath:        "/workspace/alpha",
+			SlackChannelID:   "C12345678",
+			SlackChannelName: "spexus-alpha",
+		},
+	}
+
+	prepared, err := PrepareSlackMentionEvent(context.Background(), resolver, slack.InboundInvocation{
+		SourceType:  slack.InboundSourceMention,
+		DeliveryID:  "Ev129",
+		ChannelID:   "C12345678",
+		UserID:      "U123",
+		CommandText: "<@Ubot>",
+		ThreadTS:    "1713686400.000100",
+	})
+	if err != nil {
+		t.Fatalf("PrepareSlackMentionEvent() error = %v", err)
+	}
+
+	if prepared.Event.Text != "" {
+		t.Fatalf("PrepareSlackMentionEvent() text = %q, want empty command", prepared.Event.Text)
+	}
+	if prepared.ThreadTS != "1713686400.000100" {
+		t.Fatalf("PrepareSlackMentionEvent() thread ts = %q, want existing thread anchor", prepared.ThreadTS)
+	}
+}
