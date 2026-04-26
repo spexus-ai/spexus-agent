@@ -868,7 +868,7 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesLiveProgressBeforeC
 }
 
 // Test: assistant-only streamed chunks are published to Slack before terminal completion without waiting for a tool event boundary.
-// Validates: AC-1978 (REQ-1425 - assistant progress is published before ACPX reaches a terminal outcome), AC-1980 (REQ-1427 - terminal success still posts the final answer separately)
+// Validates: AC-1978 (REQ-1425 - assistant progress is published before ACPX reaches a terminal outcome), AC-1980 (REQ-1427 - terminal success does not duplicate an identical live answer)
 func TestForegroundRuntimeStarterCollectPromptEventsPublishesAssistantOnlyProgressBeforeCompletion(t *testing.T) {
 	t.Parallel()
 
@@ -939,11 +939,11 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesAssistantOnlyProgre
 	}
 
 	messages := client.snapshotMessages()
-	if got, want := len(messages), 2; got != want {
+	if got, want := len(messages), 1; got != want {
 		t.Fatalf("slack message count = %d, want %d", got, want)
 	}
-	if messages[1].Text != "hello world from acpx" {
-		t.Fatalf("final slack message = %q, want final answer", messages[1].Text)
+	if messages[0].Text != "hello world from acpx" {
+		t.Fatalf("final slack message = %q, want final answer", messages[0].Text)
 	}
 }
 

@@ -298,6 +298,44 @@ func TestSlackThreadProgressPublisherUpdatesSingleAssistantProgressMessage(t *te
 	}
 }
 
+func TestSlackThreadProgressPublisherSkipsDuplicateFinalAssistantMessage(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeThreadMessageClient{}
+	renderer := SlackThreadRenderer{Client: client}
+	publisher, err := renderer.NewProgressPublisher(SlackThreadRenderRequest{
+		ChannelID:   "C12345678",
+		ThreadTS:    "1713686400.000100",
+		SessionName: "slack-1713686400.000100",
+	}, SlackThreadProgressPublisherConfig{})
+	if err != nil {
+		t.Fatalf("NewProgressPublisher() error = %v", err)
+	}
+
+	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageChunk, Text: "pong"}); err != nil {
+		t.Fatalf("Consume(chunk) error = %v", err)
+	}
+	if err := publisher.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageFinal, Text: "pong"}); err != nil {
+		t.Fatalf("Consume(final) error = %v", err)
+	}
+	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventSessionDone}); err != nil {
+		t.Fatalf("Consume(done) error = %v", err)
+	}
+	if err := publisher.Finish(context.Background(), nil); err != nil {
+		t.Fatalf("Finish() error = %v", err)
+	}
+
+	if got, want := len(client.messages), 1; got != want {
+		t.Fatalf("message count = %d, want %d", got, want)
+	}
+	if client.messages[0].Text != "pong" {
+		t.Fatalf("progress message = %q", client.messages[0].Text)
+	}
+}
+
 func TestSlackThreadProgressPublisherFinishesWithTerminalError(t *testing.T) {
 	t.Parallel()
 

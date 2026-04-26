@@ -139,6 +139,8 @@ func (p *SlackThreadProgressPublisher) Finish(ctx context.Context, terminalErr e
 		p.terminal = "Session error" + suffixWithText(terminalErr.Error())
 	}
 
+	publishedAssistant := strings.TrimSpace(p.flushedAssistantProgress)
+	publishedProgressLineCount := len(p.flushedProgress)
 	switch {
 	case p.terminal != "":
 		if err := p.flush(ctx, true); err != nil {
@@ -167,6 +169,9 @@ func (p *SlackThreadProgressPublisher) Finish(ctx context.Context, terminalErr e
 		text = "Session complete."
 	}
 	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	if p.terminal == "" && publishedProgressLineCount == 0 && publishedAssistant != "" && text == publishedAssistant {
 		return nil
 	}
 
