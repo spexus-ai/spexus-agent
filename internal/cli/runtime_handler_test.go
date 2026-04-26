@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,20 +49,52 @@ func (s *fakeSlackInvocationSource) InboundInvocations(ctx context.Context) (<-c
 
 func (s *fakeSlackInvocationSource) Close() error { return nil }
 
+type recordingExecutionQueue struct {
+	mu       sync.Mutex
+	requests []runtimemodel.ExecutionRequest
+	enqueue  func(context.Context, runtimemodel.ExecutionRequest) error
+}
+
+func (q *recordingExecutionQueue) Enqueue(ctx context.Context, request runtimemodel.ExecutionRequest) error {
+	q.mu.Lock()
+	q.requests = append(q.requests, request)
+	enqueue := q.enqueue
+	q.mu.Unlock()
+	if enqueue != nil {
+		return enqueue(ctx, request)
+	}
+	return nil
+}
+
+func (q *recordingExecutionQueue) snapshotRequests() []runtimemodel.ExecutionRequest {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return append([]runtimemodel.ExecutionRequest(nil), q.requests...)
+}
+
 type recordingSlackClient struct {
 	mu                  sync.Mutex
 	messages            []slack.Message
+	timestamps          []string
+	updates             []slack.MessageUpdate
 	responseURLMessages []slack.ResponseURLMessage
+	postMessageErr      error
 }
 
 func (c *recordingSlackClient) PostMessage(_ context.Context, message slack.Message) (slack.PostedMessage, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.postMessageErr != nil {
+		return slack.PostedMessage{}, c.postMessageErr
+	}
+	timestamp := fmt.Sprintf("1713686400.%06d", len(c.messages)+100)
 	c.messages = append(c.messages, message)
+	c.timestamps = append(c.timestamps, timestamp)
 	return slack.PostedMessage{
 		ChannelID: message.ChannelID,
-		Timestamp: "1713686400.000100",
+		Timestamp: timestamp,
 	}, nil
 }
 
@@ -70,7 +103,22 @@ func (c *recordingSlackClient) PostThreadMessage(_ context.Context, message slac
 	defer c.mu.Unlock()
 
 	c.messages = append(c.messages, message)
+	c.timestamps = append(c.timestamps, fmt.Sprintf("1713686400.%06d", len(c.messages)+100))
 	return nil
+}
+
+func (c *recordingSlackClient) UpdateMessage(_ context.Context, update slack.MessageUpdate) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.updates = append(c.updates, update)
+	for i, timestamp := range c.timestamps {
+		if timestamp == update.Timestamp {
+			c.messages[i].Text = update.Text
+			return nil
+		}
+	}
+	return fmt.Errorf("message timestamp %q not found", update.Timestamp)
 }
 
 func (c *recordingSlackClient) PostResponseURLMessage(_ context.Context, message slack.ResponseURLMessage) error {
@@ -106,9 +154,11 @@ func (c *recordingSlackClient) FindChannelByName(context.Context, string) (slack
 func (c *recordingSlackClient) Close() error { return nil }
 
 type fakePromptAdapter struct {
-	results    []acpxadapter.SessionResult
-	calls      []acpxadapter.SessionRequest
-	sendPrompt func(context.Context, acpxadapter.SessionRequest) (acpxadapter.SessionResult, error)
+	mu          sync.Mutex
+	results     []acpxadapter.SessionResult
+	calls       []acpxadapter.SessionRequest
+	sendPrompt  func(context.Context, acpxadapter.SessionRequest) (acpxadapter.SessionResult, error)
+	startPrompt func(context.Context, acpxadapter.SessionRequest) (acpxadapter.PromptStream, error)
 }
 
 func (a *fakePromptAdapter) EnsureSession(context.Context, acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
@@ -116,16 +166,63 @@ func (a *fakePromptAdapter) EnsureSession(context.Context, acpxadapter.SessionRe
 }
 
 func (a *fakePromptAdapter) SendPrompt(ctx context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+	return a.nextPromptResult(ctx, req)
+}
+
+func (a *fakePromptAdapter) StartPrompt(ctx context.Context, req acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+	a.mu.Lock()
+	startPrompt := a.startPrompt
+	a.mu.Unlock()
+	if startPrompt != nil {
+		a.recordCall(req)
+		return startPrompt(ctx, req)
+	}
+
+	result, err := a.nextPromptResult(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	events, err := acpxadapter.TranslatePromptOutput(result.Output)
+	if err != nil {
+		return nil, err
+	}
+
+	return &fakePromptStream{
+		sessionName: result.SessionName,
+		events:      events,
+	}, nil
+}
+
+func (a *fakePromptAdapter) recordCall(req acpxadapter.SessionRequest) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.calls = append(a.calls, req)
-	if a.sendPrompt != nil {
-		return a.sendPrompt(ctx, req)
+}
+
+func (a *fakePromptAdapter) nextPromptResult(ctx context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+	a.mu.Lock()
+	a.calls = append(a.calls, req)
+	sendPrompt := a.sendPrompt
+	if sendPrompt != nil {
+		a.mu.Unlock()
+		return sendPrompt(ctx, req)
 	}
 	if len(a.results) == 0 {
+		a.mu.Unlock()
 		return acpxadapter.SessionResult{SessionName: acpxadapter.SessionName(req.ThreadTS)}, nil
 	}
 	result := a.results[0]
 	a.results = a.results[1:]
+	a.mu.Unlock()
 	return result, nil
+}
+
+func (a *fakePromptAdapter) snapshotCalls() []acpxadapter.SessionRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return append([]acpxadapter.SessionRequest(nil), a.calls...)
 }
 
 func (a *fakePromptAdapter) Status(context.Context, string) (acpxadapter.SessionResult, error) {
@@ -142,6 +239,10 @@ func (f *fakeRuntimeCancelAdapter) SendPrompt(context.Context, acpxadapter.Sessi
 	return acpxadapter.SessionResult{}, nil
 }
 
+func (f *fakeRuntimeCancelAdapter) StartPrompt(context.Context, acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (f *fakeRuntimeCancelAdapter) Status(context.Context, string) (acpxadapter.SessionResult, error) {
 	return acpxadapter.SessionResult{}, nil
 }
@@ -154,6 +255,58 @@ func (f *fakeRuntimeCancelAdapter) Cancel(_ context.Context, threadTS string) er
 func (r *recordingRuntimeStarter) Start(_ context.Context, status runtimemodel.Status) error {
 	r.statuses = append(r.statuses, status)
 	return nil
+}
+
+type fakePromptStream struct {
+	sessionName string
+	events      []acpxadapter.Event
+	waitErr     error
+}
+
+func (s *fakePromptStream) SessionName() string {
+	return s.sessionName
+}
+
+func (s *fakePromptStream) Events() <-chan acpxadapter.Event {
+	out := make(chan acpxadapter.Event, len(s.events))
+	for _, event := range s.events {
+		out <- event
+	}
+	close(out)
+	return out
+}
+
+func (s *fakePromptStream) Wait() error {
+	return s.waitErr
+}
+
+func (s *fakePromptStream) Close() error {
+	return nil
+}
+
+var _ io.Closer = (*fakePromptStream)(nil)
+
+type controlledPromptStream struct {
+	sessionName string
+	events      chan acpxadapter.Event
+	waitCh      chan error
+	closeErr    error
+}
+
+func (s *controlledPromptStream) SessionName() string {
+	return s.sessionName
+}
+
+func (s *controlledPromptStream) Events() <-chan acpxadapter.Event {
+	return s.events
+}
+
+func (s *controlledPromptStream) Wait() error {
+	return <-s.waitCh
+}
+
+func (s *controlledPromptStream) Close() error {
+	return s.closeErr
 }
 
 // Test: runtime start rejects unexpected arguments before attempting daemon startup.
@@ -602,13 +755,480 @@ func TestForegroundRuntimeStarterProcessesRootMentionCommand(t *testing.T) {
 		"runtime.loop: connected to slack socket mode",
 		"runtime.loop: received slack invocation delivery=Ev123 source=mention",
 		"runtime.loop: dispatching mention delivery=Ev123 project=alpha session=slack-1713686400.000100",
-		"runtime.loop: acpx output session=slack-1713686400.000100 payload=",
+		"runtime.loop: acpx events session=slack-1713686400.000100 payload=assistant_message_chunk:hello from acpx | assistant_message_final:hello from acpx | session_done",
 		"runtime.loop: rendered slack reply thread=1713686400.000100 session=slack-1713686400.000100",
 		"runtime.loop: mention processed delivery=Ev123 session=slack-1713686400.000100",
 	} {
 		if !strings.Contains(output, fragment) {
 			t.Fatalf("debug output missing %q: %s", fragment, output)
 		}
+	}
+}
+
+func TestForegroundRuntimeStarterCollectPromptEventsPublishesLiveProgressBeforeCompletion(t *testing.T) {
+	t.Parallel()
+
+	client := &recordingSlackClient{}
+	stream := &controlledPromptStream{
+		sessionName: "slack-1713686400.000100",
+		events:      make(chan acpxadapter.Event, 8),
+		waitCh:      make(chan error, 1),
+	}
+	adapter := &fakePromptAdapter{
+		startPrompt: func(context.Context, acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+			return stream, nil
+		},
+	}
+	starter := &foregroundRuntimeStarter{
+		client:   client,
+		renderer: runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:  adapter,
+	}
+	var debug bytes.Buffer
+	starter.debugf = func(format string, args ...any) {
+		_, _ = debug.WriteString(fmt.Sprintf(format, args...) + "\n")
+	}
+
+	prepared := runtimemodel.PreparedSlackEvent{
+		SourceType: slack.InboundSourceMention,
+		Project: registry.Project{
+			Name:           "alpha",
+			LocalPath:      "/workspace/alpha",
+			SlackChannelID: "C123",
+		},
+		ThreadTS:    "1713686400.000100",
+		SessionName: "slack-1713686400.000100",
+	}
+
+	type result struct {
+		sessionName string
+		events      []runtimemodel.ACPXTurnEvent
+		err         error
+	}
+	resultCh := make(chan result, 1)
+	request := runtimemodel.ExecutionRequest{
+		SourceType:  slack.InboundSourceMention,
+		DeliveryID:  "Ev-progress",
+		ChannelID:   "C123",
+		CommandText: "status",
+		Project: registry.Project{
+			Name:           "alpha",
+			LocalPath:      "/workspace/alpha",
+			SlackChannelID: "C123",
+		},
+		ThreadTS:    prepared.ThreadTS,
+		SessionName: prepared.SessionName,
+	}
+	go func() {
+		got, err := starter.collectPromptEvents(context.Background(), prepared, request, "status")
+		resultCh <- result{sessionName: got.sessionName, events: got.events, err: err}
+	}()
+
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventSessionStarted, Text: "slack-1713686400.000100"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantThinking, Text: "analyzing"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventToolStarted, ToolName: "grep", Text: "searching"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventToolFinished, ToolName: "grep", ToolStatus: "completed"}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		messages := client.snapshotMessages()
+		return len(messages) == 1 && strings.Contains(messages[0].Text, "Progress:")
+	})
+
+	messages := client.snapshotMessages()
+	if messages[0].Text != "Progress:\n- Session started: slack-1713686400.000100\n- Thinking: analyzing\n- Tool started: grep - searching\n- Tool finished: grep" {
+		t.Fatalf("live progress message = %q", messages[0].Text)
+	}
+
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageFinal, Text: "final answer"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventSessionDone}
+	close(stream.events)
+	stream.waitCh <- nil
+
+	got := <-resultCh
+	if got.err != nil {
+		t.Fatalf("collectPromptEvents() error = %v", got.err)
+	}
+	if got.sessionName != "slack-1713686400.000100" {
+		t.Fatalf("collectPromptEvents() session = %q, want slack session", got.sessionName)
+	}
+	if gotCount := len(got.events); gotCount != 6 {
+		t.Fatalf("collectPromptEvents() event count = %d, want 6", gotCount)
+	}
+
+	messages = client.snapshotMessages()
+	if gotCount := len(messages); gotCount != 2 {
+		t.Fatalf("slack message count = %d, want 2", gotCount)
+	}
+	if messages[1].Text != "final answer" {
+		t.Fatalf("final slack message = %q, want final answer", messages[1].Text)
+	}
+	if !strings.Contains(debug.String(), "runtime.loop: lifecycle event=progress_flushed source=mention delivery_id=Ev-progress channel_id=C123 project=alpha status=rendering session=slack-1713686400.000100 count=4 reason=count") {
+		t.Fatalf("debug output missing progress flush event: %s", debug.String())
+	}
+}
+
+// Test: assistant-only streamed chunks are published to Slack before terminal completion without waiting for a tool event boundary.
+// Validates: AC-1978 (REQ-1425 - assistant progress is published before ACPX reaches a terminal outcome), AC-1980 (REQ-1427 - terminal success does not duplicate an identical live answer)
+func TestForegroundRuntimeStarterCollectPromptEventsPublishesAssistantOnlyProgressBeforeCompletion(t *testing.T) {
+	t.Parallel()
+
+	client := &recordingSlackClient{}
+	stream := &controlledPromptStream{
+		sessionName: "slack-1713686400.000100",
+		events:      make(chan acpxadapter.Event, 8),
+		waitCh:      make(chan error, 1),
+	}
+	adapter := &fakePromptAdapter{
+		startPrompt: func(context.Context, acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+			return stream, nil
+		},
+	}
+	starter := &foregroundRuntimeStarter{
+		client:   client,
+		renderer: runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:  adapter,
+	}
+
+	prepared := runtimemodel.PreparedSlackEvent{
+		SourceType: slack.InboundSourceMention,
+		Project: registry.Project{
+			Name:           "alpha",
+			LocalPath:      "/workspace/alpha",
+			SlackChannelID: "C123",
+		},
+		ThreadTS:    "1713686400.000100",
+		SessionName: "slack-1713686400.000100",
+	}
+	request := runtimemodel.ExecutionRequest{
+		SourceType:  slack.InboundSourceMention,
+		DeliveryID:  "Ev-assistant-progress",
+		ChannelID:   "C123",
+		CommandText: "status",
+		Project: registry.Project{
+			Name:           "alpha",
+			LocalPath:      "/workspace/alpha",
+			SlackChannelID: "C123",
+		},
+		ThreadTS:    prepared.ThreadTS,
+		SessionName: prepared.SessionName,
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := starter.collectPromptEvents(context.Background(), prepared, request, "status")
+		resultCh <- err
+	}()
+
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: "hello"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: " world"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: " from"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: " acpx"}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		messages := client.snapshotMessages()
+		return len(messages) == 1 && messages[0].Text == "hello world from acpx"
+	})
+
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageFinal, Text: "hello world from acpx"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventSessionDone}
+	close(stream.events)
+	stream.waitCh <- nil
+
+	if err := <-resultCh; err != nil {
+		t.Fatalf("collectPromptEvents() error = %v", err)
+	}
+
+	messages := client.snapshotMessages()
+	if got, want := len(messages), 1; got != want {
+		t.Fatalf("slack message count = %d, want %d", got, want)
+	}
+	if messages[0].Text != "hello world from acpx" {
+		t.Fatalf("final slack message = %q, want final answer", messages[0].Text)
+	}
+}
+
+// Test: streamed mention progress that later fails still produces one terminal Slack error and persists failed lifecycle state.
+// Validates: AC-1978 (REQ-1425 - progress is published before ACPX reaches a terminal outcome), AC-1981 (REQ-1429 - execution state keeps a unique failed lifecycle record), AC-1981 (REQ-1430 - lifecycle timestamps and publisher checkpoints persist through failure)
+func TestForegroundRuntimeStarterReportsRenderedStreamFailureOnlyOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(home, "workspace", "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C123",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	client := &recordingSlackClient{}
+	adapter := &fakePromptAdapter{
+		startPrompt: func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+			return &fakePromptStream{
+				sessionName: acpxadapter.SessionName(req.ThreadTS),
+				events: []acpxadapter.Event{
+					{Kind: acpxadapter.EventAssistantMessageChunk, Text: "working"},
+				},
+				waitErr: errors.New("acpx async failure"),
+			}, nil
+		},
+	}
+
+	starter := &foregroundRuntimeStarter{
+		source: &fakeSlackInvocationSource{
+			invocations: []slack.InboundInvocation{
+				{
+					SourceType:  slack.InboundSourceMention,
+					DeliveryID:  "Ev-stream-fail",
+					ChannelID:   project.SlackChannelID,
+					ThreadTS:    "1713686400.000100",
+					UserID:      "U123",
+					CommandText: "<@Ubot> status",
+				},
+			},
+		},
+		client:      client,
+		renderer:    runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:     adapter,
+		projectRepo: store.Projects(),
+		runtimeRepo: store.Runtime(),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- starter.Start(ctx, runtimemodel.Status{})
+	}()
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		messages := client.snapshotMessages()
+		return len(messages) == 2 && messages[1].Text == "Session error: acpx async failure"
+	})
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context canceled", err)
+	}
+
+	messages := client.snapshotMessages()
+	if got, want := len(messages), 2; got != want {
+		t.Fatalf("slack message count = %d, want %d", got, want)
+	}
+	if messages[0].Text != "working" {
+		t.Fatalf("progress message = %q", messages[0].Text)
+	}
+	if messages[1].Text != "Session error: acpx async failure" {
+		t.Fatalf("terminal message = %q, want one rendered stream failure", messages[1].Text)
+	}
+
+	executionState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "mention", "Ev-stream-fail")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if executionState.Status != runtimemodel.ExecutionStatusFailed || executionState.CompletedAt == nil {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want failed execution", executionState)
+	}
+	if executionState.ThreadTS != "1713686400.000100" || executionState.SessionName != "slack-1713686400.000100" {
+		t.Fatalf("LoadExecutionStateByDelivery() thread/session = (%q, %q), want mention thread/session", executionState.ThreadTS, executionState.SessionName)
+	}
+	if executionState.QueuedAt.IsZero() || executionState.StartedAt == nil || executionState.RenderingStartedAt == nil {
+		t.Fatalf("LoadExecutionStateByDelivery() timestamps = %#v, want queued/running/rendering markers before failure", executionState)
+	}
+	if executionState.LastError != "acpx async failure" {
+		t.Fatalf("LoadExecutionStateByDelivery() last error = %q, want acpx async failure", executionState.LastError)
+	}
+	if executionState.PublisherCheckpointKind != string(runtimemodel.ACPXEventAssistantMessageChunk) || executionState.PublisherCheckpointSummary != "working" {
+		t.Fatalf("LoadExecutionStateByDelivery() checkpoint = (%q, %q), want assistant chunk/working", executionState.PublisherCheckpointKind, executionState.PublisherCheckpointSummary)
+	}
+
+	threadState, err := store.Runtime().LoadThreadState(context.Background(), "1713686400.000100")
+	if err != nil {
+		t.Fatalf("LoadThreadState() error = %v", err)
+	}
+	if threadState.LastStatus != "failed" || threadState.LastRequestID != "Ev-stream-fail" {
+		t.Fatalf("LoadThreadState() = %#v, want failed mention thread state", threadState)
+	}
+
+	dedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "mention", "Ev-stream-fail")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe() error = %v", err)
+	}
+	if dedupe.Status != "failed" || dedupe.ProcessedAt == nil {
+		t.Fatalf("LoadEventDedupe() = %#v, want failed mention delivery", dedupe)
+	}
+}
+
+// Test: accepted mention invocations are enqueued so the intake loop can continue processing a later mention without waiting for the first ACPX prompt to complete.
+// Validates: AC-1975 (REQ-1417 - mention ingestion does not wait for ACPX completion), AC-1975 (REQ-1418 - accepted mentions are enqueued for async execution), AC-1975 (REQ-1419 - intake returns immediately after normalization, resolution, and dedupe claim)
+func TestForegroundRuntimeStarterEnqueuesMentionExecutionWithoutBlockingNextInvocation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(home, "workspace", "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C123",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan struct{})
+
+	client := &recordingSlackClient{}
+	adapter := &fakePromptAdapter{}
+	var adapterCalls int
+	var adapterCallsMu sync.Mutex
+	adapter.sendPrompt = func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+		adapterCallsMu.Lock()
+		adapterCalls++
+		callIndex := adapterCalls
+		adapterCallsMu.Unlock()
+
+		switch callIndex {
+		case 1:
+			close(firstStarted)
+			<-releaseFirst
+			return acpxadapter.SessionResult{
+				SessionName: acpxadapter.SessionName(req.ThreadTS),
+				Output:      `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first async result"}}}}`,
+			}, nil
+		case 2:
+			close(secondStarted)
+			return acpxadapter.SessionResult{
+				SessionName: acpxadapter.SessionName(req.ThreadTS),
+				Output:      `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a8","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second async result"}}}}`,
+			}, nil
+		default:
+			return acpxadapter.SessionResult{}, fmt.Errorf("unexpected SendPrompt call %d", callIndex)
+		}
+	}
+
+	starter := &foregroundRuntimeStarter{
+		source: &fakeSlackInvocationSource{
+			invocations: []slack.InboundInvocation{
+				{
+					SourceType:  slack.InboundSourceMention,
+					DeliveryID:  "Ev130",
+					ChannelID:   project.SlackChannelID,
+					ThreadTS:    "1713686400.000100",
+					UserID:      "U123",
+					CommandText: "<@Ubot> status",
+				},
+				{
+					SourceType:  slack.InboundSourceMention,
+					DeliveryID:  "Ev131",
+					ChannelID:   project.SlackChannelID,
+					ThreadTS:    "1713686401.000200",
+					UserID:      "U123",
+					CommandText: "<@Ubot> status",
+				},
+			},
+		},
+		client:      client,
+		renderer:    runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:     adapter,
+		projectRepo: store.Projects(),
+		runtimeRepo: store.Runtime(),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- starter.Start(ctx, runtimemodel.Status{})
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first SendPrompt() did not start")
+	}
+
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second SendPrompt() did not start before the first prompt was released")
+	}
+
+	close(releaseFirst)
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		messages := client.snapshotMessages()
+		gotTexts := map[string]bool{}
+		for _, message := range messages {
+			gotTexts[message.Text] = true
+		}
+		return gotTexts["first async result"] && gotTexts["second async result"]
+	})
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context canceled", err)
+	}
+
+	calls := adapter.snapshotCalls()
+	if got, want := len(calls), 2; got != want {
+		t.Fatalf("adapter call count = %d, want %d", got, want)
+	}
+	gotThreads := map[string]bool{}
+	for _, call := range calls {
+		gotThreads[call.ThreadTS] = true
+	}
+	for _, threadTS := range []string{"1713686400.000100", "1713686401.000200"} {
+		if !gotThreads[threadTS] {
+			t.Fatalf("adapter calls = %#v, want both mention threads to execute independently", calls)
+		}
+	}
+
+	firstDedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "mention", "Ev130")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe(first) error = %v", err)
+	}
+	if firstDedupe.Status != "processed" {
+		t.Fatalf("first dedupe = %#v, want processed", firstDedupe)
+	}
+
+	secondDedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "mention", "Ev131")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe(second) error = %v", err)
+	}
+	if secondDedupe.Status != "processed" {
+		t.Fatalf("second dedupe = %#v, want processed", secondDedupe)
 	}
 }
 
@@ -701,6 +1321,528 @@ func TestForegroundRuntimeStarterProcessesThreadedMentionCommand(t *testing.T) {
 	}
 	if client.messages[0].ThreadTS != "1713686400.000100" {
 		t.Fatalf("slack reply thread ts = %q, want existing thread anchor", client.messages[0].ThreadTS)
+	}
+}
+
+// Test: accepted mention invocations are enqueued so a blocked execution in one thread does not stop intake or another thread in the same project.
+// Validates: AC-1975 (REQ-1417 - mention ingestion does not wait for ACPX completion), AC-1975 (REQ-1418 - accepted mentions are enqueued), AC-1975 (REQ-1419 - intake continues immediately without project-wide serialization)
+func TestForegroundRuntimeStarterEnqueuesMentionsWithoutBlockingLaterThreads(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(home, "workspace", "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C123",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	client := &recordingSlackClient{}
+	firstStarted := make(chan struct{}, 1)
+	secondStarted := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	adapter := &fakePromptAdapter{
+		sendPrompt: func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+			switch req.ThreadTS {
+			case "1713686400.000100":
+				firstStarted <- struct{}{}
+				<-releaseFirst
+				return acpxadapter.SessionResult{
+					SessionName: acpxadapter.SessionName(req.ThreadTS),
+					Output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first async mention result"}}}}
+{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+				}, nil
+			case "1713686400.000200":
+				secondStarted <- struct{}{}
+				<-releaseSecond
+				return acpxadapter.SessionResult{
+					SessionName: acpxadapter.SessionName(req.ThreadTS),
+					Output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second async mention result"}}}}
+{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+				}, nil
+			default:
+				return acpxadapter.SessionResult{}, fmt.Errorf("unexpected thread %s", req.ThreadTS)
+			}
+		},
+	}
+
+	var debug bytes.Buffer
+	var debugMu sync.Mutex
+	starter := &foregroundRuntimeStarter{
+		source: &fakeSlackInvocationSource{
+			invocations: []slack.InboundInvocation{
+				{
+					SourceType:  slack.InboundSourceMention,
+					DeliveryID:  "Ev126",
+					ChannelID:   project.SlackChannelID,
+					ThreadTS:    "1713686400.000100",
+					UserID:      "U123",
+					CommandText: "<@Ubot> status",
+				},
+				{
+					SourceType:  slack.InboundSourceMention,
+					DeliveryID:  "Ev127",
+					ChannelID:   project.SlackChannelID,
+					ThreadTS:    "1713686400.000200",
+					UserID:      "U123",
+					CommandText: "<@Ubot> ask summarize current project state",
+				},
+			},
+		},
+		client:      client,
+		renderer:    runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:     adapter,
+		projectRepo: store.Projects(),
+		runtimeRepo: store.Runtime(),
+	}
+	starter.debugf = func(format string, args ...any) {
+		debugMu.Lock()
+		defer debugMu.Unlock()
+		_, _ = debug.WriteString(fmt.Sprintf(format, args...) + "\n")
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- starter.Start(ctx, runtimemodel.Status{})
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first mention execution did not start")
+	}
+
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second mention execution did not start while the first thread was still blocked")
+	}
+
+	close(releaseSecond)
+	close(releaseFirst)
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(client.snapshotMessages()) == 2
+	})
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context canceled", err)
+	}
+
+	calls := adapter.snapshotCalls()
+	if got, want := len(calls), 2; got != want {
+		t.Fatalf("adapter call count = %d, want %d", got, want)
+	}
+
+	gotThreads := map[string]bool{}
+	for _, call := range calls {
+		gotThreads[call.ThreadTS] = true
+	}
+	for _, threadTS := range []string{"1713686400.000100", "1713686400.000200"} {
+		if !gotThreads[threadTS] {
+			t.Fatalf("adapter calls missing thread %s: %#v", threadTS, calls)
+		}
+	}
+
+	messages := client.snapshotMessages()
+	if got, want := len(messages), 2; got < want {
+		t.Fatalf("slack message count = %d, want at least %d", got, want)
+	}
+	gotTexts := map[string]bool{}
+	gotMessageThreads := map[string]bool{}
+	for _, message := range messages {
+		gotTexts[message.Text] = true
+		gotMessageThreads[message.ThreadTS] = true
+	}
+	for _, text := range []string{"first async mention result", "second async mention result"} {
+		if !gotTexts[text] {
+			t.Fatalf("slack messages missing %q: %#v", text, messages)
+		}
+	}
+	for _, threadTS := range []string{"1713686400.000100", "1713686400.000200"} {
+		if !gotMessageThreads[threadTS] {
+			t.Fatalf("slack messages missing thread %s: %#v", threadTS, messages)
+		}
+	}
+
+	for _, deliveryID := range []string{"Ev126", "Ev127"} {
+		dedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "mention", deliveryID)
+		if err != nil {
+			t.Fatalf("LoadEventDedupe(%s) error = %v", deliveryID, err)
+		}
+		if dedupe.Status != "processed" || dedupe.ProcessedAt == nil {
+			t.Fatalf("LoadEventDedupe(%s) = %#v, want processed mention delivery", deliveryID, dedupe)
+		}
+	}
+
+	debugMu.Lock()
+	output := debug.String()
+	debugMu.Unlock()
+	for _, fragment := range []string{
+		"runtime.loop: mention enqueued delivery=Ev126 session=slack-1713686400.000100",
+		"runtime.loop: mention enqueued delivery=Ev127 session=slack-1713686400.000200",
+		"runtime.loop: mention processed delivery=Ev126 session=slack-1713686400.000100",
+		"runtime.loop: mention processed delivery=Ev127 session=slack-1713686400.000200",
+	} {
+		if !strings.Contains(output, fragment) {
+			t.Fatalf("debug output missing %q: %s", fragment, output)
+		}
+	}
+}
+
+// Test: accepted mention invocations for one Slack session stay serialized while a later invocation for another thread in the same project can still start.
+// Validates: AC-1977 (REQ-1421 - the same session key is serialized until the earlier execution reaches terminal state), AC-1976 (REQ-1420 - a different session key can run concurrently), AC-1977 (REQ-1423 - runtime does not serialize the whole project)
+func TestForegroundRuntimeStarterSerializesSameMentionSessionWithoutBlockingOtherThread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(home, "workspace", "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C123",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	client := &recordingSlackClient{}
+	firstSharedStarted := make(chan struct{}, 1)
+	secondSharedStarted := make(chan struct{}, 1)
+	otherStarted := make(chan struct{}, 1)
+	releaseFirstShared := make(chan struct{})
+	releaseSecondShared := make(chan struct{})
+	releaseOther := make(chan struct{})
+
+	var sharedCalls int
+	var sharedCallsMu sync.Mutex
+	adapter := &fakePromptAdapter{
+		sendPrompt: func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+			switch req.ThreadTS {
+			case "1713686400.000100":
+				sharedCallsMu.Lock()
+				sharedCalls++
+				callIndex := sharedCalls
+				sharedCallsMu.Unlock()
+
+				switch callIndex {
+				case 1:
+					firstSharedStarted <- struct{}{}
+					<-releaseFirstShared
+					return acpxadapter.SessionResult{
+						SessionName: acpxadapter.SessionName(req.ThreadTS),
+						Output:      `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first shared mention result"}}}}` + "\n" + `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+					}, nil
+				case 2:
+					secondSharedStarted <- struct{}{}
+					<-releaseSecondShared
+					return acpxadapter.SessionResult{
+						SessionName: acpxadapter.SessionName(req.ThreadTS),
+						Output:      `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second shared mention result"}}}}` + "\n" + `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+					}, nil
+				default:
+					return acpxadapter.SessionResult{}, fmt.Errorf("unexpected shared-session SendPrompt call %d", callIndex)
+				}
+			case "1713686400.000200":
+				otherStarted <- struct{}{}
+				<-releaseOther
+				return acpxadapter.SessionResult{
+					SessionName: acpxadapter.SessionName(req.ThreadTS),
+					Output:      `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a8","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"other thread mention result"}}}}` + "\n" + `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+				}, nil
+			default:
+				return acpxadapter.SessionResult{}, fmt.Errorf("unexpected thread %s", req.ThreadTS)
+			}
+		},
+	}
+
+	starter := &foregroundRuntimeStarter{
+		source: &fakeSlackInvocationSource{
+			invocations: []slack.InboundInvocation{
+				{
+					SourceType:  slack.InboundSourceMention,
+					DeliveryID:  "Ev140",
+					ChannelID:   project.SlackChannelID,
+					ThreadTS:    "1713686400.000100",
+					UserID:      "U123",
+					CommandText: "<@Ubot> status",
+				},
+				{
+					SourceType:  slack.InboundSourceMention,
+					DeliveryID:  "Ev141",
+					ChannelID:   project.SlackChannelID,
+					ThreadTS:    "1713686400.000100",
+					UserID:      "U123",
+					CommandText: "<@Ubot> ask summarize shared thread",
+				},
+				{
+					SourceType:  slack.InboundSourceMention,
+					DeliveryID:  "Ev142",
+					ChannelID:   project.SlackChannelID,
+					ThreadTS:    "1713686400.000200",
+					UserID:      "U123",
+					CommandText: "<@Ubot> ask summarize parallel thread",
+				},
+			},
+		},
+		client:      client,
+		renderer:    runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:     adapter,
+		projectRepo: store.Projects(),
+		runtimeRepo: store.Runtime(),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- starter.Start(ctx, runtimemodel.Status{})
+	}()
+
+	select {
+	case <-firstSharedStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first shared-session execution did not start")
+	}
+
+	select {
+	case <-otherStarted:
+	case <-time.After(time.Second):
+		t.Fatal("other-thread execution did not start while the first shared session was still running")
+	}
+
+	select {
+	case <-secondSharedStarted:
+		t.Fatal("second shared-session execution started before the first shared execution reached terminal state")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(releaseFirstShared)
+
+	select {
+	case <-secondSharedStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second shared-session execution did not start after the first shared execution completed")
+	}
+
+	close(releaseOther)
+	close(releaseSecondShared)
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return len(client.snapshotMessages()) == 3
+	})
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context canceled", err)
+	}
+
+	calls := adapter.snapshotCalls()
+	if got, want := len(calls), 3; got != want {
+		t.Fatalf("adapter call count = %d, want %d", got, want)
+	}
+	if calls[2].ThreadTS != "1713686400.000100" {
+		t.Fatalf("adapter calls = %#v, want the deferred shared-session execution to remain last", calls)
+	}
+	firstTwo := map[string]bool{
+		calls[0].ThreadTS: true,
+		calls[1].ThreadTS: true,
+	}
+	if !firstTwo["1713686400.000100"] || !firstTwo["1713686400.000200"] {
+		t.Fatalf("adapter calls = %#v, want the first two starts to cover one shared-session execution and the other thread in either order", calls)
+	}
+
+	for _, deliveryID := range []string{"Ev140", "Ev141", "Ev142"} {
+		dedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "mention", deliveryID)
+		if err != nil {
+			t.Fatalf("LoadEventDedupe(%s) error = %v", deliveryID, err)
+		}
+		if dedupe.Status != "processed" || dedupe.ProcessedAt == nil {
+			t.Fatalf("LoadEventDedupe(%s) = %#v, want processed mention delivery", deliveryID, dedupe)
+		}
+	}
+}
+
+// Test: accepted mention invocations beyond the default global concurrency stay queued until an earlier execution releases its worker slot.
+// Validates: AC-1976 (REQ-1420 - different session keys can run concurrently), AC-1976 (REQ-1422 - global concurrency defers additional executions once capacity is full)
+func TestForegroundRuntimeStarterDefersQueuedMentionsWhenGlobalConcurrencyIsFull(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(home, "workspace", "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C123",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	client := &recordingSlackClient{}
+	started := make(chan string, 5)
+	releaseByThread := map[string]chan struct{}{
+		"1713686400.000100": make(chan struct{}),
+		"1713686400.000200": make(chan struct{}),
+		"1713686400.000300": make(chan struct{}),
+		"1713686400.000400": make(chan struct{}),
+		"1713686400.000500": make(chan struct{}),
+	}
+	adapter := &fakePromptAdapter{
+		sendPrompt: func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+			started <- req.ThreadTS
+			<-releaseByThread[req.ThreadTS]
+			return acpxadapter.SessionResult{
+				SessionName: acpxadapter.SessionName(req.ThreadTS),
+				Output: fmt.Sprintf(
+					`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"result for %s"}}}}`+"\n"+`{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+					req.ThreadTS,
+				),
+			}, nil
+		},
+	}
+
+	starter := &foregroundRuntimeStarter{
+		source: &fakeSlackInvocationSource{
+			invocations: []slack.InboundInvocation{
+				{SourceType: slack.InboundSourceMention, DeliveryID: "Ev150", ChannelID: project.SlackChannelID, ThreadTS: "1713686400.000100", UserID: "U123", CommandText: "<@Ubot> status"},
+				{SourceType: slack.InboundSourceMention, DeliveryID: "Ev151", ChannelID: project.SlackChannelID, ThreadTS: "1713686400.000200", UserID: "U123", CommandText: "<@Ubot> status"},
+				{SourceType: slack.InboundSourceMention, DeliveryID: "Ev152", ChannelID: project.SlackChannelID, ThreadTS: "1713686400.000300", UserID: "U123", CommandText: "<@Ubot> status"},
+				{SourceType: slack.InboundSourceMention, DeliveryID: "Ev153", ChannelID: project.SlackChannelID, ThreadTS: "1713686400.000400", UserID: "U123", CommandText: "<@Ubot> status"},
+				{SourceType: slack.InboundSourceMention, DeliveryID: "Ev154", ChannelID: project.SlackChannelID, ThreadTS: "1713686400.000500", UserID: "U123", CommandText: "<@Ubot> status"},
+			},
+		},
+		client:      client,
+		renderer:    runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:     adapter,
+		projectRepo: store.Projects(),
+		runtimeRepo: store.Runtime(),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- starter.Start(ctx, runtimemodel.Status{})
+	}()
+
+	firstFour := make(map[string]bool, 4)
+	for len(firstFour) < 4 {
+		select {
+		case threadTS := <-started:
+			firstFour[threadTS] = true
+		case <-time.After(time.Second):
+			t.Fatalf("only %d executions started before timeout, want 4 at the default global concurrency limit", len(firstFour))
+		}
+	}
+
+	for _, threadTS := range []string{"1713686400.000100", "1713686400.000200", "1713686400.000300", "1713686400.000400"} {
+		if !firstFour[threadTS] {
+			t.Fatalf("started threads = %#v, want initial worker slots filled by the first four unique sessions", firstFour)
+		}
+	}
+
+	select {
+	case threadTS := <-started:
+		t.Fatalf("execution for %s started before a global worker slot was released", threadTS)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(releaseByThread["1713686400.000100"])
+
+	select {
+	case threadTS := <-started:
+		if threadTS != "1713686400.000500" {
+			t.Fatalf("thread started after releasing one worker slot = %q, want queued fifth session", threadTS)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued fifth execution did not start after a global worker slot was released")
+	}
+
+	for _, threadTS := range []string{"1713686400.000200", "1713686400.000300", "1713686400.000400", "1713686400.000500"} {
+		close(releaseByThread[threadTS])
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		if len(client.snapshotMessages()) != 5 {
+			return false
+		}
+		for _, deliveryID := range []string{"Ev150", "Ev151", "Ev152", "Ev153", "Ev154"} {
+			dedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "mention", deliveryID)
+			if err != nil || dedupe.Status != "processed" || dedupe.ProcessedAt == nil {
+				return false
+			}
+		}
+		return true
+	})
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context canceled", err)
+	}
+
+	calls := adapter.snapshotCalls()
+	if got, want := len(calls), 5; got != want {
+		t.Fatalf("adapter call count = %d, want %d", got, want)
+	}
+
+	for _, deliveryID := range []string{"Ev150", "Ev151", "Ev152", "Ev153", "Ev154"} {
+		dedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "mention", deliveryID)
+		if err != nil {
+			t.Fatalf("LoadEventDedupe(%s) error = %v", deliveryID, err)
+		}
+		if dedupe.Status != "processed" || dedupe.ProcessedAt == nil {
+			t.Fatalf("LoadEventDedupe(%s) = %#v, want processed mention delivery", deliveryID, dedupe)
+		}
 	}
 }
 
@@ -922,6 +2064,7 @@ func TestForegroundRuntimeStarterRendersUnregisteredSlashRejection(t *testing.T)
 					CommandText:   "status",
 					ResponseURL:   "https://hooks.slack.test/response",
 					AckEnvelopeID: "Ev-unregistered-slash",
+					Acked:         true,
 				},
 			},
 		},
@@ -989,8 +2132,8 @@ func TestForegroundRuntimeStarterRendersUnregisteredSlashRejection(t *testing.T)
 	}
 }
 
-// Test: slash invocations are acknowledged before long-running ACPX work and publish the final result asynchronously into a new execution thread.
-// Validates: AC-1818 (REQ-1186 - slash invocations acknowledge within the Slack window), AC-1819 (REQ-1188 - long-running slash commands publish their final result asynchronously), AC-1819 (REQ-1195 - slash commands use channel-level execution rules)
+// Test: slash invocations acknowledge before async execution, publish the final result into the worker-owned thread, and persist the full processed lifecycle.
+// Validates: AC-1983 (REQ-1433 - slash acknowledgement is sent before async execution starts), AC-1983 (REQ-1435 - accepted slash execution completes asynchronously in the execution thread), AC-1981 (REQ-1429 - slash execution state is persisted), AC-1981 (REQ-1430 - slash lifecycle timestamps and terminal checkpoints are recorded)
 func TestForegroundRuntimeStarterAcknowledgesSlashAndPublishesAsyncThreadResult(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1049,6 +2192,7 @@ func TestForegroundRuntimeStarterAcknowledgesSlashAndPublishesAsyncThreadResult(
 					CommandText:   "ask summarize open work",
 					ResponseURL:   "https://hooks.slack.test/response",
 					AckEnvelopeID: "3-fwdc2",
+					Acked:         true,
 				},
 			},
 		},
@@ -1114,6 +2258,39 @@ func TestForegroundRuntimeStarterAcknowledgesSlashAndPublishesAsyncThreadResult(
 		t.Fatalf("adapter call thread ts = %q, want execution thread timestamp", adapter.calls[0].ThreadTS)
 	}
 
+	executionState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "slash", "3-fwdc2")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if executionState.Status != runtimemodel.ExecutionStatusProcessed || executionState.CompletedAt == nil {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want processed slash execution", executionState)
+	}
+	if executionState.ThreadTS != "1713686400.000100" || executionState.SessionName != "slack-1713686400.000100" {
+		t.Fatalf("LoadExecutionStateByDelivery() thread/session = (%q, %q), want worker-owned slash thread/session", executionState.ThreadTS, executionState.SessionName)
+	}
+	if executionState.QueuedAt.IsZero() || executionState.StartedAt == nil || executionState.RenderingStartedAt == nil {
+		t.Fatalf("LoadExecutionStateByDelivery() timestamps = %#v, want queued/running/rendering markers", executionState)
+	}
+	if executionState.PublisherCheckpointKind != string(runtimemodel.ACPXEventSessionDone) || executionState.PublisherCheckpointSummary != "" {
+		t.Fatalf("LoadExecutionStateByDelivery() checkpoint = (%q, %q), want session_done/empty summary", executionState.PublisherCheckpointKind, executionState.PublisherCheckpointSummary)
+	}
+
+	threadState, err := store.Runtime().LoadThreadState(context.Background(), "1713686400.000100")
+	if err != nil {
+		t.Fatalf("LoadThreadState() error = %v", err)
+	}
+	if threadState.LastStatus != "processed" || threadState.LastRequestID != "3-fwdc2" {
+		t.Fatalf("LoadThreadState() = %#v, want processed slash thread state", threadState)
+	}
+
+	dedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "slash", "3-fwdc2")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe() error = %v", err)
+	}
+	if dedupe.Status != "processed" || dedupe.ProcessedAt == nil {
+		t.Fatalf("LoadEventDedupe() = %#v, want processed slash delivery", dedupe)
+	}
+
 	debugMu.Lock()
 	output := debug.String()
 	debugMu.Unlock()
@@ -1129,6 +2306,101 @@ func TestForegroundRuntimeStarterAcknowledgesSlashAndPublishesAsyncThreadResult(
 	}
 	if strings.Index(output, "runtime.loop: slash ack sent delivery=3-fwdc2") > strings.Index(output, "runtime.loop: slash processed delivery=3-fwdc2 session=slack-1713686400.000100") {
 		t.Fatalf("debug output did not show slash ack before completion: %s", output)
+	}
+}
+
+// Test: slash execution is never enqueued or started until the inbound source confirms acknowledgement completion.
+// Validates: AC-1984 (REQ-1434 - ack failure prevents async execution start)
+func TestForegroundRuntimeStarterDoesNotStartSlashExecutionWithoutAcknowledgement(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(home, "workspace", "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C123",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	client := &recordingSlackClient{}
+	adapter := &fakePromptAdapter{}
+
+	var debug bytes.Buffer
+	var debugMu sync.Mutex
+	starter := &foregroundRuntimeStarter{
+		source: &fakeSlackInvocationSource{
+			invocations: []slack.InboundInvocation{
+				{
+					SourceType:    slack.InboundSourceSlash,
+					DeliveryID:    "3-unacked",
+					ChannelID:     project.SlackChannelID,
+					UserID:        "U123",
+					CommandText:   "status",
+					ResponseURL:   "https://hooks.slack.test/response",
+					AckEnvelopeID: "3-unacked",
+				},
+			},
+		},
+		client:      client,
+		renderer:    runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:     adapter,
+		projectRepo: store.Projects(),
+		runtimeRepo: store.Runtime(),
+	}
+	starter.debugf = func(format string, args ...any) {
+		debugMu.Lock()
+		defer debugMu.Unlock()
+		_, _ = debug.WriteString(fmt.Sprintf(format, args...) + "\n")
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- starter.Start(ctx, runtimemodel.Status{})
+	}()
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		debugMu.Lock()
+		output := debug.String()
+		debugMu.Unlock()
+		return strings.Contains(output, `runtime.loop: slash failed delivery=3-unacked: slash invocation acknowledgement not completed for delivery "3-unacked"`)
+	})
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context canceled", err)
+	}
+
+	if got := len(adapter.snapshotCalls()); got != 0 {
+		t.Fatalf("adapter call count = %d, want 0 when slash ack did not complete", got)
+	}
+	if got := len(client.snapshotMessages()); got != 0 {
+		t.Fatalf("slack channel message count = %d, want 0 when slash ack did not complete", got)
+	}
+	if got := len(client.snapshotResponseURLMessages()); got != 0 {
+		t.Fatalf("response_url message count = %d, want 0 when slash ack did not complete", got)
+	}
+
+	if _, err := store.Runtime().LoadEventDedupe(context.Background(), "slash", "3-unacked"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("LoadEventDedupe() error = %v, want not found when slash ack did not complete", err)
 	}
 }
 
@@ -1188,6 +2460,7 @@ func TestForegroundRuntimeStarterProcessesSlashStatusCommand(t *testing.T) {
 					CommandText:   "status",
 					ResponseURL:   "https://hooks.slack.test/response",
 					AckEnvelopeID: "3-fwdc5",
+					Acked:         true,
 				},
 			},
 		},
@@ -1317,6 +2590,7 @@ func TestForegroundRuntimeStarterReportsSlashAsyncFailureInExecutionThread(t *te
 					CommandText:   "status",
 					ResponseURL:   "https://hooks.slack.test/response",
 					AckEnvelopeID: "3-fwdc3",
+					Acked:         true,
 				},
 			},
 		},
@@ -1371,6 +2645,208 @@ func TestForegroundRuntimeStarterReportsSlashAsyncFailureInExecutionThread(t *te
 	}
 }
 
+// Test: if the worker cannot create the slash execution root message after ack, the runtime reports the failure through response_url and never starts ACPX.
+// Validates: AC-1983 (REQ-1435 - accepted slash execution is bound to a worker-owned execution thread), AC-1984 (REQ-1434 - post-ack bootstrap failures are deterministic and do not start execution)
+func TestForegroundRuntimeStarterReportsSlashBootstrapFailureViaResponseURL(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(home, "workspace", "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C123",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	client := &recordingSlackClient{postMessageErr: errors.New("slack post failed")}
+	adapter := &fakePromptAdapter{}
+
+	var debug bytes.Buffer
+	var debugMu sync.Mutex
+	starter := &foregroundRuntimeStarter{
+		source: &fakeSlackInvocationSource{
+			invocations: []slack.InboundInvocation{
+				{
+					SourceType:    slack.InboundSourceSlash,
+					DeliveryID:    "3-bootstrap-fail",
+					ChannelID:     project.SlackChannelID,
+					UserID:        "U123",
+					CommandText:   "status",
+					ResponseURL:   "https://hooks.slack.test/response",
+					AckEnvelopeID: "3-bootstrap-fail",
+					Acked:         true,
+				},
+			},
+		},
+		client:      client,
+		renderer:    runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:     adapter,
+		projectRepo: store.Projects(),
+		runtimeRepo: store.Runtime(),
+	}
+	starter.debugf = func(format string, args ...any) {
+		debugMu.Lock()
+		defer debugMu.Unlock()
+		_, _ = debug.WriteString(fmt.Sprintf(format, args...) + "\n")
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- starter.Start(ctx, runtimemodel.Status{})
+	}()
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		responseURLMessages := client.snapshotResponseURLMessages()
+		return len(responseURLMessages) == 1 && responseURLMessages[0].Text == "Session error: slack post failed"
+	})
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context canceled", err)
+	}
+
+	if got := len(adapter.snapshotCalls()); got != 0 {
+		t.Fatalf("adapter call count = %d, want 0 when slash bootstrap fails", got)
+	}
+	if got := len(client.snapshotMessages()); got != 0 {
+		t.Fatalf("slack channel message count = %d, want 0 when root message bootstrap fails", got)
+	}
+
+	responseURLMessages := client.snapshotResponseURLMessages()
+	if got, want := len(responseURLMessages), 1; got != want {
+		t.Fatalf("response_url message count = %d, want %d", got, want)
+	}
+	if responseURLMessages[0].ResponseURL != "https://hooks.slack.test/response" {
+		t.Fatalf("response_url = %q, want response url", responseURLMessages[0].ResponseURL)
+	}
+	if responseURLMessages[0].ResponseType != slack.ResponseTypeEphemeral {
+		t.Fatalf("response type = %q, want ephemeral", responseURLMessages[0].ResponseType)
+	}
+
+	dedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "slash", "3-bootstrap-fail")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe() error = %v", err)
+	}
+	if dedupe.Status != "failed" || dedupe.ProcessedAt == nil {
+		t.Fatalf("LoadEventDedupe() = %#v, want failed slash delivery after bootstrap error", dedupe)
+	}
+
+	debugMu.Lock()
+	output := debug.String()
+	debugMu.Unlock()
+	for _, fragment := range []string{
+		"runtime.loop: slash ack sent delivery=3-bootstrap-fail",
+		"runtime.loop: slash start message failed delivery=3-bootstrap-fail: slack post failed",
+	} {
+		if !strings.Contains(output, fragment) {
+			t.Fatalf("debug output missing %q: %s", fragment, output)
+		}
+	}
+}
+
+// Test: slash ingestion records the acknowledgement before enqueueing the async execution request.
+// Validates: AC-1983 (REQ-1433 - slash acknowledgement happens before async execution begins), AC-1983 (REQ-1435 - accepted slash work is handed off to async execution)
+func TestForegroundRuntimeStarterHandleSlashInvocationAcknowledgesBeforeEnqueue(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(home, "workspace", "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C123",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	var debug bytes.Buffer
+	var debugMu sync.Mutex
+	ackLoggedBeforeEnqueue := false
+	queue := &recordingExecutionQueue{
+		enqueue: func(_ context.Context, request runtimemodel.ExecutionRequest) error {
+			debugMu.Lock()
+			ackLoggedBeforeEnqueue = strings.Contains(debug.String(), "runtime.loop: slash ack sent delivery=3-order-check")
+			debugMu.Unlock()
+
+			if request.SourceType != slack.InboundSourceSlash {
+				t.Fatalf("Enqueue() source type = %q, want slash", request.SourceType)
+			}
+			if request.CommandText != "status" {
+				t.Fatalf("Enqueue() command text = %q, want status", request.CommandText)
+			}
+			return nil
+		},
+	}
+	starter := &foregroundRuntimeStarter{
+		projectRepo: store.Projects(),
+	}
+	starter.debugf = func(format string, args ...any) {
+		debugMu.Lock()
+		defer debugMu.Unlock()
+		_, _ = debug.WriteString(fmt.Sprintf(format, args...) + "\n")
+	}
+
+	coordinator := runtimemodel.NewSlackTurnCoordinator(store.Runtime(), "runtime-start")
+	err = starter.handleSlashInvocation(ctx, coordinator, queue, slack.InboundInvocation{
+		SourceType:    slack.InboundSourceSlash,
+		DeliveryID:    "3-order-check",
+		ChannelID:     project.SlackChannelID,
+		UserID:        "U123",
+		CommandText:   "status",
+		ResponseURL:   "https://hooks.slack.test/response",
+		AckEnvelopeID: "3-order-check",
+		Acked:         true,
+	})
+	if err != nil {
+		t.Fatalf("handleSlashInvocation() error = %v", err)
+	}
+	if !ackLoggedBeforeEnqueue {
+		t.Fatal("handleSlashInvocation() enqueued the slash request before logging acknowledgement")
+	}
+
+	requests := queue.snapshotRequests()
+	if got, want := len(requests), 1; got != want {
+		t.Fatalf("enqueued request count = %d, want %d", got, want)
+	}
+	if requests[0].ThreadTS != "" || requests[0].SessionName != "" {
+		t.Fatalf("enqueued slash request = %#v, want worker-owned thread/session bootstrap", requests[0])
+	}
+}
+
 // Test: duplicate mention deliveries reuse the source-aware dedupe record and do not execute ACPX twice.
 // Validates: AC-1825 (REQ-1193 - mention invocations are classified as source=mention), AC-1825 (REQ-1196 - duplicate mention deliveries are deduplicated), AC-1823 (REQ-1197 - mention lifecycle logs record source and status)
 func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
@@ -1415,6 +2891,7 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 	}
 
 	var debug bytes.Buffer
+	var debugMu sync.Mutex
 	starter := &foregroundRuntimeStarter{
 		source: &fakeSlackInvocationSource{
 			invocations: []slack.InboundInvocation{
@@ -1443,19 +2920,32 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 		runtimeRepo: store.Runtime(),
 	}
 	starter.debugf = func(format string, args ...any) {
+		debugMu.Lock()
+		defer debugMu.Unlock()
 		line := fmt.Sprintf(format, args...)
 		_, _ = debug.WriteString(line + "\n")
-		if strings.Contains(line, "runtime.loop: duplicate mention skipped delivery=Ev126") {
-			cancel()
-		}
 	}
 
-	err = starter.Start(ctx, runtimemodel.Status{})
-	if !errors.Is(err, context.Canceled) {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- starter.Start(ctx, runtimemodel.Status{})
+	}()
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		debugMu.Lock()
+		output := debug.String()
+		debugMu.Unlock()
+		return strings.Contains(output, "runtime.loop: duplicate mention skipped delivery=Ev126") &&
+			len(client.snapshotMessages()) == 1 &&
+			len(adapter.snapshotCalls()) == 1
+	})
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Start() error = %v, want context canceled", err)
 	}
 
-	if got, want := len(adapter.calls), 1; got != want {
+	if got, want := len(adapter.snapshotCalls()), 1; got != want {
 		t.Fatalf("adapter call count = %d, want %d", got, want)
 	}
 	if got, want := len(client.messages), 1; got != want {
@@ -1470,8 +2960,28 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 		t.Fatalf("LoadEventDedupe() = %#v, want processed mention delivery", dedupe)
 	}
 
+	executionState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "mention", "Ev126")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if executionState.ExecutionID != "mention:Ev126" || executionState.Status != runtimemodel.ExecutionStatusProcessed {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want processed mention execution", executionState)
+	}
+	if executionState.ThreadTS != "1713686400.000100" || executionState.SessionName != "slack-1713686400.000100" {
+		t.Fatalf("LoadExecutionStateByDelivery() thread/session = (%q, %q), want mention thread/session", executionState.ThreadTS, executionState.SessionName)
+	}
+	if executionState.QueuedAt.IsZero() || executionState.StartedAt == nil || executionState.RenderingStartedAt == nil || executionState.CompletedAt == nil {
+		t.Fatalf("LoadExecutionStateByDelivery() timestamps = %#v, want queued/running/rendering/completed markers", executionState)
+	}
+	if executionState.PublisherCheckpointKind != string(runtimemodel.ACPXEventSessionDone) {
+		t.Fatalf("LoadExecutionStateByDelivery() checkpoint kind = %q, want %q", executionState.PublisherCheckpointKind, runtimemodel.ACPXEventSessionDone)
+	}
+
+	debugMu.Lock()
 	output := debug.String()
+	debugMu.Unlock()
 	for _, fragment := range []string{
+		"runtime.loop: lifecycle event=execution_enqueued source=mention delivery_id=Ev126 channel_id=C123 project=alpha status=queued session=slack-1713686400.000100",
 		"runtime.loop: lifecycle event=execution_started source=mention delivery_id=Ev126 channel_id=C123 project=alpha status=processing",
 		"runtime.loop: lifecycle event=execution_completed source=mention delivery_id=Ev126 channel_id=C123 project=alpha status=processed",
 		"runtime.loop: lifecycle event=duplicate_skipped source=mention delivery_id=Ev126 channel_id=C123 project=alpha status=duplicate",
@@ -1479,6 +2989,348 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 		if !strings.Contains(output, fragment) {
 			t.Fatalf("debug output missing %q: %s", fragment, output)
 		}
+	}
+}
+
+// Test: startup reconciliation marks multiple stale non-terminal executions failed, clears runtime locks, and only notifies Slack when a thread anchor exists.
+// Validates: AC-1982 (REQ-1431 - startup recovery reconciles stale queued and running executions), AC-1982 (REQ-1432 - recovery remains observable and posts terminal Slack failure only when it has a delivery thread)
+func TestForegroundRuntimeStarterReconcilesNonTerminalExecutionsOnStartup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(home, "workspace", "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C123",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	threadTS := "1713686400.000100"
+	threadState := runtimemodel.ThreadState{
+		ThreadTS:      threadTS,
+		ChannelID:     project.SlackChannelID,
+		ProjectName:   project.Name,
+		SessionName:   "slack-" + threadTS,
+		LastStatus:    "processing",
+		LastRequestID: "Ev-recover",
+	}
+	if err := store.Runtime().SaveThreadState(ctx, threadState); err != nil {
+		t.Fatalf("SaveThreadState() error = %v", err)
+	}
+
+	receivedAt := time.Now().UTC().Add(-3 * time.Minute)
+	if err := store.Runtime().SaveEventDedupe(ctx, runtimemodel.EventDedupe{
+		SourceType: "mention",
+		DeliveryID: "Ev-recover",
+		ReceivedAt: receivedAt,
+		Status:     "processing",
+	}); err != nil {
+		t.Fatalf("SaveEventDedupe() error = %v", err)
+	}
+
+	queuedAt := time.Now().UTC().Add(-2 * time.Minute)
+	startedAt := time.Now().UTC().Add(-time.Minute)
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
+		ExecutionID: "mention:Ev-recover",
+		SourceType:  "mention",
+		DeliveryID:  "Ev-recover",
+		ProjectName: project.Name,
+		ChannelID:   project.SlackChannelID,
+		ThreadTS:    threadTS,
+		SessionName: threadState.SessionName,
+		Status:      runtimemodel.ExecutionStatusRunning,
+		QueuedAt:    queuedAt,
+		StartedAt:   &startedAt,
+		UpdatedAt:   startedAt,
+	}); err != nil {
+		t.Fatalf("SaveExecutionState() error = %v", err)
+	}
+
+	lockExpires := time.Now().UTC().Add(time.Minute)
+	if err := store.Runtime().SaveThreadLock(ctx, runtimemodel.ThreadLock{
+		ThreadTS:       threadTS,
+		LockOwner:      "runtime-start",
+		LockedAt:       startedAt,
+		LeaseExpiresAt: &lockExpires,
+		UpdatedAt:      startedAt,
+	}); err != nil {
+		t.Fatalf("SaveThreadLock() error = %v", err)
+	}
+
+	if err := store.Runtime().SaveEventDedupe(ctx, runtimemodel.EventDedupe{
+		SourceType: "slash",
+		DeliveryID: "3-recover-queued",
+		ReceivedAt: receivedAt.Add(30 * time.Second),
+		Status:     "acked",
+	}); err != nil {
+		t.Fatalf("SaveEventDedupe(queued slash) error = %v", err)
+	}
+
+	queuedSlashAt := time.Now().UTC().Add(-90 * time.Second)
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
+		ExecutionID: "slash:3-recover-queued",
+		SourceType:  "slash",
+		DeliveryID:  "3-recover-queued",
+		ProjectName: project.Name,
+		ChannelID:   project.SlackChannelID,
+		Status:      runtimemodel.ExecutionStatusQueued,
+		QueuedAt:    queuedSlashAt,
+		UpdatedAt:   queuedSlashAt,
+	}); err != nil {
+		t.Fatalf("SaveExecutionState(queued slash) error = %v", err)
+	}
+
+	client := &recordingSlackClient{}
+	var debug bytes.Buffer
+	var debugMu sync.Mutex
+	starter := &foregroundRuntimeStarter{
+		source:      &fakeSlackInvocationSource{},
+		client:      client,
+		renderer:    runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:     &fakePromptAdapter{},
+		projectRepo: store.Projects(),
+		runtimeRepo: store.Runtime(),
+	}
+	starter.debugf = func(format string, args ...any) {
+		debugMu.Lock()
+		defer debugMu.Unlock()
+		_, _ = debug.WriteString(fmt.Sprintf(format, args...) + "\n")
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- starter.Start(ctx, runtimemodel.Status{})
+	}()
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		executionState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "mention", "Ev-recover")
+		if err != nil {
+			return false
+		}
+		queuedSlashState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "slash", "3-recover-queued")
+		if err != nil {
+			return false
+		}
+		return executionState.Status == runtimemodel.ExecutionStatusFailed &&
+			executionState.CompletedAt != nil &&
+			queuedSlashState.Status == runtimemodel.ExecutionStatusFailed &&
+			queuedSlashState.CompletedAt != nil &&
+			len(client.snapshotMessages()) == 1
+	})
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context canceled", err)
+	}
+
+	executionState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "mention", "Ev-recover")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if executionState.Status != runtimemodel.ExecutionStatusFailed || executionState.CompletedAt == nil {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want failed terminal execution", executionState)
+	}
+	if executionState.LastError != runtimemodel.StartupRecoveryFailureReason {
+		t.Fatalf("LoadExecutionStateByDelivery() last error = %q, want startup recovery reason", executionState.LastError)
+	}
+
+	queuedSlashState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "slash", "3-recover-queued")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery(queued slash) error = %v", err)
+	}
+	if queuedSlashState.Status != runtimemodel.ExecutionStatusFailed || queuedSlashState.CompletedAt == nil {
+		t.Fatalf("LoadExecutionStateByDelivery(queued slash) = %#v, want failed terminal execution", queuedSlashState)
+	}
+	if queuedSlashState.LastError != runtimemodel.StartupRecoveryFailureReason {
+		t.Fatalf("LoadExecutionStateByDelivery(queued slash) last error = %q, want startup recovery reason", queuedSlashState.LastError)
+	}
+
+	recoveredThreadState, err := store.Runtime().LoadThreadState(context.Background(), threadTS)
+	if err != nil {
+		t.Fatalf("LoadThreadState() error = %v", err)
+	}
+	if recoveredThreadState.LastStatus != runtimemodel.ExecutionStatusFailed {
+		t.Fatalf("LoadThreadState() last status = %q, want failed", recoveredThreadState.LastStatus)
+	}
+
+	dedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "mention", "Ev-recover")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe() error = %v", err)
+	}
+	if dedupe.Status != runtimemodel.ExecutionStatusFailed || dedupe.ProcessedAt == nil {
+		t.Fatalf("LoadEventDedupe() = %#v, want failed dedupe with processedAt", dedupe)
+	}
+
+	queuedSlashDedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "slash", "3-recover-queued")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe(queued slash) error = %v", err)
+	}
+	if queuedSlashDedupe.Status != runtimemodel.ExecutionStatusFailed || queuedSlashDedupe.ProcessedAt == nil {
+		t.Fatalf("LoadEventDedupe(queued slash) = %#v, want failed dedupe with processedAt", queuedSlashDedupe)
+	}
+
+	if _, err := store.Runtime().LoadThreadLock(context.Background(), threadTS); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("LoadThreadLock() error = %v, want not found", err)
+	}
+
+	messages := client.snapshotMessages()
+	if got, want := len(messages), 1; got != want {
+		t.Fatalf("slack message count = %d, want %d", got, want)
+	}
+	if messages[0].Text != "Session error: "+runtimemodel.StartupRecoveryFailureReason {
+		t.Fatalf("recovery slack message = %q", messages[0].Text)
+	}
+
+	debugMu.Lock()
+	output := debug.String()
+	debugMu.Unlock()
+	for _, fragment := range []string{
+		"runtime.loop: lifecycle event=execution_reconciled source=mention delivery_id=Ev-recover channel_id=C123 project=alpha status=failed execution_id=mention:Ev-recover previous_status=running recovered_status=failed slack_notified=true",
+		"runtime.loop: lifecycle event=execution_reconciled source=slash delivery_id=3-recover-queued channel_id=C123 project=alpha status=failed execution_id=slash:3-recover-queued previous_status=queued recovered_status=failed",
+	} {
+		if !strings.Contains(output, fragment) {
+			t.Fatalf("debug output missing %q: %s", fragment, output)
+		}
+	}
+}
+
+// Test: cancelled ACPX prompt streams persist cancelled execution state instead of being overwritten as processed.
+// Validates: AC-1981 (REQ-1429 - cancelled lifecycle status is persisted), AC-1981 (REQ-1430 - publisher checkpoints and cancellation details are retained)
+func TestForegroundRuntimeStarterPersistsCancelledExecutionState(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(home, "workspace", "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C123",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	stream := &controlledPromptStream{
+		sessionName: acpxadapter.SessionName("1713686400.000100"),
+		events:      make(chan acpxadapter.Event, 4),
+		waitCh:      make(chan error, 1),
+	}
+	client := &recordingSlackClient{}
+	adapter := &fakePromptAdapter{
+		startPrompt: func(context.Context, acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+			return stream, nil
+		},
+	}
+
+	starter := &foregroundRuntimeStarter{
+		source: &fakeSlackInvocationSource{
+			invocations: []slack.InboundInvocation{{
+				SourceType:  slack.InboundSourceMention,
+				DeliveryID:  "Ev-cancel",
+				ChannelID:   project.SlackChannelID,
+				ThreadTS:    "1713686400.000100",
+				UserID:      "U123",
+				CommandText: "<@Ubot> status",
+			}},
+		},
+		client:      client,
+		renderer:    runtimemodel.SlackThreadRenderer{Client: client},
+		adapter:     adapter,
+		projectRepo: store.Projects(),
+		runtimeRepo: store.Runtime(),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- starter.Start(ctx, runtimemodel.Status{})
+	}()
+
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: "working"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventSessionCancelled, Text: "cancelled by operator"}
+	close(stream.events)
+	stream.waitCh <- nil
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		executionState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "mention", "Ev-cancel")
+		return err == nil && executionState.Status == runtimemodel.ExecutionStatusCancelled
+	})
+	cancel()
+
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context canceled", err)
+	}
+
+	executionState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "mention", "Ev-cancel")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if executionState.Status != runtimemodel.ExecutionStatusCancelled || executionState.CancelledAt == nil || executionState.CompletedAt == nil {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want cancelled execution", executionState)
+	}
+	if executionState.LastError != "cancelled by operator" {
+		t.Fatalf("LoadExecutionStateByDelivery() last error = %q, want cancellation reason", executionState.LastError)
+	}
+	if executionState.PublisherCheckpointKind != string(runtimemodel.ACPXEventSessionCancelled) {
+		t.Fatalf("LoadExecutionStateByDelivery() checkpoint kind = %q, want %q", executionState.PublisherCheckpointKind, runtimemodel.ACPXEventSessionCancelled)
+	}
+
+	threadState, err := store.Runtime().LoadThreadState(context.Background(), "1713686400.000100")
+	if err != nil {
+		t.Fatalf("LoadThreadState() error = %v", err)
+	}
+	if threadState.LastStatus != "cancelled" {
+		t.Fatalf("LoadThreadState() last status = %q, want cancelled", threadState.LastStatus)
+	}
+
+	dedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "mention", "Ev-cancel")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe() error = %v", err)
+	}
+	if dedupe.Status != "cancelled" || dedupe.ProcessedAt == nil {
+		t.Fatalf("LoadEventDedupe() = %#v, want cancelled dedupe", dedupe)
+	}
+
+	messages := client.snapshotMessages()
+	if got, want := len(messages), 2; got != want {
+		t.Fatalf("slack message count = %d, want %d", got, want)
+	}
+	if messages[1].Text != "Session cancelled: cancelled by operator" {
+		t.Fatalf("terminal message = %q, want cancellation notice", messages[1].Text)
 	}
 }
 
@@ -1538,6 +3390,7 @@ func TestForegroundRuntimeStarterSkipsDuplicateSlashDelivery(t *testing.T) {
 					CommandText:   "status",
 					ResponseURL:   "https://hooks.slack.test/response",
 					AckEnvelopeID: "3-fwdc4",
+					Acked:         true,
 				},
 				{
 					SourceType:    slack.InboundSourceSlash,
@@ -1547,6 +3400,7 @@ func TestForegroundRuntimeStarterSkipsDuplicateSlashDelivery(t *testing.T) {
 					CommandText:   "status",
 					ResponseURL:   "https://hooks.slack.test/response",
 					AckEnvelopeID: "3-fwdc4",
+					Acked:         true,
 				},
 			},
 		},
@@ -1915,6 +3769,23 @@ func TestRuntimeCancelCancelsActiveThreadWithoutCorruptingMapping(t *testing.T) 
 	if err := store.Runtime().SaveThreadState(ctx, state); err != nil {
 		t.Fatalf("SaveThreadState() error = %v", err)
 	}
+	queuedAt := time.Now().UTC().Add(-2 * time.Minute)
+	startedAt := time.Now().UTC().Add(-time.Minute)
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
+		ExecutionID: "mention:Ev123",
+		SourceType:  "mention",
+		DeliveryID:  "Ev123",
+		ProjectName: "alpha",
+		ChannelID:   "C12345678",
+		ThreadTS:    threadTS,
+		SessionName: state.SessionName,
+		Status:      runtimemodel.ExecutionStatusRunning,
+		QueuedAt:    queuedAt,
+		StartedAt:   &startedAt,
+		UpdatedAt:   startedAt,
+	}); err != nil {
+		t.Fatalf("SaveExecutionState() error = %v", err)
+	}
 	lockedAt := time.Now().UTC()
 	lockExpires := lockedAt.Add(5 * time.Minute)
 	if err := store.Runtime().SaveThreadLock(ctx, runtimemodel.ThreadLock{
@@ -1961,6 +3832,16 @@ func TestRuntimeCancelCancelsActiveThreadWithoutCorruptingMapping(t *testing.T) 
 	}
 	if loadedState.SessionName != state.SessionName || loadedState.LastRequestID != state.LastRequestID {
 		t.Fatalf("LoadThreadState() = %#v, want preserved mapping %#v", loadedState, state)
+	}
+	loadedExecutionState, err := store.Runtime().LoadExecutionStateByDelivery(ctx, "mention", "Ev123")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if loadedExecutionState.Status != runtimemodel.ExecutionStatusCancelled || loadedExecutionState.CancelledAt == nil {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want cancelled execution", loadedExecutionState)
+	}
+	if loadedExecutionState.LastError != "cancelled by operator" {
+		t.Fatalf("LoadExecutionStateByDelivery() last error = %q, want cancellation reason", loadedExecutionState.LastError)
 	}
 	if _, err := store.Runtime().LoadThreadLock(ctx, threadTS); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("LoadThreadLock() error = %v, want not found", err)

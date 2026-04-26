@@ -19,9 +19,14 @@ type SlackTurnCoordinator struct {
 	deliveries sync.Map
 }
 
+type claimedExecutionStore interface {
+	SaveClaimedExecution(context.Context, EventDedupe, ExecutionState) error
+}
+
 type SlackTurnExecutionResult struct {
 	Executed    bool
 	Duplicate   bool
+	Cancelled   bool
 	ClaimedAt   time.Time
 	CompletedAt time.Time
 }
@@ -80,6 +85,62 @@ func (c *SlackTurnCoordinator) ClaimDelivery(ctx context.Context, sourceType, de
 
 	if err := c.store.SaveEventDedupe(ctx, dedupe); err != nil {
 		return SlackTurnExecutionResult{}, fmt.Errorf("persist dedupe claim for %s/%q: %w", sourceType, deliveryID, err)
+	}
+
+	return SlackTurnExecutionResult{
+		Executed:  true,
+		ClaimedAt: claimedAt,
+	}, nil
+}
+
+func (c *SlackTurnCoordinator) ClaimExecution(ctx context.Context, request ExecutionRequest) (SlackTurnExecutionResult, error) {
+	if err := ctx.Err(); err != nil {
+		return SlackTurnExecutionResult{}, err
+	}
+	if c == nil {
+		return SlackTurnExecutionResult{}, errors.New("slack turn coordinator is required")
+	}
+	if c.store == nil {
+		return SlackTurnExecutionResult{}, errors.New("runtime store is required")
+	}
+	if err := request.validateForEnqueue(); err != nil {
+		return SlackTurnExecutionResult{}, err
+	}
+
+	lock := c.deliveryLock(request.SourceType, request.DeliveryID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if _, err := c.store.LoadEventDedupe(ctx, request.SourceType, request.DeliveryID); err == nil {
+		return SlackTurnExecutionResult{Duplicate: true}, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return SlackTurnExecutionResult{}, fmt.Errorf("load event dedupe %s/%q: %w", request.SourceType, request.DeliveryID, err)
+	}
+
+	claimedAt := c.now().UTC()
+	dedupe := EventDedupe{
+		SourceType: request.SourceType,
+		DeliveryID: request.DeliveryID,
+		ReceivedAt: claimedAt,
+		Status:     "acked",
+	}
+	state := NewExecutionStateFromRequest(request, claimedAt)
+
+	if claimedStore, ok := c.store.(claimedExecutionStore); ok {
+		if err := claimedStore.SaveClaimedExecution(ctx, dedupe, state); err != nil {
+			return SlackTurnExecutionResult{}, fmt.Errorf("persist claimed execution for %s/%q: %w", request.SourceType, request.DeliveryID, err)
+		}
+	} else {
+		if err := c.store.SaveEventDedupe(ctx, dedupe); err != nil {
+			return SlackTurnExecutionResult{}, fmt.Errorf("persist dedupe claim for %s/%q: %w", request.SourceType, request.DeliveryID, err)
+		}
+		executionStore, ok := c.store.(ExecutionStateStore)
+		if !ok {
+			return SlackTurnExecutionResult{}, errors.New("execution state store is required")
+		}
+		if err := executionStore.SaveExecutionState(ctx, state); err != nil {
+			return SlackTurnExecutionResult{}, fmt.Errorf("persist queued execution state for %s/%q: %w", request.SourceType, request.DeliveryID, err)
+		}
 	}
 
 	return SlackTurnExecutionResult{
@@ -170,6 +231,25 @@ func (c *SlackTurnCoordinator) executeWithClaim(ctx context.Context, prepared Pr
 	dedupe.ProcessedAt = &completedAt
 
 	if execErr != nil {
+		if errors.Is(execErr, ErrExecutionCancelled) {
+			state.LastStatus = "cancelled"
+			dedupe.Status = "cancelled"
+			result.Cancelled = true
+			result.CompletedAt = completedAt
+			if err := c.store.SaveThreadState(ctx, state); err != nil {
+				_ = c.store.DeleteThreadLock(ctx, prepared.ThreadTS)
+				return SlackTurnExecutionResult{}, fmt.Errorf("persist cancelled thread state for %q: %w", prepared.ThreadTS, err)
+			}
+			if err := c.store.SaveEventDedupe(ctx, dedupe); err != nil {
+				_ = c.store.DeleteThreadLock(ctx, prepared.ThreadTS)
+				return SlackTurnExecutionResult{}, fmt.Errorf("persist cancelled dedupe for %s/%q: %w", prepared.SourceType, prepared.DeliveryID, err)
+			}
+			if err := c.store.DeleteThreadLock(ctx, prepared.ThreadTS); err != nil {
+				return SlackTurnExecutionResult{}, fmt.Errorf("release thread lock for %q: %w", prepared.ThreadTS, err)
+			}
+			return result, nil
+		}
+
 		state.LastStatus = "failed"
 		dedupe.Status = "failed"
 		if err := c.store.SaveThreadState(ctx, state); err != nil {

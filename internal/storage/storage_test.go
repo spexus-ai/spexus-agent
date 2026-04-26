@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -71,6 +72,122 @@ func TestOpenBootstrapsSchemaAndProjectRepository(t *testing.T) {
 	}
 	if len(projects) != 1 {
 		t.Fatalf("List() len = %d, want 1", len(projects))
+	}
+}
+
+// Test: storage bootstrap migrates pre-async-runtime SQLite files that have older project, dedupe, thread, and lock schemas.
+// Validates: EP-154 runtime startup can open existing user databases after async execution persistence columns are introduced.
+func TestOpenMigratesLegacyRuntimeSchema(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "storage.sqlite3")
+
+	db, err := sql.Open("sqlite3", storageDSN(path))
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	legacyStmts := []string{
+		`CREATE TABLE projects (
+			name TEXT PRIMARY KEY,
+			local_path TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`INSERT INTO projects (name, local_path, created_at, updated_at)
+			VALUES ('alpha', '/workspace/alpha', '` + now + `', '` + now + `')`,
+		`CREATE TABLE events_dedupe (
+			slack_event_id TEXT PRIMARY KEY,
+			received_at TEXT NOT NULL,
+			processed_at TEXT,
+			status TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO events_dedupe (slack_event_id, received_at, status)
+			VALUES ('EvLegacy', '` + now + `', 'processed')`,
+		`CREATE TABLE threads (
+			thread_ts TEXT PRIMARY KEY,
+			channel_id TEXT NOT NULL,
+			project_name TEXT NOT NULL,
+			session_name TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE thread_locks (
+			thread_ts TEXT PRIMARY KEY,
+			lock_owner TEXT NOT NULL,
+			locked_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+	}
+	for _, stmt := range legacyStmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			_ = db.Close()
+			t.Fatalf("legacy schema exec error = %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("legacy db Close() error = %v", err)
+	}
+
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open() legacy schema error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	if err := store.Projects().Upsert(ctx, registry.Project{
+		Name:             "alpha",
+		GitRemote:        "git@github.com:org/alpha.git",
+		LocalPath:        "/workspace/alpha",
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C12345678",
+	}); err != nil {
+		t.Fatalf("Upsert() after migration error = %v", err)
+	}
+
+	dedupe, err := store.Runtime().LoadEventDedupe(ctx, "mention", "EvLegacy")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe() migrated legacy row error = %v", err)
+	}
+	if dedupe.SourceType != "mention" || dedupe.DeliveryID != "EvLegacy" || dedupe.Status != "processed" {
+		t.Fatalf("LoadEventDedupe() = %#v, want migrated mention/EvLegacy processed row", dedupe)
+	}
+
+	state := runtimemodel.ThreadState{
+		ThreadTS:      "1713686400.000100",
+		ChannelID:     "C12345678",
+		ProjectName:   "alpha",
+		SessionName:   "slack-1713686400.000100",
+		LastStatus:    "processed",
+		LastRequestID: "req-legacy",
+	}
+	if err := store.Runtime().SaveThreadState(ctx, state); err != nil {
+		t.Fatalf("SaveThreadState() after migration error = %v", err)
+	}
+	loaded, err := store.Runtime().LoadThreadState(ctx, state.ThreadTS)
+	if err != nil {
+		t.Fatalf("LoadThreadState() after migration error = %v", err)
+	}
+	if loaded.LastStatus != state.LastStatus || loaded.LastRequestID != state.LastRequestID {
+		t.Fatalf("LoadThreadState() = %#v, want migrated status/request columns", loaded)
+	}
+
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
+		ExecutionID: "mention:EvMigrated",
+		SourceType:  "mention",
+		DeliveryID:  "EvMigrated",
+		ProjectName: "alpha",
+		ChannelID:   "C12345678",
+		ThreadTS:    state.ThreadTS,
+		SessionName: state.SessionName,
+		Status:      runtimemodel.ExecutionStatusQueued,
+	}); err != nil {
+		t.Fatalf("SaveExecutionState() after migration error = %v", err)
 	}
 }
 
@@ -258,6 +375,87 @@ func TestRuntimeRepositoryPersistsThreadStateAndDedupeMetadata(t *testing.T) {
 		t.Fatalf("LoadEventDedupe() = %#v", loadedDedupe)
 	}
 
+	queuedAt := time.Now().UTC().Add(-2 * time.Minute)
+	startedAt := time.Now().UTC().Add(-time.Minute)
+	renderingStartedAt := time.Now().UTC().Add(-30 * time.Second)
+	completedAt := time.Now().UTC()
+	checkpointAt := time.Now().UTC()
+	executionState := runtimemodel.ExecutionState{
+		ExecutionID:                "mention:Ev123",
+		SourceType:                 "mention",
+		DeliveryID:                 "Ev123",
+		ProjectName:                "alpha",
+		ChannelID:                  "C12345678",
+		ThreadTS:                   threadState.ThreadTS,
+		SessionName:                threadState.SessionName,
+		Status:                     runtimemodel.ExecutionStatusProcessed,
+		QueuedAt:                   queuedAt,
+		StartedAt:                  &startedAt,
+		RenderingStartedAt:         &renderingStartedAt,
+		CompletedAt:                &completedAt,
+		UpdatedAt:                  completedAt,
+		PublisherCheckpointKind:    "assistant_message_final",
+		PublisherCheckpointSummary: "status summary rendered",
+		PublisherCheckpointAt:      &checkpointAt,
+	}
+	if err := runtimeRepo.SaveExecutionState(ctx, executionState); err != nil {
+		t.Fatalf("SaveExecutionState() error = %v", err)
+	}
+
+	loadedExecutionState, err := runtimeRepo.LoadExecutionState(ctx, executionState.ExecutionID)
+	if err != nil {
+		t.Fatalf("LoadExecutionState() error = %v", err)
+	}
+	if loadedExecutionState.Status != runtimemodel.ExecutionStatusProcessed || loadedExecutionState.SessionName != executionState.SessionName {
+		t.Fatalf("LoadExecutionState() = %#v, want processed state %#v", loadedExecutionState, executionState)
+	}
+	if loadedExecutionState.PublisherCheckpointKind != executionState.PublisherCheckpointKind || loadedExecutionState.PublisherCheckpointSummary != executionState.PublisherCheckpointSummary {
+		t.Fatalf("LoadExecutionState() checkpoint = %#v, want %#v", loadedExecutionState, executionState)
+	}
+
+	loadedByDelivery, err := runtimeRepo.LoadExecutionStateByDelivery(ctx, "mention", "Ev123")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if loadedByDelivery.ExecutionID != executionState.ExecutionID {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want execution id %q", loadedByDelivery, executionState.ExecutionID)
+	}
+
+	loadedLatestByThread, err := runtimeRepo.LoadLatestExecutionByThread(ctx, threadState.ThreadTS)
+	if err != nil {
+		t.Fatalf("LoadLatestExecutionByThread() error = %v", err)
+	}
+	if loadedLatestByThread.ExecutionID != executionState.ExecutionID {
+		t.Fatalf("LoadLatestExecutionByThread() = %#v, want execution id %q", loadedLatestByThread, executionState.ExecutionID)
+	}
+
+	if err := runtimeRepo.SaveExecutionState(ctx, runtimemodel.ExecutionState{
+		ExecutionID: "mention:Ev124",
+		SourceType:  "mention",
+		DeliveryID:  "Ev124",
+		ProjectName: "alpha",
+		ChannelID:   "C12345678",
+		ThreadTS:    "1713686400.000101",
+		SessionName: "slack-1713686400.000101",
+		Status:      runtimemodel.ExecutionStatusRunning,
+		QueuedAt:    queuedAt.Add(time.Second),
+		StartedAt:   &startedAt,
+		UpdatedAt:   startedAt,
+	}); err != nil {
+		t.Fatalf("SaveExecutionState(running) error = %v", err)
+	}
+
+	nonTerminal, err := runtimeRepo.ListExecutionStatesByStatus(ctx, runtimemodel.ExecutionStatusQueued, runtimemodel.ExecutionStatusRunning)
+	if err != nil {
+		t.Fatalf("ListExecutionStatesByStatus() error = %v", err)
+	}
+	if got, want := len(nonTerminal), 1; got != want {
+		t.Fatalf("ListExecutionStatesByStatus() count = %d, want %d", got, want)
+	}
+	if nonTerminal[0].ExecutionID != "mention:Ev124" || nonTerminal[0].Status != runtimemodel.ExecutionStatusRunning {
+		t.Fatalf("ListExecutionStatesByStatus() = %#v, want running Ev124", nonTerminal)
+	}
+
 	lockExpires := time.Now().UTC().Add(5 * time.Minute)
 	if err := runtimeRepo.SaveThreadLock(ctx, ThreadLock{
 		ThreadTS:       threadState.ThreadTS,
@@ -282,6 +480,74 @@ func TestRuntimeRepositoryPersistsThreadStateAndDedupeMetadata(t *testing.T) {
 
 	if _, err := runtimeRepo.LoadThreadLock(ctx, threadState.ThreadTS); err == nil {
 		t.Fatalf("LoadThreadLock() error = nil, want not found")
+	}
+}
+
+// Test: the accepted-delivery claim persists dedupe and queued execution state together so restart recovery can observe the delivery before enqueue processing continues.
+// Validates: AC-1981 (REQ-1429 - accepted deliveries persist an initial queued execution state), AC-1982 (REQ-1431 - startup recovery can discover accepted deliveries from persisted execution state)
+func TestRuntimeRepositorySaveClaimedExecutionPersistsDedupeAndQueuedState(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := Open(ctx, filepath.Join(dir, "storage.sqlite3"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	if err := store.Projects().Upsert(ctx, registry.Project{
+		Name:             "alpha",
+		LocalPath:        "/workspace/alpha",
+		SlackChannelID:   "C12345678",
+		SlackChannelName: "spexus-alpha",
+	}); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	claimedAt := time.Date(2026, time.April, 26, 19, 30, 0, 0, time.UTC)
+	dedupe := runtimemodel.EventDedupe{
+		SourceType: "mention",
+		DeliveryID: "Ev-claim",
+		ReceivedAt: claimedAt,
+		Status:     "acked",
+	}
+	state := runtimemodel.ExecutionState{
+		ExecutionID: "mention:Ev-claim",
+		SourceType:  "mention",
+		DeliveryID:  "Ev-claim",
+		ProjectName: "alpha",
+		ChannelID:   "C12345678",
+		ThreadTS:    "1713686400.000100",
+		SessionName: "slack-1713686400.000100",
+		Status:      runtimemodel.ExecutionStatusQueued,
+		QueuedAt:    claimedAt,
+		UpdatedAt:   claimedAt,
+	}
+
+	if err := store.Runtime().SaveClaimedExecution(ctx, dedupe, state); err != nil {
+		t.Fatalf("SaveClaimedExecution() error = %v", err)
+	}
+
+	loadedDedupe, err := store.Runtime().LoadEventDedupe(ctx, "mention", "Ev-claim")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe() error = %v", err)
+	}
+	if loadedDedupe.Status != "acked" || !loadedDedupe.ReceivedAt.Equal(claimedAt) {
+		t.Fatalf("LoadEventDedupe() = %#v, want acked claim at %s", loadedDedupe, claimedAt)
+	}
+
+	loadedState, err := store.Runtime().LoadExecutionStateByDelivery(ctx, "mention", "Ev-claim")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if loadedState.Status != runtimemodel.ExecutionStatusQueued || !loadedState.QueuedAt.Equal(claimedAt) {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want queued state at %s", loadedState, claimedAt)
+	}
+	if loadedState.ThreadTS != state.ThreadTS || loadedState.SessionName != state.SessionName {
+		t.Fatalf("LoadExecutionStateByDelivery() thread/session = (%q, %q), want (%q, %q)", loadedState.ThreadTS, loadedState.SessionName, state.ThreadTS, state.SessionName)
 	}
 }
 

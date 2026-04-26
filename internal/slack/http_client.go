@@ -39,6 +39,35 @@ func (c *HTTPClient) PostThreadMessage(ctx context.Context, message Message) err
 	return err
 }
 
+func (c *HTTPClient) UpdateMessage(ctx context.Context, update MessageUpdate) error {
+	if c == nil {
+		return fmt.Errorf("slack http client is nil")
+	}
+	channelID := strings.TrimSpace(update.ChannelID)
+	if channelID == "" {
+		return fmt.Errorf("channel id is required")
+	}
+	timestamp := strings.TrimSpace(update.Timestamp)
+	if timestamp == "" {
+		return fmt.Errorf("message timestamp is required")
+	}
+
+	payload := map[string]string{
+		"channel": channelID,
+		"ts":      timestamp,
+		"text":    update.Text,
+	}
+
+	var response slackAPIResponse
+	if err := c.do(ctx, "chat.update", payload, &response); err != nil {
+		return err
+	}
+	if !response.OK {
+		return fmt.Errorf("slack chat.update request failed: %s", response.Error)
+	}
+	return nil
+}
+
 func (c *HTTPClient) PostResponseURLMessage(ctx context.Context, message ResponseURLMessage) error {
 	if c == nil {
 		return fmt.Errorf("slack http client is nil")
