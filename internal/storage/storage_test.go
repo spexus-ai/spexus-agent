@@ -258,6 +258,87 @@ func TestRuntimeRepositoryPersistsThreadStateAndDedupeMetadata(t *testing.T) {
 		t.Fatalf("LoadEventDedupe() = %#v", loadedDedupe)
 	}
 
+	queuedAt := time.Now().UTC().Add(-2 * time.Minute)
+	startedAt := time.Now().UTC().Add(-time.Minute)
+	renderingStartedAt := time.Now().UTC().Add(-30 * time.Second)
+	completedAt := time.Now().UTC()
+	checkpointAt := time.Now().UTC()
+	executionState := runtimemodel.ExecutionState{
+		ExecutionID:                "mention:Ev123",
+		SourceType:                 "mention",
+		DeliveryID:                 "Ev123",
+		ProjectName:                "alpha",
+		ChannelID:                  "C12345678",
+		ThreadTS:                   threadState.ThreadTS,
+		SessionName:                threadState.SessionName,
+		Status:                     runtimemodel.ExecutionStatusProcessed,
+		QueuedAt:                   queuedAt,
+		StartedAt:                  &startedAt,
+		RenderingStartedAt:         &renderingStartedAt,
+		CompletedAt:                &completedAt,
+		UpdatedAt:                  completedAt,
+		PublisherCheckpointKind:    "assistant_message_final",
+		PublisherCheckpointSummary: "status summary rendered",
+		PublisherCheckpointAt:      &checkpointAt,
+	}
+	if err := runtimeRepo.SaveExecutionState(ctx, executionState); err != nil {
+		t.Fatalf("SaveExecutionState() error = %v", err)
+	}
+
+	loadedExecutionState, err := runtimeRepo.LoadExecutionState(ctx, executionState.ExecutionID)
+	if err != nil {
+		t.Fatalf("LoadExecutionState() error = %v", err)
+	}
+	if loadedExecutionState.Status != runtimemodel.ExecutionStatusProcessed || loadedExecutionState.SessionName != executionState.SessionName {
+		t.Fatalf("LoadExecutionState() = %#v, want processed state %#v", loadedExecutionState, executionState)
+	}
+	if loadedExecutionState.PublisherCheckpointKind != executionState.PublisherCheckpointKind || loadedExecutionState.PublisherCheckpointSummary != executionState.PublisherCheckpointSummary {
+		t.Fatalf("LoadExecutionState() checkpoint = %#v, want %#v", loadedExecutionState, executionState)
+	}
+
+	loadedByDelivery, err := runtimeRepo.LoadExecutionStateByDelivery(ctx, "mention", "Ev123")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if loadedByDelivery.ExecutionID != executionState.ExecutionID {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want execution id %q", loadedByDelivery, executionState.ExecutionID)
+	}
+
+	loadedLatestByThread, err := runtimeRepo.LoadLatestExecutionByThread(ctx, threadState.ThreadTS)
+	if err != nil {
+		t.Fatalf("LoadLatestExecutionByThread() error = %v", err)
+	}
+	if loadedLatestByThread.ExecutionID != executionState.ExecutionID {
+		t.Fatalf("LoadLatestExecutionByThread() = %#v, want execution id %q", loadedLatestByThread, executionState.ExecutionID)
+	}
+
+	if err := runtimeRepo.SaveExecutionState(ctx, runtimemodel.ExecutionState{
+		ExecutionID: "mention:Ev124",
+		SourceType:  "mention",
+		DeliveryID:  "Ev124",
+		ProjectName: "alpha",
+		ChannelID:   "C12345678",
+		ThreadTS:    "1713686400.000101",
+		SessionName: "slack-1713686400.000101",
+		Status:      runtimemodel.ExecutionStatusRunning,
+		QueuedAt:    queuedAt.Add(time.Second),
+		StartedAt:   &startedAt,
+		UpdatedAt:   startedAt,
+	}); err != nil {
+		t.Fatalf("SaveExecutionState(running) error = %v", err)
+	}
+
+	nonTerminal, err := runtimeRepo.ListExecutionStatesByStatus(ctx, runtimemodel.ExecutionStatusQueued, runtimemodel.ExecutionStatusRunning)
+	if err != nil {
+		t.Fatalf("ListExecutionStatesByStatus() error = %v", err)
+	}
+	if got, want := len(nonTerminal), 1; got != want {
+		t.Fatalf("ListExecutionStatesByStatus() count = %d, want %d", got, want)
+	}
+	if nonTerminal[0].ExecutionID != "mention:Ev124" || nonTerminal[0].Status != runtimemodel.ExecutionStatusRunning {
+		t.Fatalf("ListExecutionStatesByStatus() = %#v, want running Ev124", nonTerminal)
+	}
+
 	lockExpires := time.Now().UTC().Add(5 * time.Minute)
 	if err := runtimeRepo.SaveThreadLock(ctx, ThreadLock{
 		ThreadTS:       threadState.ThreadTS,
@@ -282,6 +363,74 @@ func TestRuntimeRepositoryPersistsThreadStateAndDedupeMetadata(t *testing.T) {
 
 	if _, err := runtimeRepo.LoadThreadLock(ctx, threadState.ThreadTS); err == nil {
 		t.Fatalf("LoadThreadLock() error = nil, want not found")
+	}
+}
+
+// Test: the accepted-delivery claim persists dedupe and queued execution state together so restart recovery can observe the delivery before enqueue processing continues.
+// Validates: AC-1981 (REQ-1429 - accepted deliveries persist an initial queued execution state), AC-1982 (REQ-1431 - startup recovery can discover accepted deliveries from persisted execution state)
+func TestRuntimeRepositorySaveClaimedExecutionPersistsDedupeAndQueuedState(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := Open(ctx, filepath.Join(dir, "storage.sqlite3"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	if err := store.Projects().Upsert(ctx, registry.Project{
+		Name:             "alpha",
+		LocalPath:        "/workspace/alpha",
+		SlackChannelID:   "C12345678",
+		SlackChannelName: "spexus-alpha",
+	}); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	claimedAt := time.Date(2026, time.April, 26, 19, 30, 0, 0, time.UTC)
+	dedupe := runtimemodel.EventDedupe{
+		SourceType: "mention",
+		DeliveryID: "Ev-claim",
+		ReceivedAt: claimedAt,
+		Status:     "acked",
+	}
+	state := runtimemodel.ExecutionState{
+		ExecutionID: "mention:Ev-claim",
+		SourceType:  "mention",
+		DeliveryID:  "Ev-claim",
+		ProjectName: "alpha",
+		ChannelID:   "C12345678",
+		ThreadTS:    "1713686400.000100",
+		SessionName: "slack-1713686400.000100",
+		Status:      runtimemodel.ExecutionStatusQueued,
+		QueuedAt:    claimedAt,
+		UpdatedAt:   claimedAt,
+	}
+
+	if err := store.Runtime().SaveClaimedExecution(ctx, dedupe, state); err != nil {
+		t.Fatalf("SaveClaimedExecution() error = %v", err)
+	}
+
+	loadedDedupe, err := store.Runtime().LoadEventDedupe(ctx, "mention", "Ev-claim")
+	if err != nil {
+		t.Fatalf("LoadEventDedupe() error = %v", err)
+	}
+	if loadedDedupe.Status != "acked" || !loadedDedupe.ReceivedAt.Equal(claimedAt) {
+		t.Fatalf("LoadEventDedupe() = %#v, want acked claim at %s", loadedDedupe, claimedAt)
+	}
+
+	loadedState, err := store.Runtime().LoadExecutionStateByDelivery(ctx, "mention", "Ev-claim")
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if loadedState.Status != runtimemodel.ExecutionStatusQueued || !loadedState.QueuedAt.Equal(claimedAt) {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want queued state at %s", loadedState, claimedAt)
+	}
+	if loadedState.ThreadTS != state.ThreadTS || loadedState.SessionName != state.SessionName {
+		t.Fatalf("LoadExecutionStateByDelivery() thread/session = (%q, %q), want (%q, %q)", loadedState.ThreadTS, loadedState.SessionName, state.ThreadTS, state.SessionName)
 	}
 }
 

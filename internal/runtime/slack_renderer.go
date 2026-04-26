@@ -33,17 +33,8 @@ func (r SlackThreadRenderer) Render(ctx context.Context, req SlackThreadRenderRe
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.Client == nil {
-		return ErrSlackRendererClientRequired
-	}
-	if strings.TrimSpace(req.ChannelID) == "" {
-		return fmt.Errorf("slack channel id is required")
-	}
-	if strings.TrimSpace(req.ThreadTS) == "" {
-		return fmt.Errorf("slack thread timestamp is required")
-	}
-	if strings.TrimSpace(req.SessionName) == "" {
-		return fmt.Errorf("slack session name is required")
+	if err := validateSlackThreadRenderRequest(r.Client, req); err != nil {
+		return err
 	}
 
 	messages := buildSlackThreadMessages(req, events)
@@ -56,57 +47,122 @@ func (r SlackThreadRenderer) Render(ctx context.Context, req SlackThreadRenderRe
 	return nil
 }
 
+func validateSlackThreadRenderRequest(client slack.Client, req SlackThreadRenderRequest) error {
+	if client == nil {
+		return ErrSlackRendererClientRequired
+	}
+	if strings.TrimSpace(req.ChannelID) == "" {
+		return fmt.Errorf("slack channel id is required")
+	}
+	if strings.TrimSpace(req.ThreadTS) == "" {
+		return fmt.Errorf("slack thread timestamp is required")
+	}
+	if strings.TrimSpace(req.SessionName) == "" {
+		return fmt.Errorf("slack session name is required")
+	}
+	return nil
+}
+
 func buildSlackThreadMessages(req SlackThreadRenderRequest, events []ACPXTurnEvent) []slack.Message {
 	progress := make([]string, 0, len(events))
+	var assistantProgress strings.Builder
 	finalParts := make([]string, 0, len(events))
 	messages := make([]slack.Message, 0, 2)
 	terminal := ""
 	sessionDone := false
 
-	flushProgress := func() {
-		if len(progress) == 0 {
+	flushProgress := func(includeAssistant bool) {
+		lines := append([]string(nil), progress...)
+		if includeAssistant {
+			if assistant := strings.TrimSpace(assistantProgress.String()); assistant != "" {
+				lines = append(lines, assistant)
+			}
+		}
+		if len(lines) == 0 {
+			if includeAssistant {
+				assistantProgress.Reset()
+			}
 			return
 		}
 		messages = append(messages, slack.Message{
 			ChannelID: req.ChannelID,
 			ThreadTS:  req.ThreadTS,
-			Text:      formatBatchMessage("Progress", progress),
+			Text:      formatBatchMessage("Progress", lines),
 		})
 		progress = progress[:0]
+		if includeAssistant {
+			assistantProgress.Reset()
+		}
+	}
+
+	appendProgress := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		progress = append(progress, text)
+	}
+
+	appendAssistantChunk := func(text string) {
+		if text == "" {
+			return
+		}
+		if assistantProgress.Len() == 0 {
+			text = strings.TrimSpace(text)
+			if text == "" {
+				return
+			}
+			assistantProgress.WriteString(text)
+			return
+		}
+		assistantProgress.WriteString(text)
 	}
 
 	for _, event := range events {
 		switch event.Kind {
 		case ACPXEventSessionStarted:
-			appendProgressLine(&progress, "Session started"+suffixWithText(event.Text))
+			appendProgress("Session started" + suffixWithText(event.Text))
 		case ACPXEventAssistantThinking:
-			appendProgressLine(&progress, "Thinking"+suffixWithText(event.Text))
+			appendProgress("Thinking" + suffixWithText(event.Text))
 		case ACPXEventToolStarted:
-			appendProgressLine(&progress, formatToolLine("started", event))
+			appendProgress(formatToolLine("started", event))
 		case ACPXEventToolFinished:
-			appendProgressLine(&progress, formatToolLine("finished", event))
+			appendProgress(formatToolLine("finished", event))
 		case ACPXEventAssistantMessageChunk:
-			appendProgressLine(&progress, event.Text)
+			appendAssistantChunk(event.Text)
 		case ACPXEventAssistantMessageFinal:
-			flushProgress()
+			if len(progress) > 0 {
+				flushProgress(false)
+			}
 			if text := strings.TrimSpace(event.Text); text != "" {
 				finalParts = append(finalParts, text)
 			}
 		case ACPXEventSessionDone:
-			flushProgress()
+			if len(progress) > 0 {
+				flushProgress(false)
+			}
 			sessionDone = true
 		case ACPXEventSessionError:
-			flushProgress()
+			flushProgress(true)
 			finalParts = finalParts[:0]
 			terminal = "Session error" + suffixWithText(event.Text)
 		case ACPXEventSessionCancelled:
-			flushProgress()
+			flushProgress(true)
 			finalParts = finalParts[:0]
 			terminal = "Session cancelled" + suffixWithText(event.Text)
 		}
 	}
 
-	flushProgress()
+	if len(progress) > 0 || strings.TrimSpace(assistantProgress.String()) != "" {
+		switch {
+		case terminal != "":
+			flushProgress(true)
+		case len(finalParts) > 0 || sessionDone:
+			flushProgress(false)
+		default:
+			flushProgress(true)
+		}
+	}
 	if terminal != "" {
 		finalParts = finalParts[:0]
 		finalParts = append(finalParts, terminal)

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,9 +20,10 @@ import (
 )
 
 type recordingCommandRunner struct {
-	mu      sync.Mutex
-	calls   []recordedCommandCall
-	outputs []string
+	mu           sync.Mutex
+	calls        []recordedCommandCall
+	outputs      []string
+	startOutputs []string
 }
 
 type recordedCommandCall struct {
@@ -47,6 +50,38 @@ func (r *recordingCommandRunner) Run(_ context.Context, binary string, args []st
 	r.outputs = r.outputs[1:]
 	return output, nil
 }
+
+func (r *recordingCommandRunner) Start(_ context.Context, binary string, args []string, dir string) (acpxadapter.RunningCommand, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.calls = append(r.calls, recordedCommandCall{
+		binary: binary,
+		args:   append([]string(nil), args...),
+		dir:    dir,
+	})
+
+	output := ""
+	if len(r.startOutputs) > 0 {
+		output = r.startOutputs[0]
+		r.startOutputs = r.startOutputs[1:]
+	}
+
+	return acpxadapterPromptCommand{
+		stdout: io.NopCloser(strings.NewReader(output)),
+		stderr: io.NopCloser(strings.NewReader("")),
+	}, nil
+}
+
+type acpxadapterPromptCommand struct {
+	stdout io.ReadCloser
+	stderr io.ReadCloser
+}
+
+func (c acpxadapterPromptCommand) Stdout() io.ReadCloser { return c.stdout }
+func (c acpxadapterPromptCommand) Stderr() io.ReadCloser { return c.stderr }
+func (c acpxadapterPromptCommand) Wait() error           { return nil }
+func (c acpxadapterPromptCommand) Close() error          { return nil }
 
 type recordingSlackClient struct {
 	mu       sync.Mutex
@@ -178,6 +213,10 @@ func TestSlackEventDispatchPersistsSQLiteStateAndRendersACPXOutput(t *testing.T)
 
 	runner := &recordingCommandRunner{
 		outputs: []string{
+			"ensured",
+			"ensured",
+		},
+		startOutputs: []string{
 			`{"jsonrpc":"2.0","id":2,"method":"session/new","result":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7"}}
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"tool_call","toolCallId":"call_1","title":"Run grep","kind":"execute","status":"in_progress"}}}
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"completed"}}}
@@ -255,17 +294,23 @@ func TestSlackEventDispatchPersistsSQLiteStateAndRendersACPXOutput(t *testing.T)
 	runner.mu.Lock()
 	gotCalls := append([]recordedCommandCall(nil), runner.calls...)
 	runner.mu.Unlock()
-	if got, want := len(gotCalls), 2; got != want {
+	if got, want := len(gotCalls), 4; got != want {
 		t.Fatalf("ACPX runner call count = %d, want %d", got, want)
 	}
 	if gotCalls[0].dir != project.LocalPath {
 		t.Fatalf("first ACPX call dir = %q, want %q", gotCalls[0].dir, project.LocalPath)
 	}
-	if fmt.Sprint(gotCalls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", rootPrepared.SessionName, "root prompt"}) {
-		t.Fatalf("first ACPX call args = %#v, want root prompt", gotCalls[0].args)
+	if fmt.Sprint(gotCalls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "ensure", "--name", rootPrepared.SessionName}) {
+		t.Fatalf("first ACPX call args = %#v, want ensure session", gotCalls[0].args)
 	}
-	if fmt.Sprint(gotCalls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", rootPrepared.SessionName, "thread reply"}) {
-		t.Fatalf("second ACPX call args = %#v, want reply prompt", gotCalls[1].args)
+	if fmt.Sprint(gotCalls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", rootPrepared.SessionName, "root prompt"}) {
+		t.Fatalf("second ACPX call args = %#v, want root prompt", gotCalls[1].args)
+	}
+	if fmt.Sprint(gotCalls[2].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "ensure", "--name", rootPrepared.SessionName}) {
+		t.Fatalf("third ACPX call args = %#v, want ensure session", gotCalls[2].args)
+	}
+	if fmt.Sprint(gotCalls[3].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", rootPrepared.SessionName, "thread reply"}) {
+		t.Fatalf("fourth ACPX call args = %#v, want reply prompt", gotCalls[3].args)
 	}
 
 	client.mu.Lock()

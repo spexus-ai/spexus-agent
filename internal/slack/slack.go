@@ -56,6 +56,7 @@ type InboundInvocation struct {
 	ThreadTS      string
 	ResponseURL   string
 	AckEnvelopeID string
+	Acked         bool
 }
 
 type Channel struct {

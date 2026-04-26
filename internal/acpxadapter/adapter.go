@@ -18,6 +18,7 @@ type SessionResult struct {
 
 type Adapter interface {
 	EnsureSession(context.Context, SessionRequest) (SessionResult, error)
+	StartPrompt(context.Context, SessionRequest) (PromptStream, error)
 	SendPrompt(context.Context, SessionRequest) (SessionResult, error)
 	Status(context.Context, string) (SessionResult, error)
 	Cancel(context.Context, string) error
