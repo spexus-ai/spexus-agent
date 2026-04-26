@@ -33,6 +33,16 @@ type PostedMessage struct {
 	Timestamp string
 }
 
+type MessageUpdate struct {
+	ChannelID string
+	Timestamp string
+	Text      string
+}
+
+type MessageUpdater interface {
+	UpdateMessage(context.Context, MessageUpdate) error
+}
+
 type Event struct {
 	ID        string
 	ChannelID string

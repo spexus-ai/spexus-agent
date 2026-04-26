@@ -26,12 +26,15 @@ type SlackThreadProgressPublisher struct {
 	flushInterval   time.Duration
 	now             func() time.Time
 
-	progress          []string
-	assistantProgress strings.Builder
-	finalParts        []string
-	terminal          string
-	sessionDone       bool
-	pendingCount      int
+	progress                 []string
+	flushedProgress          []string
+	assistantProgress        strings.Builder
+	flushedAssistantProgress string
+	finalParts               []string
+	terminal                 string
+	sessionDone              bool
+	pendingCount             int
+	progressMessageTS        string
 }
 
 func (r SlackThreadRenderer) NewProgressPublisher(req SlackThreadRenderRequest, cfg SlackThreadProgressPublisherConfig) (*SlackThreadProgressPublisher, error) {
@@ -99,7 +102,8 @@ func (p *SlackThreadProgressPublisher) Consume(ctx context.Context, event ACPXTu
 }
 
 func (p *SlackThreadProgressPublisher) HasPendingProgress() bool {
-	return len(p.progress) > 0 || strings.TrimSpace(p.assistantProgress.String()) != ""
+	assistant := strings.TrimSpace(p.assistantProgress.String())
+	return len(p.progress) > 0 || assistant != p.flushedAssistantProgress
 }
 
 func (p *SlackThreadProgressPublisher) PendingProgressCount() int {
@@ -145,6 +149,7 @@ func (p *SlackThreadProgressPublisher) Finish(ctx context.Context, terminalErr e
 			return err
 		}
 		p.assistantProgress.Reset()
+		p.flushedAssistantProgress = ""
 		p.pendingCount = 0
 	default:
 		if err := p.flush(ctx, true); err != nil {
@@ -192,11 +197,10 @@ func (p *SlackThreadProgressPublisher) appendAssistantChunk(text string) {
 			return
 		}
 		p.assistantProgress.WriteString(text)
-		p.pendingCount++
-		return
+	} else {
+		p.assistantProgress.WriteString(text)
 	}
 
-	p.assistantProgress.WriteString(text)
 	p.pendingCount++
 }
 
@@ -206,44 +210,71 @@ func (p *SlackThreadProgressPublisher) flush(ctx context.Context, includeAssista
 		return nil
 	}
 
-	lines := append([]string(nil), p.progress...)
+	progressLines := append([]string(nil), p.flushedProgress...)
+	progressLines = append(progressLines, p.progress...)
+	assistant := ""
 	if includeAssistant {
-		if assistant := strings.TrimSpace(p.assistantProgress.String()); assistant != "" {
-			lines = append(lines, assistant)
-		}
+		assistant = strings.TrimSpace(p.assistantProgress.String())
 	}
 
-	if len(lines) == 0 {
+	if len(progressLines) == 0 && assistant == "" {
 		p.progress = p.progress[:0]
 		if includeAssistant {
 			p.assistantProgress.Reset()
+			p.flushedAssistantProgress = ""
 		}
 		p.pendingCount = 0
 		return nil
 	}
 
-	text := formatBatchMessage("Progress", lines)
+	text := formatLiveProgressMessage(progressLines, assistant)
 	if strings.TrimSpace(text) == "" {
 		p.progress = p.progress[:0]
 		if includeAssistant {
 			p.assistantProgress.Reset()
+			p.flushedAssistantProgress = ""
 		}
 		p.pendingCount = 0
 		return nil
 	}
 
-	if err := p.client.PostThreadMessage(ctx, slack.Message{
-		ChannelID: p.req.ChannelID,
-		ThreadTS:  p.req.ThreadTS,
-		Text:      text,
-	}); err != nil {
+	if err := p.postOrUpdateProgress(ctx, text); err != nil {
 		return err
 	}
 
 	p.progress = p.progress[:0]
+	p.flushedProgress = progressLines
 	if includeAssistant {
-		p.assistantProgress.Reset()
+		p.flushedAssistantProgress = assistant
 	}
 	p.pendingCount = 0
+	return nil
+}
+
+func (p *SlackThreadProgressPublisher) postOrUpdateProgress(ctx context.Context, text string) error {
+	if p.progressMessageTS != "" {
+		if updater, ok := p.client.(slack.MessageUpdater); ok {
+			return updater.UpdateMessage(ctx, slack.MessageUpdate{
+				ChannelID: p.req.ChannelID,
+				Timestamp: p.progressMessageTS,
+				Text:      text,
+			})
+		}
+		return p.client.PostThreadMessage(ctx, slack.Message{
+			ChannelID: p.req.ChannelID,
+			ThreadTS:  p.req.ThreadTS,
+			Text:      text,
+		})
+	}
+
+	posted, err := p.client.PostMessage(ctx, slack.Message{
+		ChannelID: p.req.ChannelID,
+		ThreadTS:  p.req.ThreadTS,
+		Text:      text,
+	})
+	if err != nil {
+		return err
+	}
+	p.progressMessageTS = strings.TrimSpace(posted.Timestamp)
 	return nil
 }

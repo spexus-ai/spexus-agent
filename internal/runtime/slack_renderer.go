@@ -72,13 +72,12 @@ func buildSlackThreadMessages(req SlackThreadRenderRequest, events []ACPXTurnEve
 	sessionDone := false
 
 	flushProgress := func(includeAssistant bool) {
-		lines := append([]string(nil), progress...)
+		progressLines := append([]string(nil), progress...)
+		assistant := ""
 		if includeAssistant {
-			if assistant := strings.TrimSpace(assistantProgress.String()); assistant != "" {
-				lines = append(lines, assistant)
-			}
+			assistant = strings.TrimSpace(assistantProgress.String())
 		}
-		if len(lines) == 0 {
+		if len(progressLines) == 0 && assistant == "" {
 			if includeAssistant {
 				assistantProgress.Reset()
 			}
@@ -87,7 +86,7 @@ func buildSlackThreadMessages(req SlackThreadRenderRequest, events []ACPXTurnEve
 		messages = append(messages, slack.Message{
 			ChannelID: req.ChannelID,
 			ThreadTS:  req.ThreadTS,
-			Text:      formatBatchMessage("Progress", lines),
+			Text:      formatLiveProgressMessage(progressLines, assistant),
 		})
 		progress = progress[:0]
 		if includeAssistant {
@@ -225,6 +224,20 @@ func formatBatchMessage(title string, lines []string) string {
 		builder.WriteString(line)
 	}
 	return builder.String()
+}
+
+func formatLiveProgressMessage(progressLines []string, assistantText string) string {
+	progress := formatBatchMessage("Progress", progressLines)
+	assistantText = strings.TrimSpace(assistantText)
+
+	switch {
+	case progress == "":
+		return assistantText
+	case assistantText == "":
+		return progress
+	default:
+		return progress + "\n\n" + assistantText
+	}
 }
 
 func suffixWithText(text string) string {

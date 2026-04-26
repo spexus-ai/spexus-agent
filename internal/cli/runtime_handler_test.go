@@ -76,6 +76,8 @@ func (q *recordingExecutionQueue) snapshotRequests() []runtimemodel.ExecutionReq
 type recordingSlackClient struct {
 	mu                  sync.Mutex
 	messages            []slack.Message
+	timestamps          []string
+	updates             []slack.MessageUpdate
 	responseURLMessages []slack.ResponseURLMessage
 	postMessageErr      error
 }
@@ -87,10 +89,12 @@ func (c *recordingSlackClient) PostMessage(_ context.Context, message slack.Mess
 	if c.postMessageErr != nil {
 		return slack.PostedMessage{}, c.postMessageErr
 	}
+	timestamp := fmt.Sprintf("1713686400.%06d", len(c.messages)+100)
 	c.messages = append(c.messages, message)
+	c.timestamps = append(c.timestamps, timestamp)
 	return slack.PostedMessage{
 		ChannelID: message.ChannelID,
-		Timestamp: "1713686400.000100",
+		Timestamp: timestamp,
 	}, nil
 }
 
@@ -99,7 +103,22 @@ func (c *recordingSlackClient) PostThreadMessage(_ context.Context, message slac
 	defer c.mu.Unlock()
 
 	c.messages = append(c.messages, message)
+	c.timestamps = append(c.timestamps, fmt.Sprintf("1713686400.%06d", len(c.messages)+100))
 	return nil
+}
+
+func (c *recordingSlackClient) UpdateMessage(_ context.Context, update slack.MessageUpdate) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.updates = append(c.updates, update)
+	for i, timestamp := range c.timestamps {
+		if timestamp == update.Timestamp {
+			c.messages[i].Text = update.Text
+			return nil
+		}
+	}
+	return fmt.Errorf("message timestamp %q not found", update.Timestamp)
 }
 
 func (c *recordingSlackClient) PostResponseURLMessage(_ context.Context, message slack.ResponseURLMessage) error {
@@ -907,7 +926,7 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesAssistantOnlyProgre
 
 	waitForCondition(t, 2*time.Second, func() bool {
 		messages := client.snapshotMessages()
-		return len(messages) == 1 && messages[0].Text == "Progress:\n- hello world from acpx"
+		return len(messages) == 1 && messages[0].Text == "hello world from acpx"
 	})
 
 	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageFinal, Text: "hello world from acpx"}
@@ -1012,7 +1031,7 @@ func TestForegroundRuntimeStarterReportsRenderedStreamFailureOnlyOnce(t *testing
 	if got, want := len(messages), 2; got != want {
 		t.Fatalf("slack message count = %d, want %d", got, want)
 	}
-	if messages[0].Text != "Progress:\n- working" {
+	if messages[0].Text != "working" {
 		t.Fatalf("progress message = %q", messages[0].Text)
 	}
 	if messages[1].Text != "Session error: acpx async failure" {
@@ -1169,7 +1188,12 @@ func TestForegroundRuntimeStarterEnqueuesMentionExecutionWithoutBlockingNextInvo
 	close(releaseFirst)
 
 	waitForCondition(t, 2*time.Second, func() bool {
-		return len(client.snapshotMessages()) == 2
+		messages := client.snapshotMessages()
+		gotTexts := map[string]bool{}
+		for _, message := range messages {
+			gotTexts[message.Text] = true
+		}
+		return gotTexts["first async result"] && gotTexts["second async result"]
 	})
 	cancel()
 
@@ -1442,8 +1466,8 @@ func TestForegroundRuntimeStarterEnqueuesMentionsWithoutBlockingLaterThreads(t *
 	}
 
 	messages := client.snapshotMessages()
-	if got, want := len(messages), 2; got != want {
-		t.Fatalf("slack message count = %d, want %d", got, want)
+	if got, want := len(messages), 2; got < want {
+		t.Fatalf("slack message count = %d, want at least %d", got, want)
 	}
 	gotTexts := map[string]bool{}
 	gotMessageThreads := map[string]bool{}

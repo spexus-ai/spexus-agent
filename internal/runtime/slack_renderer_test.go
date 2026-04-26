@@ -3,29 +3,51 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/spexus-ai/spexus-agent/internal/slack"
 )
 
 type fakeThreadMessageClient struct {
-	messages []slack.Message
-	err      error
+	messages   []slack.Message
+	timestamps []string
+	updates    []slack.MessageUpdate
+	err        error
 }
 
 func (f *fakeThreadMessageClient) PostMessage(_ context.Context, message slack.Message) (slack.PostedMessage, error) {
 	if f.err != nil {
 		return slack.PostedMessage{}, f.err
 	}
-	return slack.PostedMessage{ChannelID: message.ChannelID, Timestamp: "1713686400.000100"}, nil
+	timestamp := fmt.Sprintf("1713686400.%06d", len(f.messages)+100)
+	f.messages = append(f.messages, message)
+	f.timestamps = append(f.timestamps, timestamp)
+	return slack.PostedMessage{ChannelID: message.ChannelID, Timestamp: timestamp}, nil
 }
 
 func (f *fakeThreadMessageClient) PostThreadMessage(_ context.Context, message slack.Message) error {
-	f.messages = append(f.messages, message)
 	if f.err != nil {
 		return f.err
 	}
+	timestamp := fmt.Sprintf("1713686400.%06d", len(f.messages)+100)
+	f.messages = append(f.messages, message)
+	f.timestamps = append(f.timestamps, timestamp)
 	return nil
+}
+
+func (f *fakeThreadMessageClient) UpdateMessage(_ context.Context, update slack.MessageUpdate) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.updates = append(f.updates, update)
+	for i, timestamp := range f.timestamps {
+		if timestamp == update.Timestamp {
+			f.messages[i].Text = update.Text
+			return nil
+		}
+	}
+	return fmt.Errorf("message timestamp %q not found", update.Timestamp)
 }
 
 func (f *fakeThreadMessageClient) CreateChannel(context.Context, slack.CreateChannelRequest) (slack.Channel, error) {
@@ -98,7 +120,7 @@ func TestSlackThreadRendererRendersTerminalError(t *testing.T) {
 	if got, want := len(client.messages), 2; got != want {
 		t.Fatalf("PostThreadMessage() calls = %d, want %d", got, want)
 	}
-	if client.messages[0].Text != "Progress:\n- working" {
+	if client.messages[0].Text != "working" {
 		t.Fatalf("progress render text = %q", client.messages[0].Text)
 	}
 	if client.messages[1].Text != "Session error: acpx crashed" {
@@ -129,7 +151,7 @@ func TestSlackThreadRendererRendersCancel(t *testing.T) {
 	if got, want := len(client.messages), 2; got != want {
 		t.Fatalf("PostThreadMessage() calls = %d, want %d", got, want)
 	}
-	if client.messages[0].Text != "Progress:\n- working" {
+	if client.messages[0].Text != "working" {
 		t.Fatalf("progress render text = %q", client.messages[0].Text)
 	}
 	if client.messages[1].Text != "Session cancelled: cancelled by operator" {
@@ -238,6 +260,44 @@ func TestSlackThreadProgressPublisherBuffersProgressUntilFinalOutput(t *testing.
 	}
 }
 
+func TestSlackThreadProgressPublisherUpdatesSingleAssistantProgressMessage(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeThreadMessageClient{}
+	renderer := SlackThreadRenderer{Client: client}
+	publisher, err := renderer.NewProgressPublisher(SlackThreadRenderRequest{
+		ChannelID:   "C12345678",
+		ThreadTS:    "1713686400.000100",
+		SessionName: "slack-1713686400.000100",
+	}, SlackThreadProgressPublisherConfig{})
+	if err != nil {
+		t.Fatalf("NewProgressPublisher() error = %v", err)
+	}
+
+	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageChunk, Text: "Need"}); err != nil {
+		t.Fatalf("Consume(first chunk) error = %v", err)
+	}
+	if err := publisher.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush(first chunk) error = %v", err)
+	}
+	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageChunk, Text: " the epic ID"}); err != nil {
+		t.Fatalf("Consume(second chunk) error = %v", err)
+	}
+	if err := publisher.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush(second chunk) error = %v", err)
+	}
+
+	if got, want := len(client.messages), 1; got != want {
+		t.Fatalf("message count = %d, want %d", got, want)
+	}
+	if client.messages[0].Text != "Need the epic ID" {
+		t.Fatalf("progress message = %q", client.messages[0].Text)
+	}
+	if got, want := len(client.updates), 1; got != want {
+		t.Fatalf("update count = %d, want %d", got, want)
+	}
+}
+
 func TestSlackThreadProgressPublisherFinishesWithTerminalError(t *testing.T) {
 	t.Parallel()
 
@@ -262,7 +322,7 @@ func TestSlackThreadProgressPublisherFinishesWithTerminalError(t *testing.T) {
 	if got, want := len(client.messages), 2; got != want {
 		t.Fatalf("message count = %d, want %d", got, want)
 	}
-	if client.messages[0].Text != "Progress:\n- working" {
+	if client.messages[0].Text != "working" {
 		t.Fatalf("progress message = %q", client.messages[0].Text)
 	}
 	if client.messages[1].Text != "Session error: acpx crashed" {
@@ -299,7 +359,7 @@ func TestSlackThreadProgressPublisherFinishesWithTerminalCancellation(t *testing
 	if got, want := len(client.messages), 2; got != want {
 		t.Fatalf("message count = %d, want %d", got, want)
 	}
-	if client.messages[0].Text != "Progress:\n- working" {
+	if client.messages[0].Text != "working" {
 		t.Fatalf("progress message = %q", client.messages[0].Text)
 	}
 	if client.messages[1].Text != "Session cancelled: cancelled by operator" {
