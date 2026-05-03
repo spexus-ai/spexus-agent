@@ -897,11 +897,15 @@ func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
 	END`
 	if columns["session_key"] {
 		sessionKeyExpr = `COALESCE(NULLIF(TRIM(session_key), ''), ` + sessionKeyExpr + `)`
+	} else if columns["session_name"] {
+		sessionKeyExpr = `COALESCE(NULLIF(TRIM(session_name), ''), ` + sessionKeyExpr + `)`
 	}
 
 	diagnosticContextExpr := `''`
 	if columns["diagnostic_context"] {
 		diagnosticContextExpr = `COALESCE(diagnostic_context, '')`
+	} else if columns["last_error"] {
+		diagnosticContextExpr = `COALESCE(last_error, '')`
 	}
 
 	threadTSExpr := `''`
@@ -924,7 +928,14 @@ func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
 		startedAtExpr = `started_at`
 	}
 
-	updatedAtExpr := `created_at`
+	createdAtExpr := `CURRENT_TIMESTAMP`
+	if columns["created_at"] {
+		createdAtExpr = `created_at`
+	} else if columns["queued_at"] {
+		createdAtExpr = `queued_at`
+	}
+
+	updatedAtExpr := createdAtExpr
 	if columns["updated_at"] {
 		updatedAtExpr = `updated_at`
 	}
@@ -950,12 +961,12 @@ func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
 			%s,
 			%s,
 			%s,
-			created_at,
+			%s,
 			%s,
 			%s,
 			%s
 		FROM executions
-	`, sessionKeyExpr, threadTSExpr, commandTextExpr, statusExpr, diagnosticContextExpr, startedAtExpr, updatedAtExpr, completedAtExpr)
+	`, sessionKeyExpr, threadTSExpr, commandTextExpr, statusExpr, diagnosticContextExpr, createdAtExpr, startedAtExpr, updatedAtExpr, completedAtExpr)
 	if _, err := tx.ExecContext(ctx, insertStmt); err != nil {
 		return fmt.Errorf("copy legacy executions into executions_v2: %w", err)
 	}
