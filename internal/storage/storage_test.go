@@ -441,6 +441,104 @@ func TestOpenMigratesEventDedupeDiagnosticContextColumn(t *testing.T) {
 	}
 }
 
+// Test: an existing executions table without session_key is migrated in place and derives a stable session key from thread state.
+// Validates: AC-2107 (REQ-1573 - persisted execution requests remain readable after schema upgrades)
+func TestOpenMigratesExecutionsSessionKeyColumn(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "storage.sqlite3")
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		PRAGMA foreign_keys = ON;
+		CREATE TABLE projects (
+			name TEXT PRIMARY KEY,
+			git_remote TEXT NOT NULL DEFAULT '',
+			local_path TEXT NOT NULL,
+			slack_channel_name TEXT NOT NULL DEFAULT '',
+			slack_channel_id TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE TABLE executions (
+			execution_id TEXT PRIMARY KEY,
+			source_type TEXT NOT NULL,
+			delivery_id TEXT NOT NULL,
+			channel_id TEXT NOT NULL,
+			project_name TEXT NOT NULL,
+			thread_ts TEXT NOT NULL DEFAULT '',
+			command_text TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			diagnostic_context TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			started_at TEXT,
+			updated_at TEXT NOT NULL,
+			completed_at TEXT,
+			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
+		);
+	`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO projects (
+			name, git_remote, local_path, slack_channel_name, slack_channel_id, created_at, updated_at
+		) VALUES (?, '', ?, ?, ?, ?, ?)
+	`, "alpha", filepath.Join(dir, "alpha"), "alpha", "C123", createdAt, createdAt); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO executions (
+			execution_id, source_type, delivery_id, channel_id, project_name,
+			thread_ts, command_text, status, diagnostic_context, created_at, started_at, updated_at, completed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		"exec-legacy",
+		"mention",
+		"Ev-legacy",
+		"C123",
+		"alpha",
+		"1713686400.000100",
+		"status",
+		"running",
+		"",
+		createdAt,
+		nil,
+		createdAt,
+		nil,
+	); err != nil {
+		t.Fatalf("insert legacy execution: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close() error = %v", err)
+	}
+
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	loaded, err := store.Runtime().LoadExecution(ctx, "exec-legacy")
+	if err != nil {
+		t.Fatalf("LoadExecution() error = %v", err)
+	}
+	if loaded.SessionKey != "slack-1713686400.000100" {
+		t.Fatalf("LoadExecution() session key = %q, want derived session key", loaded.SessionKey)
+	}
+	if loaded.Status != runtimemodel.ExecutionStateRunning {
+		t.Fatalf("LoadExecution() status = %q, want %q", loaded.Status, runtimemodel.ExecutionStateRunning)
+	}
+}
+
 // Test: DefaultPath points storage bootstrap at the user config directory.
 // Validates: AC-1783 (REQ-1144 - runtime initializes SQLite storage under ~/.config/spexus-agent/storage.sqlite3)
 func TestDefaultPathUsesUserConfigDirectory(t *testing.T) {

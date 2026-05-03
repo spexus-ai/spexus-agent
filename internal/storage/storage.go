@@ -199,10 +199,6 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			completed_at TEXT,
 			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_executions_project_name ON executions(project_name)`,
-		`CREATE INDEX IF NOT EXISTS idx_executions_session_key ON executions(session_key)`,
-		`CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status)`,
-		`CREATE INDEX IF NOT EXISTS idx_executions_source_delivery ON executions(source_type, delivery_id)`,
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -220,6 +216,12 @@ func (s *Store) bootstrap(ctx context.Context) error {
 	}
 
 	if err := migrateEventDedupeTable(ctx, tx); err != nil {
+		return err
+	}
+	if err := migrateExecutionsTable(ctx, tx); err != nil {
+		return err
+	}
+	if err := ensureExecutionIndexes(ctx, tx); err != nil {
 		return err
 	}
 
@@ -852,6 +854,164 @@ func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	return nil
+}
+
+func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
+	columns, err := tableColumns(ctx, tx, "executions")
+	if err != nil {
+		return fmt.Errorf("inspect executions schema: %w", err)
+	}
+	if len(columns) == 0 {
+		return nil
+	}
+	if columns["session_key"] && columns["diagnostic_context"] {
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS executions_v2 (
+			execution_id TEXT PRIMARY KEY,
+			source_type TEXT NOT NULL,
+			delivery_id TEXT NOT NULL,
+			channel_id TEXT NOT NULL,
+			project_name TEXT NOT NULL,
+			session_key TEXT NOT NULL,
+			thread_ts TEXT NOT NULL DEFAULT '',
+			command_text TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			diagnostic_context TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			started_at TEXT,
+			updated_at TEXT NOT NULL,
+			completed_at TEXT,
+			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
+		)
+	`); err != nil {
+		return fmt.Errorf("create executions_v2 table: %w", err)
+	}
+
+	sessionKeyExpr := `CASE
+		WHEN TRIM(COALESCE(thread_ts, '')) <> '' THEN 'slack-' || TRIM(thread_ts)
+		WHEN TRIM(COALESCE(channel_id, '')) <> '' THEN 'legacy-channel-' || TRIM(channel_id)
+		ELSE 'legacy-execution-' || execution_id
+	END`
+	if columns["session_key"] {
+		sessionKeyExpr = `COALESCE(NULLIF(TRIM(session_key), ''), ` + sessionKeyExpr + `)`
+	}
+
+	diagnosticContextExpr := `''`
+	if columns["diagnostic_context"] {
+		diagnosticContextExpr = `COALESCE(diagnostic_context, '')`
+	}
+
+	threadTSExpr := `''`
+	if columns["thread_ts"] {
+		threadTSExpr = `COALESCE(thread_ts, '')`
+	}
+
+	commandTextExpr := `''`
+	if columns["command_text"] {
+		commandTextExpr = `COALESCE(command_text, '')`
+	}
+
+	statusExpr := `'queued'`
+	if columns["status"] {
+		statusExpr = `status`
+	}
+
+	startedAtExpr := `NULL`
+	if columns["started_at"] {
+		startedAtExpr = `started_at`
+	}
+
+	updatedAtExpr := `created_at`
+	if columns["updated_at"] {
+		updatedAtExpr = `updated_at`
+	}
+
+	completedAtExpr := `NULL`
+	if columns["completed_at"] {
+		completedAtExpr = `completed_at`
+	}
+
+	insertStmt := fmt.Sprintf(`
+		INSERT INTO executions_v2 (
+			execution_id, source_type, delivery_id, channel_id, project_name, session_key,
+			thread_ts, command_text, status, diagnostic_context, created_at, started_at, updated_at, completed_at
+		)
+		SELECT
+			execution_id,
+			source_type,
+			delivery_id,
+			channel_id,
+			project_name,
+			%s,
+			%s,
+			%s,
+			%s,
+			%s,
+			created_at,
+			%s,
+			%s,
+			%s
+		FROM executions
+	`, sessionKeyExpr, threadTSExpr, commandTextExpr, statusExpr, diagnosticContextExpr, startedAtExpr, updatedAtExpr, completedAtExpr)
+	if _, err := tx.ExecContext(ctx, insertStmt); err != nil {
+		return fmt.Errorf("copy legacy executions into executions_v2: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DROP TABLE executions`); err != nil {
+		return fmt.Errorf("drop legacy executions table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE executions_v2 RENAME TO executions`); err != nil {
+		return fmt.Errorf("rename executions_v2 table: %w", err)
+	}
+
+	return nil
+}
+
+func ensureExecutionIndexes(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE INDEX IF NOT EXISTS idx_executions_project_name ON executions(project_name)`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_session_key ON executions(session_key)`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_source_delivery ON executions(source_type, delivery_id)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("ensure execution index: %w", err)
+		}
+	}
+	return nil
+}
+
+func tableColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return columns, nil
 }
 
 func tableColumnExists(ctx context.Context, tx *sql.Tx, tableName, columnName string) (bool, error) {
