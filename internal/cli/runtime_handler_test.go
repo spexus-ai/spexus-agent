@@ -2880,15 +2880,7 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 	}
 
 	client := &recordingSlackClient{}
-	adapter := &fakePromptAdapter{
-		results: []acpxadapter.SessionResult{
-			{
-				SessionName: acpxadapter.SessionName("1713686400.000100"),
-				Output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"deduped mention result"}}}}
-{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
-			},
-		},
-	}
+	adapter := &fakePromptAdapter{}
 
 	var debug bytes.Buffer
 	var debugMu sync.Mutex
@@ -2936,8 +2928,8 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 		output := debug.String()
 		debugMu.Unlock()
 		return strings.Contains(output, "runtime.loop: duplicate mention skipped delivery=Ev126") &&
-			len(client.snapshotMessages()) == 1 &&
-			len(adapter.snapshotCalls()) == 1
+			len(adapter.snapshotCalls()) == 0 &&
+			len(client.snapshotMessages()) == 1
 	})
 	cancel()
 
@@ -2945,11 +2937,14 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 		t.Fatalf("Start() error = %v, want context canceled", err)
 	}
 
-	if got, want := len(adapter.snapshotCalls()), 1; got != want {
+	if got, want := len(adapter.calls), 0; got != want {
 		t.Fatalf("adapter call count = %d, want %d", got, want)
 	}
 	if got, want := len(client.messages), 1; got != want {
 		t.Fatalf("slack message count = %d, want %d", got, want)
+	}
+	if client.messages[0].Text != "thread is inactive" {
+		t.Fatalf("slack message text = %q, want local status reply", client.messages[0].Text)
 	}
 
 	dedupe, err := store.Runtime().LoadEventDedupe(context.Background(), "mention", "Ev126")
@@ -2958,6 +2953,13 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 	}
 	if dedupe.Status != "processed" || dedupe.ProcessedAt == nil {
 		t.Fatalf("LoadEventDedupe() = %#v, want processed mention delivery", dedupe)
+	}
+	executions, err := store.Runtime().ListExecutions(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListExecutions() error = %v", err)
+	}
+	if got := len(executions); got != 0 {
+		t.Fatalf("execution count = %d, want no ACPX execution records for local mention status", got)
 	}
 
 	executionState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "mention", "Ev126")
