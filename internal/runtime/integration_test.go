@@ -51,6 +51,7 @@ func (r *recordingCommandRunner) Run(_ context.Context, binary string, args []st
 type recordingSlackClient struct {
 	mu       sync.Mutex
 	messages []slack.Message
+	updates  []slack.MessageUpdate
 }
 
 func (c *recordingSlackClient) PostMessage(_ context.Context, message slack.Message) (slack.PostedMessage, error) {
@@ -72,6 +73,14 @@ func (c *recordingSlackClient) PostThreadMessage(_ context.Context, message slac
 	return nil
 }
 
+func (c *recordingSlackClient) UpdateMessage(_ context.Context, update slack.MessageUpdate) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.updates = append(c.updates, update)
+	return nil
+}
+
 func (c *recordingSlackClient) CreateChannel(context.Context, slack.CreateChannelRequest) (slack.Channel, error) {
 	return slack.Channel{}, fmt.Errorf("not implemented")
 }
@@ -84,6 +93,22 @@ func (c *recordingSlackClient) Close() error { return nil }
 
 type sqliteRuntimeStore struct {
 	store *storage.Store
+}
+
+func (s sqliteRuntimeStore) CreateExecution(ctx context.Context, request runtime.ExecutionRequest) error {
+	return s.store.Runtime().CreateExecution(ctx, request)
+}
+
+func (s sqliteRuntimeStore) LoadExecution(ctx context.Context, executionID string) (runtime.ExecutionRequest, error) {
+	return s.store.Runtime().LoadExecution(ctx, executionID)
+}
+
+func (s sqliteRuntimeStore) ListExecutions(ctx context.Context, statuses []runtime.ExecutionLifecycleState) ([]runtime.ExecutionRequest, error) {
+	return s.store.Runtime().ListExecutions(ctx, statuses)
+}
+
+func (s sqliteRuntimeStore) UpdateExecutionState(ctx context.Context, state runtime.ExecutionState) error {
+	return s.store.Runtime().UpdateExecutionState(ctx, state)
 }
 
 func (s sqliteRuntimeStore) SaveThreadState(ctx context.Context, state runtime.ThreadState) error {
@@ -274,7 +299,7 @@ func TestSlackEventDispatchPersistsSQLiteStateAndRendersACPXOutput(t *testing.T)
 	if got, want := len(gotMessages), 3; got != want {
 		t.Fatalf("Slack thread message count = %d, want %d", got, want)
 	}
-	if gotMessages[0].Text != "Progress:\n- Session started: 019db13d-f733-7ce0-8186-5aced7cdb2a7\n- Tool started: Run grep\n- Tool finished: Run grep" {
+	if gotMessages[0].Text != "Progress:\n- Session started: 019db13d-f733-7ce0-8186-5aced7cdb2a7" {
 		t.Fatalf("first Slack message text = %q", gotMessages[0].Text)
 	}
 	if gotMessages[1].Text != "root final answer" {

@@ -11,6 +11,51 @@ import (
 
 var ErrNotFound = errors.New("record not found")
 
+type ExecutionLifecycleState string
+
+const (
+	ExecutionStateQueued    ExecutionLifecycleState = "queued"
+	ExecutionStateRunning   ExecutionLifecycleState = "running"
+	ExecutionStateSucceeded ExecutionLifecycleState = "succeeded"
+	ExecutionStateFailed    ExecutionLifecycleState = "failed"
+	ExecutionStateCancelled ExecutionLifecycleState = "cancelled"
+)
+
+func isTerminalExecutionState(status ExecutionLifecycleState) bool {
+	switch status {
+	case ExecutionStateSucceeded, ExecutionStateFailed, ExecutionStateCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+type ExecutionRequest struct {
+	ExecutionID       string                  `json:"executionId"`
+	SourceType        string                  `json:"sourceType"`
+	DeliveryID        string                  `json:"deliveryId"`
+	ChannelID         string                  `json:"channelId"`
+	ProjectName       string                  `json:"projectName"`
+	SessionKey        string                  `json:"sessionKey"`
+	ThreadTS          string                  `json:"threadTs,omitempty"`
+	CommandText       string                  `json:"commandText,omitempty"`
+	Status            ExecutionLifecycleState `json:"status"`
+	DiagnosticContext string                  `json:"diagnosticContext,omitempty"`
+	CreatedAt         time.Time               `json:"createdAt"`
+	StartedAt         *time.Time              `json:"startedAt,omitempty"`
+	UpdatedAt         time.Time               `json:"updatedAt"`
+	CompletedAt       *time.Time              `json:"completedAt,omitempty"`
+}
+
+type ExecutionState struct {
+	ExecutionID       string                  `json:"executionId"`
+	Status            ExecutionLifecycleState `json:"status"`
+	DiagnosticContext string                  `json:"diagnosticContext,omitempty"`
+	StartedAt         *time.Time              `json:"startedAt,omitempty"`
+	UpdatedAt         time.Time               `json:"updatedAt"`
+	CompletedAt       *time.Time              `json:"completedAt,omitempty"`
+}
+
 type ThreadState struct {
 	ThreadTS      string    `json:"threadTs"`
 	ChannelID     string    `json:"channelId"`
@@ -22,11 +67,12 @@ type ThreadState struct {
 }
 
 type EventDedupe struct {
-	SourceType  string     `json:"sourceType"`
-	DeliveryID  string     `json:"deliveryId"`
-	ReceivedAt  time.Time  `json:"receivedAt"`
-	ProcessedAt *time.Time `json:"processedAt,omitempty"`
-	Status      string     `json:"status,omitempty"`
+	SourceType        string     `json:"sourceType"`
+	DeliveryID        string     `json:"deliveryId"`
+	ReceivedAt        time.Time  `json:"receivedAt"`
+	ProcessedAt       *time.Time `json:"processedAt,omitempty"`
+	Status            string     `json:"status,omitempty"`
+	DiagnosticContext string     `json:"diagnosticContext,omitempty"`
 }
 
 type ThreadLock struct {
@@ -69,6 +115,11 @@ type ReloadReport struct {
 	Status     Status    `json:"status"`
 }
 
+type ExecutionStatusReport struct {
+	RequestedAt time.Time        `json:"requestedAt"`
+	Execution   ExecutionRequest `json:"execution"`
+}
+
 type CancelReport struct {
 	RequestedAt time.Time `json:"requestedAt"`
 	ThreadTS    string    `json:"threadTs"`
@@ -80,6 +131,10 @@ type CancelReport struct {
 }
 
 type Store interface {
+	CreateExecution(context.Context, ExecutionRequest) error
+	LoadExecution(context.Context, string) (ExecutionRequest, error)
+	ListExecutions(context.Context, []ExecutionLifecycleState) ([]ExecutionRequest, error)
+	UpdateExecutionState(context.Context, ExecutionState) error
 	SaveThreadState(context.Context, ThreadState) error
 	LoadThreadState(context.Context, string) (ThreadState, error)
 	SaveEventDedupe(context.Context, EventDedupe) error

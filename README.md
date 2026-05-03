@@ -23,9 +23,10 @@ At runtime, Spexus Agent:
 1. receives Slack events through Socket Mode
 2. resolves the Slack channel to a registered project
 3. maps the Slack thread to an ACPX session name
-4. invokes `acpx` in strict JSON mode
-5. translates ACPX events into Slack thread replies
-6. stores thread and deduplication state in SQLite
+4. treats agent mentions as command invocations and plain thread replies as prompts
+5. invokes `acpx` in strict JSON mode
+6. translates ACPX events into Slack thread replies
+7. stores thread and deduplication state in SQLite
 
 ## Repository Scope
 
@@ -81,6 +82,10 @@ The runtime uses:
 - Slack Web API for channel provisioning and thread replies
 - Slack Socket Mode for inbound message delivery
 - ACPX in strict JSON mode for prompt execution and structured event output
+
+In Slack threads, a normal human reply without an agent mention is sent to ACPX as the prompt text. Mention the agent when you want the local command surface, such as `status`, `ask <prompt>`, or `cancel`.
+
+Assistant output is streamed into the Slack thread: the runtime posts the first partial answer, updates that message while it remains under the Slack text limit, and opens the next thread message when the current chunk reaches the limit.
 
 Raw Socket Mode frame logging is disabled by default, even when `--debug` is enabled. To enable websocket-level tracing for troubleshooting:
 

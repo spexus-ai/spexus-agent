@@ -118,6 +118,50 @@ func TestSocketModeMessageNormalizeInboundMention(t *testing.T) {
 	}
 }
 
+// Test: thread message payloads normalize into the shared inbound invocation shape used by direct prompt routing.
+func TestSocketModeMessageNormalizeInboundThreadMessage(t *testing.T) {
+	t.Parallel()
+
+	invocation, err := (SocketModeMessage{
+		EventID:   "Ev126",
+		Type:      SocketModeMessageType,
+		ChannelID: "C12345678",
+		ThreadTS:  "1713686420.000300",
+		Timestamp: "1713686421.000400",
+		UserID:    "U123",
+		Text:      "summarize current project state",
+	}).NormalizeInbound()
+	if err != nil {
+		t.Fatalf("NormalizeInbound() error = %v", err)
+	}
+	if invocation.SourceType != InboundSourceMessage {
+		t.Fatalf("NormalizeInbound() source = %q, want %q", invocation.SourceType, InboundSourceMessage)
+	}
+	if invocation.DeliveryID != "Ev126" || invocation.ChannelID != "C12345678" || invocation.ThreadTS != "1713686420.000300" {
+		t.Fatalf("NormalizeInbound() invocation = %#v", invocation)
+	}
+}
+
+// Test: root message payloads remain classified as messages but do not invent a thread anchor.
+func TestSocketModeMessageNormalizeInboundRootMessageDoesNotSetThread(t *testing.T) {
+	t.Parallel()
+
+	invocation, err := (SocketModeMessage{
+		EventID:   "Ev127",
+		Type:      SocketModeMessageType,
+		ChannelID: "C12345678",
+		Timestamp: "1713686421.000400",
+		UserID:    "U123",
+		Text:      "channel chatter",
+	}).NormalizeInbound()
+	if err != nil {
+		t.Fatalf("NormalizeInbound() error = %v", err)
+	}
+	if invocation.SourceType != InboundSourceMessage || invocation.ThreadTS != "" {
+		t.Fatalf("NormalizeInbound() invocation = %#v, want root message without thread", invocation)
+	}
+}
+
 // Test: slash command payloads normalize into the shared inbound invocation shape without thread metadata.
 // Validates: AC-1818 (REQ-1185 - slash invocations resolve channel context), AC-1824 (REQ-1193 - invocation sources classify as slash)
 func TestSocketModeSlashCommandNormalizeInbound(t *testing.T) {

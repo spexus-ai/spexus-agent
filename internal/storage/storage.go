@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -156,6 +157,7 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			received_at TEXT NOT NULL,
 			processed_at TEXT,
 			status TEXT NOT NULL DEFAULT '',
+			diagnostic_context TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY(source_type, delivery_id)
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_source_delivery ON events_dedupe(source_type, delivery_id)`,
@@ -180,6 +182,27 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			updated_at TEXT NOT NULL,
 			FOREIGN KEY(thread_ts) REFERENCES threads(thread_ts) ON DELETE CASCADE
 		)`,
+		`CREATE TABLE IF NOT EXISTS executions (
+			execution_id TEXT PRIMARY KEY,
+			source_type TEXT NOT NULL,
+			delivery_id TEXT NOT NULL,
+			channel_id TEXT NOT NULL,
+			project_name TEXT NOT NULL,
+			session_key TEXT NOT NULL,
+			thread_ts TEXT NOT NULL DEFAULT '',
+			command_text TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			diagnostic_context TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			started_at TEXT,
+			updated_at TEXT NOT NULL,
+			completed_at TEXT,
+			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_project_name ON executions(project_name)`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_session_key ON executions(session_key)`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_source_delivery ON executions(source_type, delivery_id)`,
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -202,6 +225,195 @@ func (s *Store) bootstrap(ctx context.Context) error {
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema bootstrap: %w", err)
+	}
+
+	return nil
+}
+
+func (r *RuntimeRepository) CreateExecution(ctx context.Context, request runtimemodel.ExecutionRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if request.ExecutionID == "" {
+		return fmt.Errorf("execution id is required")
+	}
+	if request.SourceType == "" {
+		return fmt.Errorf("source type is required")
+	}
+	if request.DeliveryID == "" {
+		return fmt.Errorf("delivery id is required")
+	}
+	if request.ChannelID == "" {
+		return fmt.Errorf("channel id is required")
+	}
+	if request.ProjectName == "" {
+		return fmt.Errorf("project name is required")
+	}
+	if request.SessionKey == "" {
+		return fmt.Errorf("session key is required")
+	}
+
+	if request.Status == "" {
+		request.Status = runtimemodel.ExecutionStateQueued
+	}
+	if request.Status != runtimemodel.ExecutionStateQueued {
+		return fmt.Errorf("execution status must start as %q", runtimemodel.ExecutionStateQueued)
+	}
+	if err := validateExecutionStatus(request.Status); err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	if request.CreatedAt.IsZero() {
+		request.CreatedAt = now
+	}
+	if request.UpdatedAt.IsZero() {
+		request.UpdatedAt = request.CreatedAt
+	}
+
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO executions (
+			execution_id, source_type, delivery_id, channel_id, project_name, session_key,
+			thread_ts, command_text, status, diagnostic_context, created_at, started_at, updated_at, completed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		request.ExecutionID,
+		request.SourceType,
+		request.DeliveryID,
+		request.ChannelID,
+		request.ProjectName,
+		request.SessionKey,
+		request.ThreadTS,
+		request.CommandText,
+		request.Status,
+		request.DiagnosticContext,
+		request.CreatedAt.UTC().Format(time.RFC3339Nano),
+		formatNullableTime(request.StartedAt),
+		request.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		formatNullableTime(request.CompletedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("create execution %q: %w", request.ExecutionID, err)
+	}
+
+	return nil
+}
+
+func (r *RuntimeRepository) LoadExecution(ctx context.Context, executionID string) (runtimemodel.ExecutionRequest, error) {
+	if err := ctx.Err(); err != nil {
+		return runtimemodel.ExecutionRequest{}, err
+	}
+	if executionID == "" {
+		return runtimemodel.ExecutionRequest{}, fmt.Errorf("execution id is required")
+	}
+
+	row := r.db.QueryRowContext(ctx, `
+		SELECT execution_id, source_type, delivery_id, channel_id, project_name, session_key,
+			thread_ts, command_text, status, diagnostic_context, created_at, started_at, updated_at, completed_at
+		FROM executions
+		WHERE execution_id = ?
+	`, executionID)
+
+	execution, err := scanExecution(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return runtimemodel.ExecutionRequest{}, ErrNotFound
+		}
+		return runtimemodel.ExecutionRequest{}, fmt.Errorf("load execution %q: %w", executionID, err)
+	}
+
+	return execution, nil
+}
+
+func (r *RuntimeRepository) ListExecutions(ctx context.Context, statuses []runtimemodel.ExecutionLifecycleState) ([]runtimemodel.ExecutionRequest, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	query := `
+		SELECT execution_id, source_type, delivery_id, channel_id, project_name, session_key,
+			thread_ts, command_text, status, diagnostic_context, created_at, started_at, updated_at, completed_at
+		FROM executions
+	`
+	args := make([]any, 0, len(statuses))
+	if len(statuses) > 0 {
+		placeholders := make([]string, 0, len(statuses))
+		for _, status := range statuses {
+			if err := validateExecutionStatus(status); err != nil {
+				return nil, err
+			}
+			placeholders = append(placeholders, "?")
+			args = append(args, status)
+		}
+		query += " WHERE status IN (" + strings.Join(placeholders, ", ") + ")"
+	}
+	query += " ORDER BY created_at ASC, execution_id ASC"
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list executions: %w", err)
+	}
+	defer rows.Close()
+
+	executions := make([]runtimemodel.ExecutionRequest, 0)
+	for rows.Next() {
+		execution, err := scanExecution(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list executions: %w", err)
+		}
+		executions = append(executions, execution)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list executions: %w", err)
+	}
+
+	return executions, nil
+}
+
+func (r *RuntimeRepository) UpdateExecutionState(ctx context.Context, state runtimemodel.ExecutionState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if state.ExecutionID == "" {
+		return fmt.Errorf("execution id is required")
+	}
+	if err := validateExecutionStatus(state.Status); err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = now
+	}
+	if state.Status == runtimemodel.ExecutionStateRunning && state.StartedAt == nil {
+		state.StartedAt = timePtr(state.UpdatedAt)
+	}
+	if isTerminalExecutionState(state.Status) && state.CompletedAt == nil {
+		state.CompletedAt = timePtr(state.UpdatedAt)
+	}
+
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE executions
+		SET status = ?, diagnostic_context = ?, started_at = COALESCE(?, started_at), updated_at = ?, completed_at = COALESCE(?, completed_at)
+		WHERE execution_id = ?
+	`,
+		state.Status,
+		state.DiagnosticContext,
+		formatNullableTime(state.StartedAt),
+		state.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		formatNullableTime(state.CompletedAt),
+		state.ExecutionID,
+	)
+	if err != nil {
+		return fmt.Errorf("update execution state %q: %w", state.ExecutionID, err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update execution state %q rows affected: %w", state.ExecutionID, err)
+	}
+	if rowsAffected == 0 {
+		return ErrNotFound
 	}
 
 	return nil
@@ -504,18 +716,20 @@ func (r *RuntimeRepository) SaveEventDedupe(ctx context.Context, dedupe runtimem
 
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO events_dedupe (
-			source_type, delivery_id, received_at, processed_at, status
-		) VALUES (?, ?, ?, ?, ?)
+			source_type, delivery_id, received_at, processed_at, status, diagnostic_context
+		) VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(source_type, delivery_id) DO UPDATE SET
 			received_at = excluded.received_at,
 			processed_at = excluded.processed_at,
-			status = excluded.status
+			status = excluded.status,
+			diagnostic_context = excluded.diagnostic_context
 	`,
 		dedupe.SourceType,
 		dedupe.DeliveryID,
 		dedupe.ReceivedAt.UTC().Format(time.RFC3339Nano),
 		formatNullableTime(dedupe.ProcessedAt),
 		dedupe.Status,
+		dedupe.DiagnosticContext,
 	)
 	if err != nil {
 		return fmt.Errorf("save event dedupe %s/%q: %w", dedupe.SourceType, dedupe.DeliveryID, err)
@@ -536,7 +750,7 @@ func (r *RuntimeRepository) LoadEventDedupe(ctx context.Context, sourceType, del
 	}
 
 	row := r.db.QueryRowContext(ctx, `
-		SELECT source_type, delivery_id, received_at, processed_at, status
+		SELECT source_type, delivery_id, received_at, processed_at, status, diagnostic_context
 		FROM events_dedupe
 		WHERE source_type = ? AND delivery_id = ?
 	`, sourceType, deliveryID)
@@ -544,7 +758,7 @@ func (r *RuntimeRepository) LoadEventDedupe(ctx context.Context, sourceType, del
 	var dedupe runtimemodel.EventDedupe
 	var receivedAtText string
 	var processedAtText sql.NullString
-	if err := row.Scan(&dedupe.SourceType, &dedupe.DeliveryID, &receivedAtText, &processedAtText, &dedupe.Status); err != nil {
+	if err := row.Scan(&dedupe.SourceType, &dedupe.DeliveryID, &receivedAtText, &processedAtText, &dedupe.Status, &dedupe.DiagnosticContext); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return runtimemodel.EventDedupe{}, ErrNotFound
 		}
@@ -591,7 +805,17 @@ func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
 	if err != nil {
 		return fmt.Errorf("inspect events_dedupe delivery_id column: %w", err)
 	}
+	hasDiagnosticContext, err := tableColumnExists(ctx, tx, "events_dedupe", "diagnostic_context")
+	if err != nil {
+		return fmt.Errorf("inspect events_dedupe diagnostic_context column: %w", err)
+	}
 	if hasSourceType && hasDeliveryID {
+		if hasDiagnosticContext {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE events_dedupe ADD COLUMN diagnostic_context TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add events_dedupe diagnostic_context column: %w", err)
+		}
 		return nil
 	}
 
@@ -602,6 +826,7 @@ func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
 			received_at TEXT NOT NULL,
 			processed_at TEXT,
 			status TEXT NOT NULL DEFAULT '',
+			diagnostic_context TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY(source_type, delivery_id)
 		)
 	`); err != nil {
@@ -609,8 +834,8 @@ func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT OR REPLACE INTO events_dedupe_v2 (source_type, delivery_id, received_at, processed_at, status)
-		SELECT 'mention', slack_event_id, received_at, processed_at, status
+		INSERT OR REPLACE INTO events_dedupe_v2 (source_type, delivery_id, received_at, processed_at, status, diagnostic_context)
+		SELECT 'mention', slack_event_id, received_at, processed_at, status, ''
 		FROM events_dedupe
 	`); err != nil {
 		return fmt.Errorf("copy events_dedupe rows into v2: %w", err)
@@ -795,6 +1020,64 @@ func scanProject(scanner interface {
 	return project, nil
 }
 
+func scanExecution(scanner interface {
+	Scan(dest ...any) error
+}) (runtimemodel.ExecutionRequest, error) {
+	var execution runtimemodel.ExecutionRequest
+	var createdAtText string
+	var updatedAtText string
+	var startedAtText sql.NullString
+	var completedAtText sql.NullString
+
+	if err := scanner.Scan(
+		&execution.ExecutionID,
+		&execution.SourceType,
+		&execution.DeliveryID,
+		&execution.ChannelID,
+		&execution.ProjectName,
+		&execution.SessionKey,
+		&execution.ThreadTS,
+		&execution.CommandText,
+		&execution.Status,
+		&execution.DiagnosticContext,
+		&createdAtText,
+		&startedAtText,
+		&updatedAtText,
+		&completedAtText,
+	); err != nil {
+		return runtimemodel.ExecutionRequest{}, err
+	}
+
+	createdAt, err := parseTime(createdAtText)
+	if err != nil {
+		return runtimemodel.ExecutionRequest{}, fmt.Errorf("parse created_at for execution %q: %w", execution.ExecutionID, err)
+	}
+	updatedAt, err := parseTime(updatedAtText)
+	if err != nil {
+		return runtimemodel.ExecutionRequest{}, fmt.Errorf("parse updated_at for execution %q: %w", execution.ExecutionID, err)
+	}
+
+	execution.CreatedAt = createdAt
+	execution.UpdatedAt = updatedAt
+
+	if startedAtText.Valid {
+		startedAt, err := parseTime(startedAtText.String)
+		if err != nil {
+			return runtimemodel.ExecutionRequest{}, fmt.Errorf("parse started_at for execution %q: %w", execution.ExecutionID, err)
+		}
+		execution.StartedAt = &startedAt
+	}
+	if completedAtText.Valid {
+		completedAt, err := parseTime(completedAtText.String)
+		if err != nil {
+			return runtimemodel.ExecutionRequest{}, fmt.Errorf("parse completed_at for execution %q: %w", execution.ExecutionID, err)
+		}
+		execution.CompletedAt = &completedAt
+	}
+
+	return execution, nil
+}
+
 func parseTime(value string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, value)
 }
@@ -808,6 +1091,37 @@ func formatNullableTime(value *time.Time) any {
 
 func storageDSN(path string) string {
 	return path + "?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL"
+}
+
+func validateExecutionStatus(status runtimemodel.ExecutionLifecycleState) error {
+	switch status {
+	case runtimemodel.ExecutionStateQueued,
+		runtimemodel.ExecutionStateRunning,
+		runtimemodel.ExecutionStateSucceeded,
+		runtimemodel.ExecutionStateFailed,
+		runtimemodel.ExecutionStateCancelled:
+		return nil
+	case "":
+		return fmt.Errorf("execution status is required")
+	default:
+		return fmt.Errorf("unsupported execution status %q", status)
+	}
+}
+
+func isTerminalExecutionState(status runtimemodel.ExecutionLifecycleState) bool {
+	switch status {
+	case runtimemodel.ExecutionStateSucceeded,
+		runtimemodel.ExecutionStateFailed,
+		runtimemodel.ExecutionStateCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func timePtr(value time.Time) *time.Time {
+	value = value.UTC()
+	return &value
 }
 
 func ensureFilePermissions(path string) error {

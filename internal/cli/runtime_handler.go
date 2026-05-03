@@ -121,16 +121,29 @@ func (h *runtimeCommandHandler) Start(ctx context.Context, args []string) error 
 }
 
 func (h *runtimeCommandHandler) Status(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return fmt.Errorf("runtime status does not accept arguments")
-	}
+	switch len(args) {
+	case 0:
+		status, err := h.currentStatus(ctx)
+		if err != nil {
+			return err
+		}
 
-	status, err := h.currentStatus(ctx)
-	if err != nil {
-		return err
-	}
+		return writeJSON(h.out, status)
+	case 1:
+		executionID := strings.TrimSpace(args[0])
+		if executionID == "" {
+			return fmt.Errorf("runtime status requires a non-empty execution id")
+		}
 
-	return writeJSON(h.out, status)
+		report, err := h.loadExecutionStatus(ctx, executionID)
+		if err != nil {
+			return err
+		}
+
+		return writeJSON(h.out, report)
+	default:
+		return fmt.Errorf("runtime status accepts at most one execution id argument")
+	}
 }
 
 func (h *runtimeCommandHandler) Reload(ctx context.Context, args []string) error {
@@ -167,12 +180,12 @@ func (h *runtimeCommandHandler) Doctor(ctx context.Context, args []string) error
 
 func (h *runtimeCommandHandler) Cancel(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("runtime cancel requires exactly one thread timestamp argument")
+		return fmt.Errorf("runtime cancel requires exactly one execution id or thread timestamp argument")
 	}
 
-	threadTS := strings.TrimSpace(args[0])
-	if threadTS == "" {
-		return fmt.Errorf("runtime cancel requires exactly one thread timestamp argument")
+	identifier := strings.TrimSpace(args[0])
+	if identifier == "" {
+		return fmt.Errorf("runtime cancel requires exactly one execution id or thread timestamp argument")
 	}
 
 	if _, _, err := h.loadValidatedConfig(ctx); err != nil {
@@ -197,6 +210,15 @@ func (h *runtimeCommandHandler) Cancel(ctx context.Context, args []string) error
 		return errors.New("runtime repository unavailable")
 	}
 
+	execution, err := runtimeRepo.LoadExecution(ctx, identifier)
+	if err == nil {
+		return h.cancelExecution(ctx, runtimeRepo, execution, nil, nil)
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return err
+	}
+
+	threadTS := identifier
 	state, err := runtimeRepo.LoadThreadState(ctx, threadTS)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -221,13 +243,30 @@ func (h *runtimeCommandHandler) Cancel(ctx context.Context, args []string) error
 	if adapter == nil {
 		return errors.New("acpx adapter is required")
 	}
-
 	if err := adapter.Cancel(ctx, threadTS); err != nil {
 		return err
 	}
 
+	cancelledAt := time.Now().UTC()
+	execution, err = findRunningExecutionForThread(ctx, runtimeRepo, threadTS)
+	if err != nil {
+		if !errors.Is(err, runtime.ErrNotFound) {
+			return err
+		}
+	} else {
+		if err := runtimeRepo.UpdateExecutionState(ctx, runtime.ExecutionState{
+			ExecutionID:       execution.ExecutionID,
+			Status:            runtime.ExecutionStateCancelled,
+			DiagnosticContext: "cancelled by operator",
+			UpdatedAt:         cancelledAt,
+			CompletedAt:       &cancelledAt,
+		}); err != nil {
+			return fmt.Errorf("persist cancelled execution state for %q: %w", execution.ExecutionID, err)
+		}
+	}
+
 	state.LastStatus = "cancelled"
-	state.UpdatedAt = time.Now().UTC()
+	state.UpdatedAt = cancelledAt
 	if err := runtimeRepo.SaveThreadState(ctx, state); err != nil {
 		return fmt.Errorf("persist cancelled thread state for %q: %w", threadTS, err)
 	}
@@ -241,7 +280,7 @@ func (h *runtimeCommandHandler) Cancel(ctx context.Context, args []string) error
 	}
 
 	report := runtime.CancelReport{
-		RequestedAt: time.Now().UTC(),
+		RequestedAt: cancelledAt,
 		ThreadTS:    threadTS,
 		SessionName: state.SessionName,
 		Result:      "cancelled",
@@ -252,6 +291,189 @@ func (h *runtimeCommandHandler) Cancel(ctx context.Context, args []string) error
 	report.Status.Message = report.Message
 
 	return writeJSON(h.out, report)
+}
+
+func (h *runtimeCommandHandler) cancelExecution(ctx context.Context, runtimeRepo runtime.Store, execution runtime.ExecutionRequest, state *runtime.ThreadState, lock *runtime.ThreadLock) error {
+	if runtimeRepo == nil {
+		return errors.New("runtime repository unavailable")
+	}
+	if execution.ExecutionID == "" {
+		return errors.New("execution id is required")
+	}
+	if execution.Status != runtime.ExecutionStateRunning {
+		sessionName := strings.TrimSpace(execution.SessionKey)
+		if state != nil && strings.TrimSpace(state.SessionName) != "" {
+			sessionName = state.SessionName
+		}
+		return h.writeCancelNoOp(ctx, execution.ThreadTS, sessionName, fmt.Sprintf("execution is %s", execution.Status))
+	}
+	if strings.TrimSpace(execution.ThreadTS) == "" {
+		return h.persistCancelRoutingFailure(ctx, runtimeRepo, execution, "cancel routing failed: execution thread timestamp is unavailable")
+	}
+
+	if state == nil {
+		loadedState, err := runtimeRepo.LoadThreadState(ctx, execution.ThreadTS)
+		if err != nil {
+			if !errors.Is(err, storage.ErrNotFound) {
+				return err
+			}
+		} else {
+			state = &loadedState
+		}
+	}
+	if lock == nil {
+		loadedLock, err := runtimeRepo.LoadThreadLock(ctx, execution.ThreadTS)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return h.persistCancelRoutingFailure(ctx, runtimeRepo, execution, fmt.Sprintf("cancel routing failed: execution owner unavailable for thread %q", execution.ThreadTS))
+			}
+			return err
+		}
+		lock = &loadedLock
+	}
+	if strings.TrimSpace(lock.LockOwner) == "" {
+		return h.persistCancelRoutingFailure(ctx, runtimeRepo, execution, fmt.Sprintf("cancel routing failed: execution owner missing for thread %q", execution.ThreadTS))
+	}
+
+	adapter := h.adapter
+	if adapter == nil {
+		return h.persistCancelRoutingFailure(ctx, runtimeRepo, execution, "cancel routing failed: acpx adapter is required")
+	}
+	if err := adapter.Cancel(ctx, execution.ThreadTS); err != nil {
+		return h.persistCancelRoutingFailure(ctx, runtimeRepo, execution, fmt.Sprintf("cancel routing failed via owner %q: %v", lock.LockOwner, err))
+	}
+
+	cancelledAt := time.Now().UTC()
+	if err := runtimeRepo.UpdateExecutionState(ctx, runtime.ExecutionState{
+		ExecutionID:       execution.ExecutionID,
+		Status:            runtime.ExecutionStateCancelled,
+		DiagnosticContext: "cancelled by operator",
+		UpdatedAt:         cancelledAt,
+		CompletedAt:       &cancelledAt,
+	}); err != nil {
+		return fmt.Errorf("persist cancelled execution state for %q: %w", execution.ExecutionID, err)
+	}
+
+	sessionName := strings.TrimSpace(execution.SessionKey)
+	if state != nil {
+		state.LastStatus = "cancelled"
+		state.UpdatedAt = cancelledAt
+		if err := runtimeRepo.SaveThreadState(ctx, *state); err != nil {
+			return fmt.Errorf("persist cancelled thread state for %q: %w", execution.ThreadTS, err)
+		}
+		sessionName = state.SessionName
+	}
+	if err := runtimeRepo.DeleteThreadLock(ctx, execution.ThreadTS); err != nil {
+		return fmt.Errorf("release thread lock for %q: %w", execution.ThreadTS, err)
+	}
+
+	snapshot, err := h.reloadSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+
+	report := runtime.CancelReport{
+		RequestedAt: cancelledAt,
+		ThreadTS:    execution.ThreadTS,
+		SessionName: sessionName,
+		Result:      "cancelled",
+		NoOp:        false,
+		Message:     "active ACPX execution cancelled",
+		Status:      snapshot.statusCopy(),
+	}
+	report.Status.Message = report.Message
+
+	return writeJSON(h.out, report)
+}
+
+func (h *runtimeCommandHandler) persistCancelRoutingFailure(ctx context.Context, runtimeRepo runtime.Store, execution runtime.ExecutionRequest, diagnostic string) error {
+	if runtimeRepo == nil {
+		return errors.New("runtime repository unavailable")
+	}
+	diagnostic = strings.TrimSpace(diagnostic)
+	if diagnostic == "" {
+		diagnostic = "cancel routing failed"
+	}
+
+	failedAt := time.Now().UTC()
+	if err := runtimeRepo.UpdateExecutionState(ctx, runtime.ExecutionState{
+		ExecutionID:       execution.ExecutionID,
+		Status:            runtime.ExecutionStateFailed,
+		DiagnosticContext: diagnostic,
+		StartedAt:         execution.StartedAt,
+		UpdatedAt:         failedAt,
+		CompletedAt:       &failedAt,
+	}); err != nil {
+		return fmt.Errorf("%s: persist execution diagnostic for %q: %w", diagnostic, execution.ExecutionID, err)
+	}
+	if err := runtime.ReleaseExecutionAdmission(ctx, execution.ExecutionID); err != nil {
+		return fmt.Errorf("%s: release execution admission for %q: %w", diagnostic, execution.ExecutionID, err)
+	}
+
+	return errors.New(diagnostic)
+}
+
+func findRunningExecutionForThread(ctx context.Context, runtimeRepo runtime.Store, threadTS string) (runtime.ExecutionRequest, error) {
+	if runtimeRepo == nil {
+		return runtime.ExecutionRequest{}, errors.New("runtime repository unavailable")
+	}
+
+	executions, err := runtimeRepo.ListExecutions(ctx, []runtime.ExecutionLifecycleState{runtime.ExecutionStateRunning})
+	if err != nil {
+		return runtime.ExecutionRequest{}, fmt.Errorf("list running executions: %w", err)
+	}
+
+	var matched runtime.ExecutionRequest
+	for _, execution := range executions {
+		if execution.ThreadTS != threadTS {
+			continue
+		}
+		if matched.ExecutionID == "" || execution.UpdatedAt.After(matched.UpdatedAt) {
+			matched = execution
+		}
+	}
+	if matched.ExecutionID == "" {
+		return runtime.ExecutionRequest{}, runtime.ErrNotFound
+	}
+
+	return matched, nil
+}
+
+func (h *runtimeCommandHandler) loadExecutionStatus(ctx context.Context, executionID string) (runtime.ExecutionStatusReport, error) {
+	if _, _, err := h.loadValidatedConfig(ctx); err != nil {
+		return runtime.ExecutionStatusReport{}, err
+	}
+
+	storagePath, err := storage.DefaultPath()
+	if err != nil {
+		return runtime.ExecutionStatusReport{}, err
+	}
+
+	store, err := storage.Open(ctx, storagePath)
+	if err != nil {
+		return runtime.ExecutionStatusReport{}, err
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+
+	runtimeRepo := store.Runtime()
+	if runtimeRepo == nil {
+		return runtime.ExecutionStatusReport{}, errors.New("runtime repository unavailable")
+	}
+
+	execution, err := runtimeRepo.LoadExecution(ctx, executionID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return runtime.ExecutionStatusReport{}, fmt.Errorf("execution %q not found", executionID)
+		}
+		return runtime.ExecutionStatusReport{}, err
+	}
+
+	return runtime.ExecutionStatusReport{
+		RequestedAt: time.Now().UTC(),
+		Execution:   execution,
+	}, nil
 }
 
 func (h *runtimeCommandHandler) writeCancelNoOp(ctx context.Context, threadTS, sessionName, message string) error {
@@ -366,14 +588,16 @@ func (h *runtimeCommandHandler) debugf(format string, args ...any) {
 }
 
 type foregroundRuntimeStarter struct {
-	source      slack.InboundInvocationSource
-	client      slack.Client
-	renderer    runtime.SlackThreadRenderer
-	adapter     acpxadapter.Adapter
-	projectRepo runtime.ProjectContextResolver
-	runtimeRepo runtime.Store
-	store       interface{ Close() error }
-	debugf      func(string, ...any)
+	source           slack.InboundInvocationSource
+	client           slack.Client
+	renderer         runtime.SlackThreadRenderer
+	adapter          acpxadapter.Adapter
+	projectRepo      runtime.ProjectContextResolver
+	runtimeRepo      runtime.Store
+	executionManager runtime.ExecutionManager
+	store            interface{ Close() error }
+	newExecID        func() string
+	debugf           func(string, ...any)
 }
 
 func (s *foregroundRuntimeStarter) Start(ctx context.Context, _ runtime.Status) error {
@@ -409,6 +633,13 @@ func (s *foregroundRuntimeStarter) Start(ctx context.Context, _ runtime.Status) 
 	}
 
 	coordinator := runtime.NewSlackTurnCoordinator(s.runtimeRepo, "runtime-start")
+	if s.newExecID != nil {
+		coordinator.SetExecutionIDGenerator(s.newExecID)
+	}
+	manager := s.executionManager
+	if manager == nil {
+		manager = runtime.NewExecutionManager(coordinator, nil)
+	}
 	s.logf("runtime.loop: connected to slack socket mode")
 
 	for {
@@ -434,11 +665,15 @@ func (s *foregroundRuntimeStarter) Start(ctx context.Context, _ runtime.Status) 
 
 			switch invocation.SourceType {
 			case slack.InboundSourceMention:
-				if err := s.handleMentionInvocation(ctx, coordinator, invocation); err != nil {
+				if err := s.handleMentionInvocation(ctx, coordinator, manager, invocation); err != nil {
 					s.logf("runtime.loop: mention failed delivery=%s: %v", invocation.DeliveryID, err)
 				}
+			case slack.InboundSourceMessage:
+				if err := s.handleMessageInvocation(ctx, coordinator, manager, invocation); err != nil {
+					s.logf("runtime.loop: message failed delivery=%s: %v", invocation.DeliveryID, err)
+				}
 			case slack.InboundSourceSlash:
-				if err := s.handleSlashInvocation(ctx, coordinator, invocation); err != nil {
+				if err := s.handleSlashInvocation(ctx, coordinator, manager, invocation); err != nil {
 					s.logf("runtime.loop: slash failed delivery=%s: %v", invocation.DeliveryID, err)
 				}
 			default:
@@ -448,14 +683,29 @@ func (s *foregroundRuntimeStarter) Start(ctx context.Context, _ runtime.Status) 
 	}
 }
 
-func (s *foregroundRuntimeStarter) handleMentionInvocation(ctx context.Context, coordinator *runtime.SlackTurnCoordinator, invocation slack.InboundInvocation) error {
+func (s *foregroundRuntimeStarter) handleMentionInvocation(ctx context.Context, coordinator *runtime.SlackTurnCoordinator, manager runtime.ExecutionManager, invocation slack.InboundInvocation) error {
 	prepared, err := runtime.PrepareSlackMentionEvent(ctx, s.projectRepo, invocation)
 	if err != nil {
 		return s.handleInvocationRejection(ctx, invocation, err)
 	}
 	command := runtime.ParseSlackCommand(prepared.Event.Text)
 
-	result, err := coordinator.Execute(ctx, prepared, func(ctx context.Context, prepared runtime.PreparedSlackEvent) error {
+	accepted, result, err := coordinator.Accept(ctx, prepared)
+	if err != nil {
+		s.logLifecycle("execution_completed", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "failed", "session="+prepared.SessionName, "error="+strconv.Quote(err.Error()))
+		_ = s.postTurnError(ctx, prepared, err)
+		return err
+	}
+	if result.Duplicate {
+		s.logLifecycle("duplicate_skipped", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "duplicate")
+		s.logf("runtime.loop: duplicate mention skipped delivery=%s", invocation.DeliveryID)
+		return nil
+	}
+
+	s.logLifecycle("execution_handed_off", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "queued", "session="+prepared.SessionName, "execution_id="+accepted.Execution.ExecutionID)
+	s.logf("runtime.loop: mention handed off delivery=%s execution=%s session=%s", invocation.DeliveryID, accepted.Execution.ExecutionID, prepared.SessionName)
+
+	return s.scheduleAcceptedInvocation(ctx, manager, accepted, "mention", func(ctx context.Context, prepared runtime.PreparedSlackEvent) error {
 		s.logLifecycle("execution_started", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "processing", "session="+prepared.SessionName)
 		s.logf(
 			"runtime.loop: dispatching mention delivery=%s project=%s session=%s",
@@ -476,37 +726,27 @@ func (s *foregroundRuntimeStarter) handleMentionInvocation(ctx context.Context, 
 			return nil
 		}
 
-		session, err := s.adapter.SendPrompt(ctx, acpxadapter.SessionRequest{
-			ProjectPath: prepared.Project.LocalPath,
-			ThreadTS:    prepared.ThreadTS,
-			Prompt:      command.ACPXPrompt(),
-		})
+		session, err := s.sendPromptAndRender(ctx, prepared, command.ACPXPrompt(), "mention", command.Kind == runtime.SlackCommandAsk)
 		if err != nil {
 			return err
 		}
-
-		s.logf(
-			"runtime.loop: acpx completed session=%s output_bytes=%d",
-			session.SessionName,
-			len(session.Output),
-		)
-		s.logf(
-			"runtime.loop: acpx output session=%s payload=%s",
-			session.SessionName,
-			summarizeACPXOutput(session.Output, 4000),
-		)
-
-		if err := runtime.RenderACPXTurnOutput(ctx, s.renderer, runtime.SlackThreadRenderRequest{
-			ChannelID:   prepared.Project.SlackChannelID,
-			ThreadTS:    prepared.ThreadTS,
-			SessionName: session.SessionName,
-		}, session.Output); err != nil {
-			return err
-		}
-
 		s.logf("runtime.loop: rendered slack reply thread=%s session=%s", prepared.ThreadTS, session.SessionName)
 		return nil
 	})
+}
+
+func (s *foregroundRuntimeStarter) handleMessageInvocation(ctx context.Context, coordinator *runtime.SlackTurnCoordinator, manager runtime.ExecutionManager, invocation slack.InboundInvocation) error {
+	if strings.TrimSpace(invocation.ThreadTS) == "" {
+		s.logf("runtime.loop: ignored root message delivery=%s channel=%s", invocation.DeliveryID, invocation.ChannelID)
+		return nil
+	}
+
+	prepared, err := runtime.PrepareSlackMessageEvent(ctx, s.projectRepo, invocation)
+	if err != nil {
+		return s.handleInvocationRejection(ctx, invocation, err)
+	}
+
+	accepted, result, err := coordinator.Accept(ctx, prepared)
 	if err != nil {
 		s.logLifecycle("execution_completed", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "failed", "session="+prepared.SessionName, "error="+strconv.Quote(err.Error()))
 		_ = s.postTurnError(ctx, prepared, err)
@@ -514,15 +754,38 @@ func (s *foregroundRuntimeStarter) handleMentionInvocation(ctx context.Context, 
 	}
 	if result.Duplicate {
 		s.logLifecycle("duplicate_skipped", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "duplicate")
-		s.logf("runtime.loop: duplicate mention skipped delivery=%s", invocation.DeliveryID)
+		s.logf("runtime.loop: duplicate message skipped delivery=%s", invocation.DeliveryID)
 		return nil
 	}
-	s.logLifecycle("execution_completed", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "processed", "session="+prepared.SessionName)
-	s.logf("runtime.loop: mention processed delivery=%s session=%s", invocation.DeliveryID, prepared.SessionName)
-	return nil
+
+	s.logLifecycle("execution_handed_off", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "queued", "session="+prepared.SessionName, "execution_id="+accepted.Execution.ExecutionID)
+	s.logf("runtime.loop: message handed off delivery=%s execution=%s session=%s", invocation.DeliveryID, accepted.Execution.ExecutionID, prepared.SessionName)
+
+	return s.scheduleAcceptedInvocation(ctx, manager, accepted, "message", func(ctx context.Context, prepared runtime.PreparedSlackEvent) error {
+		s.logLifecycle("execution_started", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "processing", "session="+prepared.SessionName)
+		s.logf(
+			"runtime.loop: dispatching message delivery=%s project=%s session=%s",
+			prepared.Event.ID,
+			prepared.Project.Name,
+			prepared.SessionName,
+		)
+
+		prompt := strings.TrimSpace(prepared.Event.Text)
+		if prompt == "" {
+			s.logf("runtime.loop: ignored empty message thread=%s", prepared.ThreadTS)
+			return nil
+		}
+
+		session, err := s.sendPromptAndRender(ctx, prepared, prompt, "message", false)
+		if err != nil {
+			return err
+		}
+		s.logf("runtime.loop: rendered message reply thread=%s session=%s", prepared.ThreadTS, session.SessionName)
+		return nil
+	})
 }
 
-func (s *foregroundRuntimeStarter) handleSlashInvocation(ctx context.Context, coordinator *runtime.SlackTurnCoordinator, invocation slack.InboundInvocation) error {
+func (s *foregroundRuntimeStarter) handleSlashInvocation(ctx context.Context, coordinator *runtime.SlackTurnCoordinator, manager runtime.ExecutionManager, invocation slack.InboundInvocation) error {
 	prepared, err := runtime.PrepareSlackInvocation(ctx, s.projectRepo, invocation)
 	if err != nil {
 		return s.handleInvocationRejection(ctx, invocation, err)
@@ -539,11 +802,11 @@ func (s *foregroundRuntimeStarter) handleSlashInvocation(ctx context.Context, co
 
 	s.logLifecycle("ack_sent", prepared.Invocation.SourceType, prepared.Invocation.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "acked")
 	s.logf("runtime.loop: slash ack sent delivery=%s", prepared.Invocation.DeliveryID)
-	go s.executeSlashInvocation(ctx, coordinator, prepared)
+	go s.executeSlashInvocation(ctx, coordinator, manager, prepared)
 	return nil
 }
 
-func (s *foregroundRuntimeStarter) executeSlashInvocation(ctx context.Context, coordinator *runtime.SlackTurnCoordinator, prepared runtime.PreparedSlackInvocation) {
+func (s *foregroundRuntimeStarter) executeSlashInvocation(ctx context.Context, coordinator *runtime.SlackTurnCoordinator, manager runtime.ExecutionManager, prepared runtime.PreparedSlackInvocation) {
 	command := runtime.ParseSlackCommand(prepared.Invocation.CommandText)
 	rawCommand := strings.TrimSpace(prepared.Invocation.CommandText)
 
@@ -552,7 +815,7 @@ func (s *foregroundRuntimeStarter) executeSlashInvocation(ctx context.Context, c
 		Text:      slashStartText(rawCommand),
 	})
 	if err != nil {
-		s.markDeliveryCompleted(ctx, prepared.Invocation.SourceType, prepared.Invocation.DeliveryID, "failed")
+		s.markDeliveryCompleted(ctx, prepared.Invocation.SourceType, prepared.Invocation.DeliveryID, "failed", err.Error())
 		s.logLifecycle("execution_completed", prepared.Invocation.SourceType, prepared.Invocation.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "failed", "error="+strconv.Quote(err.Error()))
 		s.logf("runtime.loop: slash start message failed delivery=%s: %v", prepared.Invocation.DeliveryID, err)
 		return
@@ -590,7 +853,24 @@ func (s *foregroundRuntimeStarter) executeSlashInvocation(ctx context.Context, c
 		threadTS,
 	)
 
-	result, err := coordinator.ExecuteClaimed(ctx, preparedEvent, func(ctx context.Context, prepared runtime.PreparedSlackEvent) error {
+	accepted, result, err := coordinator.Accept(ctx, preparedEvent)
+	if err != nil {
+		s.markDeliveryCompleted(ctx, preparedEvent.SourceType, preparedEvent.DeliveryID, "failed", err.Error())
+		s.logLifecycle("execution_completed", preparedEvent.SourceType, preparedEvent.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "failed", "session="+preparedEvent.SessionName, "error="+strconv.Quote(err.Error()))
+		s.logf("runtime.loop: slash async failed delivery=%s: %v", prepared.Invocation.DeliveryID, err)
+		_ = s.postTurnError(ctx, preparedEvent, err)
+		return
+	}
+	if result.Duplicate {
+		s.logLifecycle("duplicate_skipped", preparedEvent.SourceType, preparedEvent.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "duplicate")
+		s.logf("runtime.loop: duplicate slash skipped delivery=%s", prepared.Invocation.DeliveryID)
+		return
+	}
+
+	s.logLifecycle("execution_handed_off", preparedEvent.SourceType, preparedEvent.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "queued", "session="+preparedEvent.SessionName, "execution_id="+accepted.Execution.ExecutionID)
+	s.logf("runtime.loop: slash handed off delivery=%s execution=%s session=%s", prepared.Invocation.DeliveryID, accepted.Execution.ExecutionID, preparedEvent.SessionName)
+
+	if err := s.scheduleAcceptedInvocation(ctx, manager, accepted, "slash", func(ctx context.Context, prepared runtime.PreparedSlackEvent) error {
 		s.logLifecycle("execution_started", prepared.SourceType, prepared.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "processing", "session="+prepared.SessionName)
 		if !command.ShouldExecute() {
 			if err := s.client.PostThreadMessage(ctx, slack.Message{
@@ -604,50 +884,110 @@ func (s *foregroundRuntimeStarter) executeSlashInvocation(ctx context.Context, c
 			return nil
 		}
 
-		session, err := s.adapter.SendPrompt(ctx, acpxadapter.SessionRequest{
-			ProjectPath: prepared.Project.LocalPath,
-			ThreadTS:    prepared.ThreadTS,
-			Prompt:      command.ACPXPrompt(),
-		})
+		session, err := s.sendPromptAndRender(ctx, prepared, command.ACPXPrompt(), "slash", command.Kind == runtime.SlackCommandAsk)
 		if err != nil {
 			return err
 		}
-
-		s.logf(
-			"runtime.loop: acpx completed session=%s output_bytes=%d",
-			session.SessionName,
-			len(session.Output),
-		)
-		s.logf(
-			"runtime.loop: acpx output session=%s payload=%s",
-			session.SessionName,
-			summarizeACPXOutput(session.Output, 4000),
-		)
-
-		if err := runtime.RenderACPXTurnOutput(ctx, s.renderer, runtime.SlackThreadRenderRequest{
-			ChannelID:   prepared.Project.SlackChannelID,
-			ThreadTS:    prepared.ThreadTS,
-			SessionName: session.SessionName,
-		}, session.Output); err != nil {
-			return err
-		}
-
 		s.logf("runtime.loop: rendered slash reply thread=%s session=%s", prepared.ThreadTS, session.SessionName)
 		return nil
+	}); err != nil {
+		s.logLifecycle("execution_completed", preparedEvent.SourceType, preparedEvent.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "failed", "session="+preparedEvent.SessionName, "execution_id="+accepted.Execution.ExecutionID, "error="+strconv.Quote(err.Error()))
+		s.logf("runtime.loop: slash async failed delivery=%s execution=%s session=%s: %v", prepared.Invocation.DeliveryID, accepted.Execution.ExecutionID, preparedEvent.SessionName, err)
+		_ = s.postTurnError(ctx, preparedEvent, err)
+	}
+}
+
+func (s *foregroundRuntimeStarter) scheduleAcceptedInvocation(ctx context.Context, manager runtime.ExecutionManager, accepted runtime.AcceptedSlackExecution, sourceLabel string, execute func(context.Context, runtime.PreparedSlackEvent) error) error {
+	if manager == nil {
+		return errors.New("execution manager is required")
+	}
+
+	result, err := manager.ScheduleAccepted(ctx, runtime.ManagedExecution{
+		Accepted: accepted,
+		Execute:  execute,
+		Callbacks: runtime.ExecutionCallbacks{
+			OnCompleted: func(result runtime.SlackTurnExecutionResult) {
+				s.logLifecycle("execution_completed", accepted.Prepared.SourceType, accepted.Prepared.DeliveryID, accepted.Prepared.Project.SlackChannelID, accepted.Prepared.Project.Name, "processed", "session="+accepted.Prepared.SessionName, "execution_id="+accepted.Execution.ExecutionID)
+				s.logf("runtime.loop: %s processed delivery=%s execution=%s session=%s completed_at=%s", sourceLabel, accepted.Prepared.DeliveryID, accepted.Execution.ExecutionID, accepted.Prepared.SessionName, result.CompletedAt.UTC().Format(time.RFC3339Nano))
+			},
+			OnFailed: func(err error) {
+				s.logLifecycle("execution_completed", accepted.Prepared.SourceType, accepted.Prepared.DeliveryID, accepted.Prepared.Project.SlackChannelID, accepted.Prepared.Project.Name, "failed", "session="+accepted.Prepared.SessionName, "execution_id="+accepted.Execution.ExecutionID, "error="+strconv.Quote(err.Error()))
+				s.logf("runtime.loop: %s failed delivery=%s execution=%s session=%s: %v", sourceLabel, accepted.Prepared.DeliveryID, accepted.Execution.ExecutionID, accepted.Prepared.SessionName, err)
+				_ = s.postTurnError(ctx, accepted.Prepared, err)
+			},
+		},
 	})
 	if err != nil {
-		s.logLifecycle("execution_completed", preparedEvent.SourceType, preparedEvent.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "failed", "session="+preparedEvent.SessionName, "error="+strconv.Quote(err.Error()))
-		s.logf("runtime.loop: slash async failed delivery=%s: %v", prepared.Invocation.DeliveryID, err)
-		_ = s.postTurnError(ctx, preparedEvent, err)
-		return
+		return err
 	}
-	if result.Duplicate {
-		s.logLifecycle("duplicate_skipped", preparedEvent.SourceType, preparedEvent.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "duplicate")
-		s.logf("runtime.loop: duplicate slash skipped delivery=%s", prepared.Invocation.DeliveryID)
-		return
+	if !result.Started {
+		fields := []string{
+			"session=" + accepted.Prepared.SessionName,
+			"execution_id=" + accepted.Execution.ExecutionID,
+		}
+		if reason := strings.TrimSpace(result.Decision.Reason); reason != "" {
+			fields = append(fields, "reason="+strconv.Quote(reason))
+		}
+		s.logLifecycle("execution_deferred", accepted.Prepared.SourceType, accepted.Prepared.DeliveryID, accepted.Prepared.Project.SlackChannelID, accepted.Prepared.Project.Name, "queued", fields...)
+		s.logf("runtime.loop: %s deferred delivery=%s execution=%s session=%s reason=%q", sourceLabel, accepted.Prepared.DeliveryID, accepted.Execution.ExecutionID, accepted.Prepared.SessionName, result.Decision.Reason)
 	}
-	s.logLifecycle("execution_completed", preparedEvent.SourceType, preparedEvent.DeliveryID, prepared.Project.SlackChannelID, prepared.Project.Name, "processed", "session="+preparedEvent.SessionName)
-	s.logf("runtime.loop: slash processed delivery=%s session=%s", prepared.Invocation.DeliveryID, preparedEvent.SessionName)
+	return nil
+}
+
+func (s *foregroundRuntimeStarter) sendPromptAndRender(ctx context.Context, prepared runtime.PreparedSlackEvent, prompt, sourceLabel string, forceNew bool) (acpxadapter.SessionResult, error) {
+	req := acpxadapter.SessionRequest{
+		ProjectPath: prepared.Project.LocalPath,
+		ThreadTS:    prepared.ThreadTS,
+		Prompt:      prompt,
+		ForceNew:    forceNew,
+	}
+	renderReq := runtime.SlackThreadRenderRequest{
+		ChannelID:   prepared.Project.SlackChannelID,
+		ThreadTS:    prepared.ThreadTS,
+		SessionName: prepared.SessionName,
+	}
+
+	if streamingAdapter, ok := s.adapter.(acpxadapter.StreamingAdapter); ok {
+		stream, err := s.renderer.NewStream(ctx, renderReq)
+		if err != nil {
+			return acpxadapter.SessionResult{}, err
+		}
+		session, err := streamingAdapter.SendPromptStream(ctx, req, func(output string) error {
+			return stream.RenderOutput(ctx, output)
+		})
+		if err != nil {
+			return session, err
+		}
+		if err := stream.RenderOutput(ctx, session.Output); err != nil {
+			return session, err
+		}
+		s.logACPXCompletion(session)
+		s.logf("runtime.loop: streamed %s reply thread=%s session=%s", sourceLabel, prepared.ThreadTS, session.SessionName)
+		return session, nil
+	}
+
+	session, err := s.adapter.SendPrompt(ctx, req)
+	if err != nil {
+		return acpxadapter.SessionResult{}, err
+	}
+	s.logACPXCompletion(session)
+	if err := runtime.RenderACPXTurnOutput(ctx, s.renderer, renderReq, session.Output); err != nil {
+		return session, err
+	}
+	return session, nil
+}
+
+func (s *foregroundRuntimeStarter) logACPXCompletion(session acpxadapter.SessionResult) {
+	s.logf(
+		"runtime.loop: acpx completed session=%s output_bytes=%d",
+		session.SessionName,
+		len(session.Output),
+	)
+	s.logf(
+		"runtime.loop: acpx output session=%s payload=%s",
+		session.SessionName,
+		summarizeACPXOutput(session.Output, 4000),
+	)
 }
 
 func (s *foregroundRuntimeStarter) postTurnError(ctx context.Context, prepared runtime.PreparedSlackEvent, err error) error {
@@ -763,7 +1103,7 @@ func (s *foregroundRuntimeStarter) renderSlackInvocationRejection(ctx context.Co
 	return err
 }
 
-func (s *foregroundRuntimeStarter) markDeliveryCompleted(ctx context.Context, sourceType, deliveryID, status string) {
+func (s *foregroundRuntimeStarter) markDeliveryCompleted(ctx context.Context, sourceType, deliveryID, status, diagnosticContext string) {
 	if s == nil || s.runtimeRepo == nil {
 		return
 	}
@@ -775,6 +1115,7 @@ func (s *foregroundRuntimeStarter) markDeliveryCompleted(ctx context.Context, so
 	completedAt := time.Now().UTC()
 	dedupe.Status = status
 	dedupe.ProcessedAt = &completedAt
+	dedupe.DiagnosticContext = diagnosticContext
 	_ = s.runtimeRepo.SaveEventDedupe(ctx, dedupe)
 }
 

@@ -90,14 +90,14 @@ func parseACPXJSONLines(output string) ([]ACPXTurnEvent, bool, error) {
 	jsonSeen := false
 
 	flushAssistantText := func() {
-		text := strings.TrimSpace(textBuilder.String())
-		if text == "" {
+		text := textBuilder.String()
+		if strings.TrimSpace(text) == "" {
 			textBuilder.Reset()
 			return
 		}
 		events = append(events, ACPXTurnEvent{
 			Kind: ACPXEventAssistantMessageFinal,
-			Text: text,
+			Text: strings.Trim(text, " \t\r"),
 		})
 		textBuilder.Reset()
 	}

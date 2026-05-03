@@ -115,6 +115,22 @@ After updating scopes or events, reinstall the app to the workspace.
 
 For any project channel you expect the runtime to process, ensure the bot is present in the channel.
 
+### 3.6 Slack Thread Usage
+
+In an existing Slack thread, any normal human reply without an agent mention is treated as the next ACPX prompt for that thread.
+
+Mention the agent when you want a local runtime command instead:
+
+```text
+<@Spexus.Agent> status
+<@Spexus.Agent> ask summarize current project state
+<@Spexus.Agent> cancel
+```
+
+Plain root channel messages are ignored. Start or address a thread with an agent mention or `/spexus`, then continue the thread with normal replies.
+
+Agent replies stream into the thread. The runtime updates the latest partial answer until that Slack message reaches the configured text limit, then creates the next thread reply and continues streaming there.
+
 ## 4. Store Slack Credentials
 
 Run:

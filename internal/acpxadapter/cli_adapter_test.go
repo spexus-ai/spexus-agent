@@ -38,6 +38,16 @@ func (f *fakeRunner) Run(_ context.Context, binary string, args []string, dir st
 	return result.output, result.err
 }
 
+func (f *fakeRunner) RunStream(ctx context.Context, binary string, args []string, dir string, onOutput PromptStreamFunc) (string, error) {
+	output, err := f.Run(ctx, binary, args, dir)
+	if onOutput != nil {
+		if callbackErr := onOutput(output); callbackErr != nil {
+			return output, callbackErr
+		}
+	}
+	return output, err
+}
+
 // Test: session names are derived deterministically from Slack thread timestamps.
 // Validates: AC-1795 (REQ-1156 - cancel requests cancellation without corrupting session mapping), EP-151 system design session mapping policy (`thread_ts -> session_name = slack-<thread_ts>`)
 func TestSessionNameTrimsAndPrefixesSlackThreadTimestamp(t *testing.T) {
@@ -235,5 +245,122 @@ func TestCLIAdapterRetriesPromptAfterQueueOwnerStartupFailure(t *testing.T) {
 	}
 	if fmt.Sprint(runner.calls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "new", "--name", "slack-1713686400.000100"}) {
 		t.Fatalf("recreate call args = %#v, want sessions new", runner.calls[1].args)
+	}
+}
+
+func TestCLIAdapterStreamEnsuresSessionBeforePrompt(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{
+		results: []runnerResult{
+			{output: "ensured"},
+			{output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}}}`},
+		},
+	}
+	adapter := NewCLIAdapter("acpx", runner)
+
+	var streamed []string
+	result, err := adapter.SendPromptStream(context.Background(), SessionRequest{
+		ProjectPath: "/workspace/alpha",
+		ThreadTS:    "1713686400.000100",
+		Prompt:      "stream prompt",
+	}, func(output string) error {
+		streamed = append(streamed, output)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("SendPromptStream() error = %v", err)
+	}
+	if result.SessionName != "slack-1713686400.000100" {
+		t.Fatalf("session name = %q, want slack session", result.SessionName)
+	}
+	if got, want := len(runner.calls), 2; got != want {
+		t.Fatalf("runner calls = %d, want %d", got, want)
+	}
+	if fmt.Sprint(runner.calls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "ensure", "--name", "slack-1713686400.000100"}) {
+		t.Fatalf("ensure call args = %#v", runner.calls[0].args)
+	}
+	if fmt.Sprint(runner.calls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", "slack-1713686400.000100", "stream prompt"}) {
+		t.Fatalf("prompt call args = %#v", runner.calls[1].args)
+	}
+	if got, want := len(streamed), 1; got != want {
+		t.Fatalf("stream callback calls = %d, want %d", got, want)
+	}
+}
+
+func TestCLIAdapterStreamSuppressesRecoverableNoSessionBeforeRetry(t *testing.T) {
+	t.Parallel()
+
+	noSessionOutput := `{"jsonrpc":"2.0","id":null,"error":{"code":-32002,"message":":warning: No acpx session found","data":{"acpxCode":"NO_SESSION"}}}`
+	runner := &fakeRunner{
+		results: []runnerResult{
+			{output: "ensured"},
+			{output: noSessionOutput, err: errors.New("exit status 4: " + noSessionOutput)},
+			{output: "created"},
+			{output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"recovered"}}}}`},
+		},
+	}
+	adapter := NewCLIAdapter("acpx", runner)
+
+	var streamed []string
+	result, err := adapter.SendPromptStream(context.Background(), SessionRequest{
+		ProjectPath: "/workspace/alpha",
+		ThreadTS:    "1713686400.000100",
+		Prompt:      "recover stream",
+	}, func(output string) error {
+		streamed = append(streamed, output)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("SendPromptStream() error = %v", err)
+	}
+	if result.Output == noSessionOutput {
+		t.Fatalf("SendPromptStream() returned unrecovered no-session output")
+	}
+	if got, want := len(streamed), 1; got != want {
+		t.Fatalf("stream callback calls = %d, want only recovered output", got)
+	}
+	if streamed[0] == noSessionOutput {
+		t.Fatalf("recoverable no-session output was streamed")
+	}
+	if got, want := len(runner.calls), 4; got != want {
+		t.Fatalf("runner calls = %d, want ensure, prompt, recreate, prompt", got)
+	}
+	if fmt.Sprint(runner.calls[2].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "new", "--name", "slack-1713686400.000100"}) {
+		t.Fatalf("recreate call args = %#v", runner.calls[2].args)
+	}
+}
+
+func TestCLIAdapterForceNewCreatesSessionBeforePrompt(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{
+		results: []runnerResult{
+			{output: "created"},
+			{output: "prompted"},
+		},
+	}
+	adapter := NewCLIAdapter("acpx", runner)
+
+	result, err := adapter.SendPrompt(context.Background(), SessionRequest{
+		ProjectPath: "/workspace/alpha",
+		ThreadTS:    "1713686400.000100",
+		Prompt:      "fresh ask",
+		ForceNew:    true,
+	})
+	if err != nil {
+		t.Fatalf("SendPrompt() error = %v", err)
+	}
+	if result.Output != "prompted" {
+		t.Fatalf("SendPrompt() output = %q, want prompted", result.Output)
+	}
+	if got, want := len(runner.calls), 2; got != want {
+		t.Fatalf("runner calls = %d, want %d", got, want)
+	}
+	if fmt.Sprint(runner.calls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "new", "--name", "slack-1713686400.000100"}) {
+		t.Fatalf("first call args = %#v, want sessions new", runner.calls[0].args)
+	}
+	if fmt.Sprint(runner.calls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", "slack-1713686400.000100", "fresh ask"}) {
+		t.Fatalf("second call args = %#v, want prompt", runner.calls[1].args)
 	}
 }

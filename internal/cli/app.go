@@ -311,8 +311,8 @@ func printRuntimeHelp(out io.Writer) {
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Commands:")
 	fmt.Fprintln(out, "  start [--debug]")
-	fmt.Fprintln(out, "  status")
+	fmt.Fprintln(out, "  status [execution-id]")
 	fmt.Fprintln(out, "  reload")
 	fmt.Fprintln(out, "  doctor")
-	fmt.Fprintln(out, "  cancel <thread-ts>")
+	fmt.Fprintln(out, "  cancel <execution-id|thread-ts>")
 }
