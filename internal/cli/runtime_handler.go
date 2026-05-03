@@ -221,78 +221,45 @@ func (h *runtimeCommandHandler) Cancel(ctx context.Context, args []string) error
 	}
 
 	threadTS := identifier
-	state, err := runtimeRepo.LoadThreadState(ctx, threadTS)
+	var (
+		state    runtime.ThreadState
+		statePtr *runtime.ThreadState
+	)
+	state, err = runtimeRepo.LoadThreadState(ctx, threadTS)
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return h.writeCancelNoOp(ctx, threadTS, "", "thread is inactive")
-		}
-		return err
-	}
-
-	lock, err := runtimeRepo.LoadThreadLock(ctx, threadTS)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return h.writeCancelNoOp(ctx, threadTS, state.SessionName, "thread is inactive")
-		}
-		return err
-	}
-
-	if strings.TrimSpace(state.LastStatus) != "processing" || lock.LockOwner == "" {
-		return h.writeCancelNoOp(ctx, threadTS, state.SessionName, "thread is inactive")
-	}
-
-	adapter := h.adapter
-	if adapter == nil {
-		return errors.New("acpx adapter is required")
-	}
-	if err := adapter.Cancel(ctx, threadTS); err != nil {
-		return err
-	}
-
-	cancelledAt := time.Now().UTC()
-	execution, err = findRunningExecutionForThread(ctx, runtimeRepo, threadTS)
-	if err != nil {
-		if !errors.Is(err, runtime.ErrNotFound) {
+		if !errors.Is(err, storage.ErrNotFound) {
 			return err
 		}
 	} else {
-		if err := runtimeRepo.UpdateExecutionState(ctx, runtime.ExecutionState{
-			ExecutionID:       execution.ExecutionID,
-			Status:            runtime.ExecutionStateCancelled,
-			DiagnosticContext: "cancelled by operator",
-			UpdatedAt:         cancelledAt,
-			CompletedAt:       &cancelledAt,
-		}); err != nil {
-			return fmt.Errorf("persist cancelled execution state for %q: %w", execution.ExecutionID, err)
-		}
+		statePtr = &state
 	}
 
-	state.LastStatus = "cancelled"
-	state.UpdatedAt = cancelledAt
-	if err := runtimeRepo.SaveThreadState(ctx, state); err != nil {
-		return fmt.Errorf("persist cancelled thread state for %q: %w", threadTS, err)
-	}
-	if err := runtimeRepo.DeleteThreadLock(ctx, threadTS); err != nil {
-		return fmt.Errorf("release thread lock for %q: %w", threadTS, err)
-	}
-
-	snapshot, err := h.reloadSnapshot(ctx)
+	var (
+		lock    runtime.ThreadLock
+		lockPtr *runtime.ThreadLock
+	)
+	lock, err = runtimeRepo.LoadThreadLock(ctx, threadTS)
 	if err != nil {
+		if !errors.Is(err, storage.ErrNotFound) {
+			return err
+		}
+	} else {
+		lockPtr = &lock
+	}
+
+	execution, err = findRunningExecutionForThread(ctx, runtimeRepo, threadTS)
+	if err != nil {
+		if errors.Is(err, runtime.ErrNotFound) {
+			sessionName := ""
+			if statePtr != nil {
+				sessionName = state.SessionName
+			}
+			return h.writeCancelNoOp(ctx, threadTS, sessionName, "thread is inactive")
+		}
 		return err
 	}
 
-	report := runtime.CancelReport{
-		RequestedAt: cancelledAt,
-		ThreadTS:    threadTS,
-		SessionName: state.SessionName,
-		Result:      "cancelled",
-		NoOp:        false,
-		Message:     "active ACPX execution cancelled",
-		Status:      snapshot.statusCopy(),
-	}
-	report.Status.Message = report.Message
-
-	return writeJSON(h.out, report)
+	return h.cancelExecution(ctx, runtimeRepo, execution, statePtr, lockPtr)
 }
 
 func (h *runtimeCommandHandler) cancelExecution(ctx context.Context, runtimeRepo runtime.Store, execution runtime.ExecutionRequest, state *runtime.ThreadState, lock *runtime.ThreadLock) error {
@@ -1342,9 +1309,83 @@ func slashStartText(command string) string {
 }
 
 func (h *runtimeCommandHandler) loadStartupSnapshot(ctx context.Context) (runtimeSnapshot, error) {
-	snapshot, err := h.loadSnapshot(ctx, false, "runtime start loaded")
+	cfg, configPath, err := h.loadValidatedConfig(ctx)
 	if err != nil {
 		return runtimeSnapshot{}, err
+	}
+
+	storagePath, err := storage.DefaultPath()
+	if err != nil {
+		return runtimeSnapshot{}, err
+	}
+
+	info, statErr := os.Stat(storagePath)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return runtimeSnapshot{}, fmt.Errorf("storage database %q is missing", storagePath)
+		}
+		return runtimeSnapshot{}, fmt.Errorf("stat storage database: %w", statErr)
+	}
+	if info.IsDir() {
+		return runtimeSnapshot{}, fmt.Errorf("storage database path %q is a directory", storagePath)
+	}
+
+	store, err := storage.Open(ctx, storagePath)
+	if err != nil {
+		return runtimeSnapshot{}, err
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+
+	runtimeRepo := store.Runtime()
+	if runtimeRepo == nil {
+		return runtimeSnapshot{}, errors.New("runtime repository unavailable")
+	}
+	if err := h.recoverStartupExecutions(ctx, runtimeRepo); err != nil {
+		return runtimeSnapshot{}, err
+	}
+
+	projectRepo := store.Projects()
+	if projectRepo == nil {
+		return runtimeSnapshot{}, errors.New("project repository unavailable")
+	}
+
+	projects, err := projectRepo.List(ctx)
+	if err != nil {
+		return runtimeSnapshot{}, err
+	}
+
+	activeThreads, err := runtimeRepo.CountThreads(ctx)
+	if err != nil {
+		return runtimeSnapshot{}, err
+	}
+
+	dedupeCount, err := runtimeRepo.CountEventDedupe(ctx)
+	if err != nil {
+		return runtimeSnapshot{}, err
+	}
+
+	snapshot := runtimeSnapshot{
+		status: runtime.Status{
+			Running:          true,
+			Healthy:          true,
+			Message:          "runtime start loaded",
+			ActiveThreads:    activeThreads,
+			ProjectCount:     len(projects),
+			EventDedupeCount: dedupeCount,
+			ConfigPath:       configPath,
+			StoragePath:      storagePath,
+			LoadedAt:         time.Now().UTC(),
+			Config:           cfg,
+			Projects:         projects,
+		},
+		projectByChannel: make(map[string]registry.Project, len(projects)),
+	}
+	for _, project := range projects {
+		if channelID := strings.TrimSpace(project.SlackChannelID); channelID != "" {
+			snapshot.projectByChannel[channelID] = project
+		}
 	}
 
 	if !snapshot.status.Config.Slack.Status().Configured {
@@ -1352,6 +1393,66 @@ func (h *runtimeCommandHandler) loadStartupSnapshot(ctx context.Context) (runtim
 	}
 
 	return snapshot, nil
+}
+
+func (h *runtimeCommandHandler) recoverStartupExecutions(ctx context.Context, runtimeRepo runtime.Store) error {
+	if runtimeRepo == nil {
+		return errors.New("runtime repository unavailable")
+	}
+
+	pending, err := runtimeRepo.ListExecutions(ctx, []runtime.ExecutionLifecycleState{
+		runtime.ExecutionStateQueued,
+		runtime.ExecutionStateRunning,
+	})
+	if err != nil {
+		return fmt.Errorf("list startup recovery executions: %w", err)
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	recoveredAt := time.Now().UTC()
+	seenThreads := make(map[string]bool, len(pending))
+	for _, execution := range pending {
+		diagnostic := "startup recovery: previous runtime stopped before execution reached a terminal state"
+		if execution.Status == runtime.ExecutionStateRunning {
+			diagnostic = "startup recovery: execution interrupted by runtime restart"
+		}
+
+		if err := runtimeRepo.UpdateExecutionState(ctx, runtime.ExecutionState{
+			ExecutionID:       execution.ExecutionID,
+			Status:            runtime.ExecutionStateFailed,
+			DiagnosticContext: diagnostic,
+			StartedAt:         execution.StartedAt,
+			UpdatedAt:         recoveredAt,
+			CompletedAt:       &recoveredAt,
+		}); err != nil {
+			return fmt.Errorf("recover startup execution %q: %w", execution.ExecutionID, err)
+		}
+
+		threadTS := strings.TrimSpace(execution.ThreadTS)
+		if threadTS == "" || seenThreads[threadTS] {
+			continue
+		}
+		seenThreads[threadTS] = true
+
+		state, err := runtimeRepo.LoadThreadState(ctx, threadTS)
+		if err == nil {
+			state.LastStatus = "failed"
+			state.UpdatedAt = recoveredAt
+			if err := runtimeRepo.SaveThreadState(ctx, state); err != nil {
+				return fmt.Errorf("recover startup thread state %q: %w", threadTS, err)
+			}
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("load startup thread state %q: %w", threadTS, err)
+		}
+
+		if err := runtimeRepo.DeleteThreadLock(ctx, threadTS); err != nil {
+			return fmt.Errorf("recover startup thread lock %q: %w", threadTS, err)
+		}
+	}
+
+	return nil
 }
 
 func (h *runtimeCommandHandler) currentStatus(ctx context.Context) (runtime.Status, error) {

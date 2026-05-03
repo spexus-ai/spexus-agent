@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -784,6 +785,167 @@ func TestRuntimeStartDebugWritesForegroundTrace(t *testing.T) {
 		if !strings.Contains(output, fragment) {
 			t.Fatalf("debug output missing %q: %s", fragment, output)
 		}
+	}
+}
+
+// Test: runtime startup recovers stale queued/running executions from a previous service instance before entering the foreground loop.
+// Validates: startup recovery clears impossible non-terminal executions and releases stale thread locks after a runtime restart
+func TestRuntimeStartRecoversStaleNonTerminalExecutions(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	workspacePath := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(workspacePath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	cfgStore := config.NewFileStore("")
+	if _, err := cfgStore.SetBaseWorkspacePath(ctx, workspacePath); err != nil {
+		t.Fatalf("SetBaseWorkspacePath() error = %v", err)
+	}
+	if _, err := cfgStore.SetSlackAuth(ctx, config.SlackAuth{
+		BotToken:    "xoxb-secret",
+		AppToken:    "xapp-secret",
+		WorkspaceID: "T123",
+	}); err != nil {
+		t.Fatalf("SetSlackAuth() error = %v", err)
+	}
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	project := registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(workspacePath, "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C12345678",
+	}
+	if err := os.MkdirAll(project.LocalPath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := store.Projects().Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	threadTS := "1713686400.000500"
+	if err := store.Runtime().SaveThreadState(ctx, runtimemodel.ThreadState{
+		ThreadTS:      threadTS,
+		ChannelID:     project.SlackChannelID,
+		ProjectName:   project.Name,
+		SessionName:   "slack-1713686400.000500",
+		LastStatus:    "queued",
+		LastRequestID: "Ev-stale-queued",
+		UpdatedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("SaveThreadState() error = %v", err)
+	}
+	lockTime := time.Now().UTC().Add(-10 * time.Minute)
+	lockExpires := lockTime.Add(5 * time.Minute)
+	if err := store.Runtime().SaveThreadLock(ctx, runtimemodel.ThreadLock{
+		ThreadTS:       threadTS,
+		LockOwner:      "runtime-start",
+		LockedAt:       lockTime,
+		LeaseExpiresAt: &lockExpires,
+		UpdatedAt:      lockTime,
+	}); err != nil {
+		t.Fatalf("SaveThreadLock() error = %v", err)
+	}
+
+	if err := store.Runtime().CreateExecution(ctx, runtimemodel.ExecutionRequest{
+		ExecutionID: "exec-stale-running",
+		SourceType:  "message",
+		DeliveryID:  "Ev-stale-running",
+		ChannelID:   project.SlackChannelID,
+		ProjectName: project.Name,
+		SessionKey:  "slack-1713686400.000500",
+		ThreadTS:    threadTS,
+		CommandText: "stale running execution",
+		CreatedAt:   lockTime.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("CreateExecution(running) error = %v", err)
+	}
+	startedAt := lockTime.Add(-30 * time.Second)
+	if err := store.Runtime().UpdateExecutionState(ctx, runtimemodel.ExecutionState{
+		ExecutionID: "exec-stale-running",
+		Status:      runtimemodel.ExecutionStateRunning,
+		StartedAt:   &startedAt,
+		UpdatedAt:   startedAt,
+	}); err != nil {
+		t.Fatalf("UpdateExecutionState(running) error = %v", err)
+	}
+
+	if err := store.Runtime().CreateExecution(ctx, runtimemodel.ExecutionRequest{
+		ExecutionID: "exec-stale-queued",
+		SourceType:  "message",
+		DeliveryID:  "Ev-stale-queued",
+		ChannelID:   project.SlackChannelID,
+		ProjectName: project.Name,
+		SessionKey:  "slack-1713686400.000500",
+		ThreadTS:    threadTS,
+		CommandText: "stale queued execution",
+		CreatedAt:   lockTime.Add(-45 * time.Second),
+	}); err != nil {
+		t.Fatalf("CreateExecution(queued) error = %v", err)
+	}
+
+	handler := &runtimeCommandHandler{
+		configStore: cfgStore,
+		out:         io.Discard,
+	}
+
+	snapshot, err := handler.loadStartupSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("loadStartupSnapshot() error = %v", err)
+	}
+	if !snapshot.status.Running || !snapshot.status.Healthy {
+		t.Fatalf("snapshot status = %#v, want running and healthy", snapshot.status)
+	}
+
+	runningExecution, err := store.Runtime().LoadExecution(ctx, "exec-stale-running")
+	if err != nil {
+		t.Fatalf("LoadExecution(exec-stale-running) error = %v", err)
+	}
+	if runningExecution.Status != runtimemodel.ExecutionStateFailed {
+		t.Fatalf("running execution status = %q, want failed", runningExecution.Status)
+	}
+	if runningExecution.CompletedAt == nil {
+		t.Fatalf("running execution completed_at = nil, want terminal timestamp")
+	}
+	if runningExecution.DiagnosticContext != "startup recovery: execution interrupted by runtime restart" {
+		t.Fatalf("running execution diagnostic context = %q, want startup recovery detail", runningExecution.DiagnosticContext)
+	}
+
+	queuedExecution, err := store.Runtime().LoadExecution(ctx, "exec-stale-queued")
+	if err != nil {
+		t.Fatalf("LoadExecution(exec-stale-queued) error = %v", err)
+	}
+	if queuedExecution.Status != runtimemodel.ExecutionStateFailed {
+		t.Fatalf("queued execution status = %q, want failed", queuedExecution.Status)
+	}
+	if queuedExecution.CompletedAt == nil {
+		t.Fatalf("queued execution completed_at = nil, want terminal timestamp")
+	}
+	if queuedExecution.DiagnosticContext != "startup recovery: previous runtime stopped before execution reached a terminal state" {
+		t.Fatalf("queued execution diagnostic context = %q, want startup recovery detail", queuedExecution.DiagnosticContext)
+	}
+
+	state, err := store.Runtime().LoadThreadState(ctx, threadTS)
+	if err != nil {
+		t.Fatalf("LoadThreadState() error = %v", err)
+	}
+	if state.LastStatus != "failed" {
+		t.Fatalf("LoadThreadState() last status = %q, want failed", state.LastStatus)
+	}
+	if _, err := store.Runtime().LoadThreadLock(ctx, threadTS); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("LoadThreadLock() error = %v, want not found", err)
 	}
 }
 
@@ -3533,6 +3695,130 @@ func TestRuntimeCancelCancelsActiveThreadWithoutCorruptingMapping(t *testing.T) 
 	}
 	if execution.DiagnosticContext != "cancelled by operator" {
 		t.Fatalf("execution diagnostic context = %q, want cancelled by operator", execution.DiagnosticContext)
+	}
+}
+
+// Test: thread-based cancel still cancels the live running execution even when the thread summary has already advanced to queued.
+// Validates: thread cancel resolves the active running execution from persisted executions rather than trusting the thread summary alone
+func TestRuntimeCancelCancelsRunningExecutionWhenThreadSummaryIsQueued(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	workspacePath := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(workspacePath, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	cfgStore := config.NewFileStore("")
+	if _, err := cfgStore.SetBaseWorkspacePath(ctx, workspacePath); err != nil {
+		t.Fatalf("SetBaseWorkspacePath() error = %v", err)
+	}
+
+	store, err := storage.OpenDefault(ctx)
+	if err != nil {
+		t.Fatalf("OpenDefault() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	if err := store.Projects().Upsert(ctx, registry.Project{
+		Name:             "alpha",
+		LocalPath:        filepath.Join(workspacePath, "alpha"),
+		SlackChannelName: "spexus-alpha",
+		SlackChannelID:   "C12345678",
+	}); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	threadTS := "1713686400.000101"
+	state := runtimemodel.ThreadState{
+		ThreadTS:      threadTS,
+		ChannelID:     "C12345678",
+		ProjectName:   "alpha",
+		SessionName:   "slack-1713686400.000101",
+		LastStatus:    "queued",
+		LastRequestID: "Ev-queued-after-running",
+	}
+	if err := store.Runtime().SaveThreadState(ctx, state); err != nil {
+		t.Fatalf("SaveThreadState() error = %v", err)
+	}
+	lockedAt := time.Now().UTC()
+	lockExpires := lockedAt.Add(5 * time.Minute)
+	if err := store.Runtime().SaveThreadLock(ctx, runtimemodel.ThreadLock{
+		ThreadTS:       threadTS,
+		LockOwner:      "runtime-1",
+		LockedAt:       lockedAt,
+		LeaseExpiresAt: &lockExpires,
+	}); err != nil {
+		t.Fatalf("SaveThreadLock() error = %v", err)
+	}
+	if err := store.Runtime().CreateExecution(ctx, runtimemodel.ExecutionRequest{
+		ExecutionID: "exec-cancel-queued-summary",
+		SourceType:  "message",
+		DeliveryID:  "Ev-running-before-queued",
+		ChannelID:   state.ChannelID,
+		ProjectName: state.ProjectName,
+		SessionKey:  state.SessionName,
+		ThreadTS:    threadTS,
+		CommandText: "long running prompt",
+		CreatedAt:   lockedAt.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("CreateExecution() error = %v", err)
+	}
+	startedAt := lockedAt.Add(-30 * time.Second)
+	if err := store.Runtime().UpdateExecutionState(ctx, runtimemodel.ExecutionState{
+		ExecutionID: "exec-cancel-queued-summary",
+		Status:      runtimemodel.ExecutionStateRunning,
+		StartedAt:   &startedAt,
+		UpdatedAt:   startedAt,
+	}); err != nil {
+		t.Fatalf("UpdateExecutionState(running) error = %v", err)
+	}
+
+	var out bytes.Buffer
+	cancelAdapter := &fakeRuntimeCancelAdapter{}
+	handler := &runtimeCommandHandler{
+		configStore: cfgStore,
+		adapter:     cancelAdapter,
+		out:         &out,
+	}
+
+	if err := handler.Cancel(ctx, []string{threadTS}); err != nil {
+		t.Fatalf("Cancel() error = %v", err)
+	}
+
+	var report runtimemodel.CancelReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v; output=%s", err, out.String())
+	}
+	if report.NoOp || report.Result != "cancelled" {
+		t.Fatalf("cancel report = %#v, want cancelled", report)
+	}
+	if len(cancelAdapter.cancelCalls) != 1 || cancelAdapter.cancelCalls[0] != threadTS {
+		t.Fatalf("Cancel() calls = %#v, want one call for %s", cancelAdapter.cancelCalls, threadTS)
+	}
+
+	execution, err := store.Runtime().LoadExecution(ctx, "exec-cancel-queued-summary")
+	if err != nil {
+		t.Fatalf("LoadExecution() error = %v", err)
+	}
+	if execution.Status != runtimemodel.ExecutionStateCancelled {
+		t.Fatalf("execution status = %q, want cancelled", execution.Status)
+	}
+
+	loadedState, err := store.Runtime().LoadThreadState(ctx, threadTS)
+	if err != nil {
+		t.Fatalf("LoadThreadState() error = %v", err)
+	}
+	if loadedState.LastStatus != "cancelled" {
+		t.Fatalf("LoadThreadState() last status = %q, want cancelled", loadedState.LastStatus)
+	}
+	if _, err := store.Runtime().LoadThreadLock(ctx, threadTS); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("LoadThreadLock() error = %v, want not found", err)
 	}
 }
 
