@@ -3,6 +3,8 @@ package acpxadapter
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,12 +13,16 @@ import (
 	"sync"
 )
 
-type commandRunner interface {
+type CommandRunner interface {
 	Run(context.Context, string, []string, string) (string, error)
+	Start(context.Context, string, []string, string) (RunningCommand, error)
 }
 
-type commandStreamRunner interface {
-	RunStream(context.Context, string, []string, string, PromptStreamFunc) (string, error)
+type RunningCommand interface {
+	Stdout() io.ReadCloser
+	Stderr() io.ReadCloser
+	Wait() error
+	Close() error
 }
 
 type execRunner struct{}
@@ -32,82 +38,66 @@ func (execRunner) Run(ctx context.Context, binary string, args []string, dir str
 	return string(output), nil
 }
 
-func (execRunner) RunStream(ctx context.Context, binary string, args []string, dir string, onOutput PromptStreamFunc) (string, error) {
+func (execRunner) Start(ctx context.Context, binary string, args []string, dir string) (RunningCommand, error) {
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = dir
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", fmt.Errorf("open stdout pipe: %w", err)
+		return nil, fmt.Errorf("stdout pipe for %s %s: %w", binary, strings.Join(args, " "), err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return "", fmt.Errorf("open stderr pipe: %w", err)
+		return nil, fmt.Errorf("stderr pipe for %s %s: %w", binary, strings.Join(args, " "), err)
 	}
-
 	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("start %s %s: %w", binary, strings.Join(args, " "), err)
+		return nil, fmt.Errorf("start %s %s: %w", binary, strings.Join(args, " "), err)
 	}
 
-	var mu sync.Mutex
-	var output strings.Builder
-	var callbackErr error
-	var wg sync.WaitGroup
+	return &execProcess{
+		cmd:    cmd,
+		stdout: stdout,
+		stderr: stderr,
+	}, nil
+}
 
-	appendOutput := func(text string, stream bool) {
-		mu.Lock()
-		defer mu.Unlock()
+type execProcess struct {
+	cmd    *exec.Cmd
+	stdout io.ReadCloser
+	stderr io.ReadCloser
+}
 
-		output.WriteString(text)
-		if stream && onOutput != nil && callbackErr == nil {
-			callbackErr = onOutput(output.String())
-		}
+func (p *execProcess) Stdout() io.ReadCloser {
+	return p.stdout
+}
+
+func (p *execProcess) Stderr() io.ReadCloser {
+	return p.stderr
+}
+
+func (p *execProcess) Wait() error {
+	return p.cmd.Wait()
+}
+
+func (p *execProcess) Close() error {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+		return nil
 	}
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			appendOutput(scanner.Text()+"\n", true)
-		}
-		if err := scanner.Err(); err != nil {
-			appendOutput(fmt.Sprintf("stdout scan error: %v\n", err), false)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		data, err := io.ReadAll(stderr)
-		if len(data) > 0 {
-			appendOutput(string(data), false)
-		}
-		if err != nil {
-			appendOutput(fmt.Sprintf("stderr read error: %v\n", err), false)
-		}
-	}()
-
-	wg.Wait()
-	waitErr := cmd.Wait()
-
-	result := output.String()
-	if callbackErr != nil {
-		return result, callbackErr
+	err := p.cmd.Process.Kill()
+	if err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
 	}
-	if waitErr != nil {
-		return result, fmt.Errorf("run %s %s: %w%s", binary, strings.Join(args, " "), waitErr, formatCommandOutput([]byte(result)))
-	}
-	return result, nil
+	return nil
 }
 
 type CLIAdapter struct {
 	binary string
-	runner commandRunner
+	runner CommandRunner
 }
 
 var _ Adapter = (*CLIAdapter)(nil)
 
-func NewCLIAdapter(binary string, runner commandRunner) *CLIAdapter {
+func NewCLIAdapter(binary string, runner CommandRunner) *CLIAdapter {
 	if strings.TrimSpace(binary) == "" {
 		if override := strings.TrimSpace(os.Getenv("SPEXUS_AGENT_ACPX_BIN")); override != "" {
 			binary = override
@@ -153,94 +143,75 @@ func (a *CLIAdapter) EnsureSession(ctx context.Context, req SessionRequest) (Ses
 }
 
 func (a *CLIAdapter) SendPrompt(ctx context.Context, req SessionRequest) (SessionResult, error) {
-	if err := ctx.Err(); err != nil {
+	stream, err := a.StartPrompt(ctx, req)
+	if err != nil {
 		return SessionResult{}, err
 	}
-	if strings.TrimSpace(req.ProjectPath) == "" {
-		return SessionResult{}, fmt.Errorf("project path is required")
-	}
-	if strings.TrimSpace(req.Prompt) == "" {
-		return SessionResult{}, fmt.Errorf("prompt is required")
-	}
+	defer func() {
+		_ = stream.Close()
+	}()
 
-	sessionName, err := validateThreadSession(req.ThreadTS)
+	events, err := CollectPromptStream(stream)
 	if err != nil {
 		return SessionResult{}, err
 	}
 
-	if req.ForceNew {
-		if err := a.createSession(ctx, req.ProjectPath, sessionName); err != nil {
-			return SessionResult{}, err
-		}
+	output := ""
+	if promptStream, ok := stream.(*cliPromptStream); ok {
+		output = promptStream.RawOutput()
 	}
-
-	output, err := a.run(ctx, req.ProjectPath, "codex", "prompt", "-s", sessionName, req.Prompt)
-	if err != nil {
-		if !isRecoverablePromptError(err) {
-			return SessionResult{}, fmt.Errorf("send prompt to session %q: %w", sessionName, err)
-		}
-		if recreateErr := a.createSession(ctx, req.ProjectPath, sessionName); recreateErr != nil {
-			return SessionResult{}, fmt.Errorf("send prompt to session %q: %w", sessionName, err)
-		}
-
-		output, err = a.run(ctx, req.ProjectPath, "codex", "prompt", "-s", sessionName, req.Prompt)
-		if err != nil {
-			return SessionResult{}, fmt.Errorf("send prompt to session %q: %w", sessionName, err)
-		}
+	if output == "" {
+		output = encodePromptEvents(events)
 	}
 
 	return SessionResult{
-		SessionName: sessionName,
+		SessionName: stream.SessionName(),
 		Output:      output,
 	}, nil
 }
 
-func (a *CLIAdapter) SendPromptStream(ctx context.Context, req SessionRequest, onOutput PromptStreamFunc) (SessionResult, error) {
+func (a *CLIAdapter) StartPrompt(ctx context.Context, req SessionRequest) (PromptStream, error) {
 	if err := ctx.Err(); err != nil {
-		return SessionResult{}, err
+		return nil, err
+	}
+	if a == nil {
+		return nil, fmt.Errorf("acpx adapter is required")
 	}
 	if strings.TrimSpace(req.ProjectPath) == "" {
-		return SessionResult{}, fmt.Errorf("project path is required")
+		return nil, fmt.Errorf("project path is required")
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
-		return SessionResult{}, fmt.Errorf("prompt is required")
+		return nil, fmt.Errorf("prompt is required")
 	}
 
 	sessionName, err := validateThreadSession(req.ThreadTS)
 	if err != nil {
-		return SessionResult{}, err
+		return nil, err
 	}
 
-	if req.ForceNew {
-		if err := a.createSession(ctx, req.ProjectPath, sessionName); err != nil {
-			return SessionResult{}, err
-		}
-	} else if _, err := a.run(ctx, req.ProjectPath, "codex", "sessions", "ensure", "--name", sessionName); err != nil {
-		if createErr := a.createSession(ctx, req.ProjectPath, sessionName); createErr != nil {
-			return SessionResult{}, fmt.Errorf("ensure session %q: %w", sessionName, err)
-		}
+	if _, err := a.EnsureSession(ctx, SessionRequest{
+		ProjectPath: req.ProjectPath,
+		ThreadTS:    req.ThreadTS,
+	}); err != nil {
+		return nil, err
 	}
 
-	streamOutput := recoverableAwareStreamFunc(onOutput)
-	output, err := a.runStream(ctx, req.ProjectPath, streamOutput, "codex", "prompt", "-s", sessionName, req.Prompt)
+	commandArgs, err := a.commandArgs("codex", "prompt", "-s", sessionName, req.Prompt)
 	if err != nil {
-		if !isRecoverablePromptError(err) {
-			return SessionResult{}, fmt.Errorf("send prompt to session %q: %w", sessionName, err)
-		}
-		if recreateErr := a.createSession(ctx, req.ProjectPath, sessionName); recreateErr != nil {
-			return SessionResult{}, fmt.Errorf("send prompt to session %q: %w", sessionName, err)
-		}
-
-		output, err = a.runStream(ctx, req.ProjectPath, streamOutput, "codex", "prompt", "-s", sessionName, req.Prompt)
-		if err != nil {
-			return SessionResult{}, fmt.Errorf("send prompt to session %q: %w", sessionName, err)
-		}
+		return nil, err
 	}
 
-	return SessionResult{
-		SessionName: sessionName,
-		Output:      output,
-	}, nil
+	runner := a.runner
+	if runner == nil {
+		runner = execRunner{}
+	}
+
+	command, err := runner.Start(ctx, a.binary, commandArgs, req.ProjectPath)
+	if err != nil {
+		return nil, fmt.Errorf("send prompt to session %q: %w", sessionName, err)
+	}
+
+	return newCLIPromptStream(sessionName, a.binary, commandArgs, command), nil
 }
 
 func (a *CLIAdapter) Status(ctx context.Context, threadTS string) (SessionResult, error) {
@@ -285,8 +256,10 @@ func (a *CLIAdapter) run(ctx context.Context, dir string, args ...string) (strin
 	if a == nil {
 		return "", fmt.Errorf("acpx adapter is required")
 	}
-	if strings.TrimSpace(a.binary) == "" {
-		return "", fmt.Errorf("acpx binary is required")
+
+	commandArgs, err := a.commandArgs(args...)
+	if err != nil {
+		return "", err
 	}
 
 	runner := a.runner
@@ -294,90 +267,7 @@ func (a *CLIAdapter) run(ctx context.Context, dir string, args ...string) (strin
 		runner = execRunner{}
 	}
 
-	// Slack runtime runs ACPX non-interactively, so command/tool permissions must
-	// be pre-approved or ACPX will fail the turn with PERMISSION_DENIED.
-	commandArgs := append([]string{"--format", "json", "--json-strict", "--approve-all"}, args...)
 	return runner.Run(ctx, a.binary, commandArgs, dir)
-}
-
-func (a *CLIAdapter) runStream(ctx context.Context, dir string, onOutput PromptStreamFunc, args ...string) (string, error) {
-	if a == nil {
-		return "", fmt.Errorf("acpx adapter is required")
-	}
-	if strings.TrimSpace(a.binary) == "" {
-		return "", fmt.Errorf("acpx binary is required")
-	}
-
-	runner := a.runner
-	if runner == nil {
-		runner = execRunner{}
-	}
-
-	commandArgs := append([]string{"--format", "json", "--json-strict", "--approve-all"}, args...)
-	if streamRunner, ok := runner.(commandStreamRunner); ok {
-		return streamRunner.RunStream(ctx, a.binary, commandArgs, dir, onOutput)
-	}
-
-	output, err := runner.Run(ctx, a.binary, commandArgs, dir)
-	if err == nil && onOutput != nil {
-		if callbackErr := onOutput(output); callbackErr != nil {
-			return output, callbackErr
-		}
-	}
-	return output, err
-}
-
-func (a *CLIAdapter) createSession(ctx context.Context, dir, sessionName string) error {
-	if _, err := a.run(ctx, dir, "codex", "sessions", "new", "--name", sessionName); err != nil {
-		return fmt.Errorf("create session %q: %w", sessionName, err)
-	}
-	return nil
-}
-
-func recoverableAwareStreamFunc(onOutput PromptStreamFunc) PromptStreamFunc {
-	if onOutput == nil {
-		return nil
-	}
-	return func(output string) error {
-		if isRecoverablePromptOutput(output) {
-			return nil
-		}
-		return onOutput(output)
-	}
-}
-
-func isRecoverablePromptError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	return containsRecoverablePromptMessage(err.Error())
-}
-
-func isRecoverablePromptOutput(output string) bool {
-	output = strings.TrimSpace(output)
-	if output == "" {
-		return false
-	}
-	return containsRecoverablePromptMessage(output) &&
-		(strings.Contains(output, `"error"`) || strings.Contains(output, "acpxCode"))
-}
-
-func containsRecoverablePromptMessage(message string) bool {
-	message = strings.ToLower(message)
-	recoverable := []string{
-		"no session",
-		"no acpx session",
-		"resource not found",
-		"session queue owner failed to start",
-		"queue owner unavailable",
-	}
-	for _, token := range recoverable {
-		if strings.Contains(message, token) {
-			return true
-		}
-	}
-	return false
 }
 
 func validateThreadSession(threadTS string) (string, error) {
@@ -395,4 +285,222 @@ func formatCommandOutput(output []byte) string {
 		return ""
 	}
 	return ": " + trimmed
+}
+
+func (a *CLIAdapter) commandArgs(args ...string) ([]string, error) {
+	if a == nil {
+		return nil, fmt.Errorf("acpx adapter is required")
+	}
+	if strings.TrimSpace(a.binary) == "" {
+		return nil, fmt.Errorf("acpx binary is required")
+	}
+
+	// Slack runtime runs ACPX non-interactively, so command/tool permissions must
+	// be pre-approved or ACPX will fail the turn with PERMISSION_DENIED.
+	return append([]string{"--format", "json", "--json-strict", "--approve-all"}, args...), nil
+}
+
+type cliPromptStream struct {
+	sessionName string
+	binary      string
+	args        []string
+	command     RunningCommand
+	events      chan Event
+	done        chan struct{}
+
+	mu        sync.Mutex
+	rawOutput strings.Builder
+	stderr    strings.Builder
+	waitErr   error
+	closeErr  error
+	closeOnce sync.Once
+}
+
+func newCLIPromptStream(sessionName, binary string, args []string, command RunningCommand) *cliPromptStream {
+	stream := &cliPromptStream{
+		sessionName: sessionName,
+		binary:      binary,
+		args:        append([]string(nil), args...),
+		command:     command,
+		events:      make(chan Event, 32),
+		done:        make(chan struct{}),
+	}
+	go stream.run()
+	return stream
+}
+
+func (s *cliPromptStream) SessionName() string {
+	return s.sessionName
+}
+
+func (s *cliPromptStream) Events() <-chan Event {
+	return s.events
+}
+
+func (s *cliPromptStream) Wait() error {
+	<-s.done
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.waitErr
+}
+
+func (s *cliPromptStream) Close() error {
+	s.closeOnce.Do(func() {
+		if s.command != nil {
+			s.closeErr = s.command.Close()
+		}
+	})
+	return s.closeErr
+}
+
+func (s *cliPromptStream) RawOutput() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.TrimSuffix(s.rawOutput.String(), "\n")
+}
+
+func (s *cliPromptStream) run() {
+	defer close(s.done)
+	defer close(s.events)
+
+	parser := newEventLineParser()
+	var stdoutErr error
+	var stderrErr error
+	var errMu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		scanner := newLineScanner(s.command.Stdout())
+		for scanner.Scan() {
+			line := scanner.Text()
+			s.appendRawLine(line)
+
+			lineEvents, err := parser.Parse(line)
+			if err != nil {
+				errMu.Lock()
+				if stdoutErr == nil {
+					stdoutErr = err
+				}
+				errMu.Unlock()
+				continue
+			}
+			for _, event := range lineEvents {
+				s.events <- event
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			errMu.Lock()
+			if stdoutErr == nil {
+				stdoutErr = err
+			}
+			errMu.Unlock()
+		}
+		errMu.Lock()
+		currentErr := stdoutErr
+		errMu.Unlock()
+		if currentErr == nil {
+			for _, event := range parser.Finish() {
+				s.events <- event
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		scanner := newLineScanner(s.command.Stderr())
+		for scanner.Scan() {
+			s.appendStderrLine(scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			errMu.Lock()
+			stderrErr = err
+			errMu.Unlock()
+		}
+	}()
+
+	wg.Wait()
+	waitErr := s.command.Wait()
+	errMu.Lock()
+	currentStdoutErr := stdoutErr
+	currentStderrErr := stderrErr
+	errMu.Unlock()
+
+	s.mu.Lock()
+	s.waitErr = s.buildWaitError(waitErr, currentStdoutErr, currentStderrErr)
+	s.mu.Unlock()
+}
+
+func (s *cliPromptStream) appendRawLine(line string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rawOutput.WriteString(line)
+	s.rawOutput.WriteByte('\n')
+}
+
+func (s *cliPromptStream) appendStderrLine(line string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stderr.WriteString(line)
+	s.stderr.WriteByte('\n')
+}
+
+func (s *cliPromptStream) buildWaitError(waitErr, stdoutErr, stderrErr error) error {
+	if stdoutErr != nil {
+		return stdoutErr
+	}
+	if stderrErr != nil {
+		return stderrErr
+	}
+	if waitErr == nil {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"run %s %s: %w%s",
+		s.binary,
+		strings.Join(s.args, " "),
+		waitErr,
+		formatCommandOutput([]byte(s.errorOutput())),
+	)
+}
+
+func (s *cliPromptStream) errorOutput() string {
+	stdout := strings.TrimSpace(s.rawOutput.String())
+	stderr := strings.TrimSpace(s.stderr.String())
+	switch {
+	case stdout != "" && stderr != "":
+		return stdout + "\n" + stderr
+	case stdout != "":
+		return stdout
+	default:
+		return stderr
+	}
+}
+
+func newLineScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	return scanner
+}
+
+func encodePromptEvents(events []Event) string {
+	lines := make([]string, 0, len(events))
+	for _, event := range events {
+		payload, err := jsonMarshal(event)
+		if err != nil {
+			continue
+		}
+		lines = append(lines, payload)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func jsonMarshal(event Event) (string, error) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }

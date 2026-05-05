@@ -138,7 +138,7 @@ func (s *Store) bootstrap(ctx context.Context) error {
 		return fmt.Errorf("set busy timeout: %w", err)
 	}
 
-	stmts := []string{
+	tableStmts := []string{
 		`CREATE TABLE IF NOT EXISTS projects (
 			name TEXT PRIMARY KEY,
 			git_remote TEXT NOT NULL DEFAULT '',
@@ -148,19 +148,14 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_local_path ON projects(local_path)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slack_channel_id ON projects(slack_channel_id) WHERE slack_channel_id <> ''`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slack_channel_name ON projects(slack_channel_name) WHERE slack_channel_name <> ''`,
 		`CREATE TABLE IF NOT EXISTS events_dedupe (
 			source_type TEXT NOT NULL,
 			delivery_id TEXT NOT NULL,
 			received_at TEXT NOT NULL,
 			processed_at TEXT,
 			status TEXT NOT NULL DEFAULT '',
-			diagnostic_context TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY(source_type, delivery_id)
 		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_source_delivery ON events_dedupe(source_type, delivery_id)`,
 		`CREATE TABLE IF NOT EXISTS threads (
 			thread_ts TEXT PRIMARY KEY,
 			channel_id TEXT NOT NULL,
@@ -172,8 +167,6 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			updated_at TEXT NOT NULL,
 			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_threads_channel_id ON threads(channel_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_threads_project_name ON threads(project_name)`,
 		`CREATE TABLE IF NOT EXISTS thread_locks (
 			thread_ts TEXT PRIMARY KEY,
 			lock_owner TEXT NOT NULL,
@@ -186,19 +179,35 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			execution_id TEXT PRIMARY KEY,
 			source_type TEXT NOT NULL,
 			delivery_id TEXT NOT NULL,
-			channel_id TEXT NOT NULL,
 			project_name TEXT NOT NULL,
-			session_key TEXT NOT NULL,
+			channel_id TEXT NOT NULL,
 			thread_ts TEXT NOT NULL DEFAULT '',
-			command_text TEXT NOT NULL DEFAULT '',
+			session_name TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL,
-			diagnostic_context TEXT NOT NULL DEFAULT '',
-			created_at TEXT NOT NULL,
+			queued_at TEXT NOT NULL,
 			started_at TEXT,
-			updated_at TEXT NOT NULL,
+			rendering_started_at TEXT,
 			completed_at TEXT,
+			cancelled_at TEXT,
+			updated_at TEXT NOT NULL,
+			last_error TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_kind TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_summary TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_at TEXT,
 			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
 		)`,
+	}
+
+	indexStmts := []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_local_path ON projects(local_path)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slack_channel_id ON projects(slack_channel_id) WHERE slack_channel_id <> ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slack_channel_name ON projects(slack_channel_name) WHERE slack_channel_name <> ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_source_delivery ON events_dedupe(source_type, delivery_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_threads_channel_id ON threads(channel_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_threads_project_name ON threads(project_name)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_source_delivery ON executions(source_type, delivery_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_thread_ts ON executions(thread_ts) WHERE thread_ts <> ''`,
+		`CREATE INDEX IF NOT EXISTS idx_executions_session_name ON executions(session_name) WHERE session_name <> ''`,
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -209,7 +218,7 @@ func (s *Store) bootstrap(ctx context.Context) error {
 		_ = tx.Rollback()
 	}()
 
-	for _, stmt := range stmts {
+	for _, stmt := range tableStmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("bootstrap schema: %w", err)
 		}
@@ -218,204 +227,21 @@ func (s *Store) bootstrap(ctx context.Context) error {
 	if err := migrateEventDedupeTable(ctx, tx); err != nil {
 		return err
 	}
-	if err := migrateExecutionsTable(ctx, tx); err != nil {
+	if err := migrateAdditiveColumns(ctx, tx); err != nil {
 		return err
 	}
-	if err := ensureExecutionIndexes(ctx, tx); err != nil {
+	if err := migrateExecutionStateTable(ctx, tx); err != nil {
 		return err
+	}
+
+	for _, stmt := range indexStmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("bootstrap indexes: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema bootstrap: %w", err)
-	}
-
-	return nil
-}
-
-func (r *RuntimeRepository) CreateExecution(ctx context.Context, request runtimemodel.ExecutionRequest) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if request.ExecutionID == "" {
-		return fmt.Errorf("execution id is required")
-	}
-	if request.SourceType == "" {
-		return fmt.Errorf("source type is required")
-	}
-	if request.DeliveryID == "" {
-		return fmt.Errorf("delivery id is required")
-	}
-	if request.ChannelID == "" {
-		return fmt.Errorf("channel id is required")
-	}
-	if request.ProjectName == "" {
-		return fmt.Errorf("project name is required")
-	}
-	if request.SessionKey == "" {
-		return fmt.Errorf("session key is required")
-	}
-
-	if request.Status == "" {
-		request.Status = runtimemodel.ExecutionStateQueued
-	}
-	if request.Status != runtimemodel.ExecutionStateQueued {
-		return fmt.Errorf("execution status must start as %q", runtimemodel.ExecutionStateQueued)
-	}
-	if err := validateExecutionStatus(request.Status); err != nil {
-		return err
-	}
-
-	now := time.Now().UTC()
-	if request.CreatedAt.IsZero() {
-		request.CreatedAt = now
-	}
-	if request.UpdatedAt.IsZero() {
-		request.UpdatedAt = request.CreatedAt
-	}
-
-	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO executions (
-			execution_id, source_type, delivery_id, channel_id, project_name, session_key,
-			thread_ts, command_text, status, diagnostic_context, created_at, started_at, updated_at, completed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		request.ExecutionID,
-		request.SourceType,
-		request.DeliveryID,
-		request.ChannelID,
-		request.ProjectName,
-		request.SessionKey,
-		request.ThreadTS,
-		request.CommandText,
-		request.Status,
-		request.DiagnosticContext,
-		request.CreatedAt.UTC().Format(time.RFC3339Nano),
-		formatNullableTime(request.StartedAt),
-		request.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		formatNullableTime(request.CompletedAt),
-	)
-	if err != nil {
-		return fmt.Errorf("create execution %q: %w", request.ExecutionID, err)
-	}
-
-	return nil
-}
-
-func (r *RuntimeRepository) LoadExecution(ctx context.Context, executionID string) (runtimemodel.ExecutionRequest, error) {
-	if err := ctx.Err(); err != nil {
-		return runtimemodel.ExecutionRequest{}, err
-	}
-	if executionID == "" {
-		return runtimemodel.ExecutionRequest{}, fmt.Errorf("execution id is required")
-	}
-
-	row := r.db.QueryRowContext(ctx, `
-		SELECT execution_id, source_type, delivery_id, channel_id, project_name, session_key,
-			thread_ts, command_text, status, diagnostic_context, created_at, started_at, updated_at, completed_at
-		FROM executions
-		WHERE execution_id = ?
-	`, executionID)
-
-	execution, err := scanExecution(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return runtimemodel.ExecutionRequest{}, ErrNotFound
-		}
-		return runtimemodel.ExecutionRequest{}, fmt.Errorf("load execution %q: %w", executionID, err)
-	}
-
-	return execution, nil
-}
-
-func (r *RuntimeRepository) ListExecutions(ctx context.Context, statuses []runtimemodel.ExecutionLifecycleState) ([]runtimemodel.ExecutionRequest, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	query := `
-		SELECT execution_id, source_type, delivery_id, channel_id, project_name, session_key,
-			thread_ts, command_text, status, diagnostic_context, created_at, started_at, updated_at, completed_at
-		FROM executions
-	`
-	args := make([]any, 0, len(statuses))
-	if len(statuses) > 0 {
-		placeholders := make([]string, 0, len(statuses))
-		for _, status := range statuses {
-			if err := validateExecutionStatus(status); err != nil {
-				return nil, err
-			}
-			placeholders = append(placeholders, "?")
-			args = append(args, status)
-		}
-		query += " WHERE status IN (" + strings.Join(placeholders, ", ") + ")"
-	}
-	query += " ORDER BY created_at ASC, execution_id ASC"
-
-	rows, err := r.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list executions: %w", err)
-	}
-	defer rows.Close()
-
-	executions := make([]runtimemodel.ExecutionRequest, 0)
-	for rows.Next() {
-		execution, err := scanExecution(rows)
-		if err != nil {
-			return nil, fmt.Errorf("list executions: %w", err)
-		}
-		executions = append(executions, execution)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list executions: %w", err)
-	}
-
-	return executions, nil
-}
-
-func (r *RuntimeRepository) UpdateExecutionState(ctx context.Context, state runtimemodel.ExecutionState) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if state.ExecutionID == "" {
-		return fmt.Errorf("execution id is required")
-	}
-	if err := validateExecutionStatus(state.Status); err != nil {
-		return err
-	}
-
-	now := time.Now().UTC()
-	if state.UpdatedAt.IsZero() {
-		state.UpdatedAt = now
-	}
-	if state.Status == runtimemodel.ExecutionStateRunning && state.StartedAt == nil {
-		state.StartedAt = timePtr(state.UpdatedAt)
-	}
-	if isTerminalExecutionState(state.Status) && state.CompletedAt == nil {
-		state.CompletedAt = timePtr(state.UpdatedAt)
-	}
-
-	result, err := r.db.ExecContext(ctx, `
-		UPDATE executions
-		SET status = ?, diagnostic_context = ?, started_at = COALESCE(?, started_at), updated_at = ?, completed_at = COALESCE(?, completed_at)
-		WHERE execution_id = ?
-	`,
-		state.Status,
-		state.DiagnosticContext,
-		formatNullableTime(state.StartedAt),
-		state.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		formatNullableTime(state.CompletedAt),
-		state.ExecutionID,
-	)
-	if err != nil {
-		return fmt.Errorf("update execution state %q: %w", state.ExecutionID, err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("update execution state %q rows affected: %w", state.ExecutionID, err)
-	}
-	if rowsAffected == 0 {
-		return ErrNotFound
 	}
 
 	return nil
@@ -718,25 +544,73 @@ func (r *RuntimeRepository) SaveEventDedupe(ctx context.Context, dedupe runtimem
 
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO events_dedupe (
-			source_type, delivery_id, received_at, processed_at, status, diagnostic_context
-		) VALUES (?, ?, ?, ?, ?, ?)
+			source_type, delivery_id, received_at, processed_at, status
+		) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(source_type, delivery_id) DO UPDATE SET
 			received_at = excluded.received_at,
 			processed_at = excluded.processed_at,
-			status = excluded.status,
-			diagnostic_context = excluded.diagnostic_context
+			status = excluded.status
 	`,
 		dedupe.SourceType,
 		dedupe.DeliveryID,
 		dedupe.ReceivedAt.UTC().Format(time.RFC3339Nano),
 		formatNullableTime(dedupe.ProcessedAt),
 		dedupe.Status,
-		dedupe.DiagnosticContext,
 	)
 	if err != nil {
 		return fmt.Errorf("save event dedupe %s/%q: %w", dedupe.SourceType, dedupe.DeliveryID, err)
 	}
 
+	return nil
+}
+
+func (r *RuntimeRepository) SaveClaimedExecution(ctx context.Context, dedupe runtimemodel.EventDedupe, state runtimemodel.ExecutionState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dedupe.SourceType == "" {
+		return fmt.Errorf("slack source type is required")
+	}
+	if dedupe.DeliveryID == "" {
+		return fmt.Errorf("slack delivery id is required")
+	}
+	if state.ExecutionID == "" {
+		return fmt.Errorf("execution id is required")
+	}
+	if state.SourceType == "" {
+		return fmt.Errorf("execution source type is required")
+	}
+	if state.DeliveryID == "" {
+		return fmt.Errorf("execution delivery id is required")
+	}
+	if state.ProjectName == "" {
+		return fmt.Errorf("execution project name is required")
+	}
+	if state.ChannelID == "" {
+		return fmt.Errorf("execution channel id is required")
+	}
+	if state.Status == "" {
+		return fmt.Errorf("execution status is required")
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin claimed execution transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if err := saveEventDedupeTx(ctx, tx, dedupe); err != nil {
+		return err
+	}
+	if err := saveExecutionStateTx(ctx, tx, state); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit claimed execution transaction: %w", err)
+	}
 	return nil
 }
 
@@ -752,7 +626,7 @@ func (r *RuntimeRepository) LoadEventDedupe(ctx context.Context, sourceType, del
 	}
 
 	row := r.db.QueryRowContext(ctx, `
-		SELECT source_type, delivery_id, received_at, processed_at, status, diagnostic_context
+		SELECT source_type, delivery_id, received_at, processed_at, status
 		FROM events_dedupe
 		WHERE source_type = ? AND delivery_id = ?
 	`, sourceType, deliveryID)
@@ -760,7 +634,7 @@ func (r *RuntimeRepository) LoadEventDedupe(ctx context.Context, sourceType, del
 	var dedupe runtimemodel.EventDedupe
 	var receivedAtText string
 	var processedAtText sql.NullString
-	if err := row.Scan(&dedupe.SourceType, &dedupe.DeliveryID, &receivedAtText, &processedAtText, &dedupe.Status, &dedupe.DiagnosticContext); err != nil {
+	if err := row.Scan(&dedupe.SourceType, &dedupe.DeliveryID, &receivedAtText, &processedAtText, &dedupe.Status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return runtimemodel.EventDedupe{}, ErrNotFound
 		}
@@ -798,6 +672,234 @@ func (r *RuntimeRepository) CountEventDedupe(ctx context.Context) (int, error) {
 	return count, nil
 }
 
+func (r *RuntimeRepository) SaveExecutionState(ctx context.Context, state runtimemodel.ExecutionState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if state.ExecutionID == "" {
+		return fmt.Errorf("execution id is required")
+	}
+	if state.SourceType == "" {
+		return fmt.Errorf("execution source type is required")
+	}
+	if state.DeliveryID == "" {
+		return fmt.Errorf("execution delivery id is required")
+	}
+	if state.ProjectName == "" {
+		return fmt.Errorf("execution project name is required")
+	}
+	if state.ChannelID == "" {
+		return fmt.Errorf("execution channel id is required")
+	}
+	if state.Status == "" {
+		return fmt.Errorf("execution status is required")
+	}
+	if state.QueuedAt.IsZero() {
+		state.QueuedAt = time.Now().UTC()
+	}
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = state.QueuedAt
+	}
+
+	if err := saveExecutionStateTx(ctx, r.db, state); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func saveExecutionStateTx(ctx context.Context, execer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, state runtimemodel.ExecutionState) error {
+	_, err := execer.ExecContext(ctx, `
+		INSERT INTO executions (
+			execution_id, source_type, delivery_id, project_name, channel_id, thread_ts, session_name,
+			status, queued_at, started_at, rendering_started_at, completed_at, cancelled_at, updated_at,
+			last_error, publisher_checkpoint_kind, publisher_checkpoint_summary, publisher_checkpoint_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(execution_id) DO UPDATE SET
+			source_type = excluded.source_type,
+			delivery_id = excluded.delivery_id,
+			project_name = excluded.project_name,
+			channel_id = excluded.channel_id,
+			thread_ts = excluded.thread_ts,
+			session_name = excluded.session_name,
+			status = excluded.status,
+			queued_at = excluded.queued_at,
+			started_at = excluded.started_at,
+			rendering_started_at = excluded.rendering_started_at,
+			completed_at = excluded.completed_at,
+			cancelled_at = excluded.cancelled_at,
+			updated_at = excluded.updated_at,
+			last_error = excluded.last_error,
+			publisher_checkpoint_kind = excluded.publisher_checkpoint_kind,
+			publisher_checkpoint_summary = excluded.publisher_checkpoint_summary,
+			publisher_checkpoint_at = excluded.publisher_checkpoint_at
+	`,
+		state.ExecutionID,
+		state.SourceType,
+		state.DeliveryID,
+		state.ProjectName,
+		state.ChannelID,
+		state.ThreadTS,
+		state.SessionName,
+		state.Status,
+		state.QueuedAt.UTC().Format(time.RFC3339Nano),
+		formatNullableTime(state.StartedAt),
+		formatNullableTime(state.RenderingStartedAt),
+		formatNullableTime(state.CompletedAt),
+		formatNullableTime(state.CancelledAt),
+		state.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		state.LastError,
+		state.PublisherCheckpointKind,
+		state.PublisherCheckpointSummary,
+		formatNullableTime(state.PublisherCheckpointAt),
+	)
+	if err != nil {
+		return fmt.Errorf("save execution state %q: %w", state.ExecutionID, err)
+	}
+
+	return nil
+}
+
+func saveEventDedupeTx(ctx context.Context, execer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, dedupe runtimemodel.EventDedupe) error {
+	if dedupe.ReceivedAt.IsZero() {
+		dedupe.ReceivedAt = time.Now().UTC()
+	}
+
+	_, err := execer.ExecContext(ctx, `
+		INSERT INTO events_dedupe (
+			source_type, delivery_id, received_at, processed_at, status
+		) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(source_type, delivery_id) DO UPDATE SET
+			received_at = excluded.received_at,
+			processed_at = excluded.processed_at,
+			status = excluded.status
+	`,
+		dedupe.SourceType,
+		dedupe.DeliveryID,
+		dedupe.ReceivedAt.UTC().Format(time.RFC3339Nano),
+		formatNullableTime(dedupe.ProcessedAt),
+		dedupe.Status,
+	)
+	if err != nil {
+		return fmt.Errorf("save event dedupe %s/%q: %w", dedupe.SourceType, dedupe.DeliveryID, err)
+	}
+
+	return nil
+}
+
+func (r *RuntimeRepository) LoadExecutionState(ctx context.Context, executionID string) (runtimemodel.ExecutionState, error) {
+	if err := ctx.Err(); err != nil {
+		return runtimemodel.ExecutionState{}, err
+	}
+	if executionID == "" {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("execution id is required")
+	}
+
+	row := r.db.QueryRowContext(ctx, executionSelectSQL(`WHERE execution_id = ?`), executionID)
+	state, err := scanExecutionState(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return runtimemodel.ExecutionState{}, ErrNotFound
+		}
+		return runtimemodel.ExecutionState{}, fmt.Errorf("load execution state %q: %w", executionID, err)
+	}
+	return state, nil
+}
+
+func (r *RuntimeRepository) LoadExecutionStateByDelivery(ctx context.Context, sourceType, deliveryID string) (runtimemodel.ExecutionState, error) {
+	if err := ctx.Err(); err != nil {
+		return runtimemodel.ExecutionState{}, err
+	}
+	if sourceType == "" {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("execution source type is required")
+	}
+	if deliveryID == "" {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("execution delivery id is required")
+	}
+
+	row := r.db.QueryRowContext(ctx, executionSelectSQL(`WHERE source_type = ? AND delivery_id = ?`), sourceType, deliveryID)
+	state, err := scanExecutionState(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return runtimemodel.ExecutionState{}, ErrNotFound
+		}
+		return runtimemodel.ExecutionState{}, fmt.Errorf("load execution state for %s/%q: %w", sourceType, deliveryID, err)
+	}
+	return state, nil
+}
+
+func (r *RuntimeRepository) LoadLatestExecutionByThread(ctx context.Context, threadTS string) (runtimemodel.ExecutionState, error) {
+	if err := ctx.Err(); err != nil {
+		return runtimemodel.ExecutionState{}, err
+	}
+	if threadTS == "" {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("thread timestamp is required")
+	}
+
+	row := r.db.QueryRowContext(ctx, executionSelectSQL(`WHERE thread_ts = ? ORDER BY queued_at DESC, updated_at DESC LIMIT 1`), threadTS)
+	state, err := scanExecutionState(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return runtimemodel.ExecutionState{}, ErrNotFound
+		}
+		return runtimemodel.ExecutionState{}, fmt.Errorf("load latest execution state for thread %q: %w", threadTS, err)
+	}
+	return state, nil
+}
+
+func (r *RuntimeRepository) ListExecutionStatesByStatus(ctx context.Context, statuses ...string) ([]runtimemodel.ExecutionState, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(statuses) == 0 {
+		return nil, fmt.Errorf("at least one execution status is required")
+	}
+
+	args := make([]any, 0, len(statuses))
+	placeholders := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		status = strings.TrimSpace(status)
+		if status == "" {
+			return nil, fmt.Errorf("execution status is required")
+		}
+		args = append(args, status)
+		placeholders = append(placeholders, "?")
+	}
+
+	rows, err := r.db.QueryContext(
+		ctx,
+		executionSelectSQL(
+			fmt.Sprintf(
+				"WHERE status IN (%s) ORDER BY queued_at ASC, updated_at ASC",
+				strings.Join(placeholders, ", "),
+			),
+		),
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list execution states by status: %w", err)
+	}
+	defer rows.Close()
+
+	states := make([]runtimemodel.ExecutionState, 0)
+	for rows.Next() {
+		state, err := scanExecutionState(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan execution state row: %w", err)
+		}
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate execution states by status: %w", err)
+	}
+
+	return states, nil
+}
+
 func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
 	hasSourceType, err := tableColumnExists(ctx, tx, "events_dedupe", "source_type")
 	if err != nil {
@@ -807,17 +909,7 @@ func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
 	if err != nil {
 		return fmt.Errorf("inspect events_dedupe delivery_id column: %w", err)
 	}
-	hasDiagnosticContext, err := tableColumnExists(ctx, tx, "events_dedupe", "diagnostic_context")
-	if err != nil {
-		return fmt.Errorf("inspect events_dedupe diagnostic_context column: %w", err)
-	}
 	if hasSourceType && hasDeliveryID {
-		if hasDiagnosticContext {
-			return nil
-		}
-		if _, err := tx.ExecContext(ctx, `ALTER TABLE events_dedupe ADD COLUMN diagnostic_context TEXT NOT NULL DEFAULT ''`); err != nil {
-			return fmt.Errorf("add events_dedupe diagnostic_context column: %w", err)
-		}
 		return nil
 	}
 
@@ -828,7 +920,6 @@ func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
 			received_at TEXT NOT NULL,
 			processed_at TEXT,
 			status TEXT NOT NULL DEFAULT '',
-			diagnostic_context TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY(source_type, delivery_id)
 		)
 	`); err != nil {
@@ -836,8 +927,8 @@ func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT OR REPLACE INTO events_dedupe_v2 (source_type, delivery_id, received_at, processed_at, status, diagnostic_context)
-		SELECT 'mention', slack_event_id, received_at, processed_at, status, ''
+		INSERT OR REPLACE INTO events_dedupe_v2 (source_type, delivery_id, received_at, processed_at, status)
+		SELECT 'mention', slack_event_id, received_at, processed_at, status
 		FROM events_dedupe
 	`); err != nil {
 		return fmt.Errorf("copy events_dedupe rows into v2: %w", err)
@@ -856,7 +947,39 @@ func migrateEventDedupeTable(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
+func migrateAdditiveColumns(ctx context.Context, tx *sql.Tx) error {
+	migrations := []struct {
+		table  string
+		column string
+		sql    string
+	}{
+		{table: "projects", column: "git_remote", sql: `ALTER TABLE projects ADD COLUMN git_remote TEXT NOT NULL DEFAULT ''`},
+		{table: "projects", column: "slack_channel_name", sql: `ALTER TABLE projects ADD COLUMN slack_channel_name TEXT NOT NULL DEFAULT ''`},
+		{table: "projects", column: "slack_channel_id", sql: `ALTER TABLE projects ADD COLUMN slack_channel_id TEXT NOT NULL DEFAULT ''`},
+		{table: "events_dedupe", column: "processed_at", sql: `ALTER TABLE events_dedupe ADD COLUMN processed_at TEXT`},
+		{table: "events_dedupe", column: "status", sql: `ALTER TABLE events_dedupe ADD COLUMN status TEXT NOT NULL DEFAULT ''`},
+		{table: "threads", column: "last_status", sql: `ALTER TABLE threads ADD COLUMN last_status TEXT NOT NULL DEFAULT ''`},
+		{table: "threads", column: "last_request_id", sql: `ALTER TABLE threads ADD COLUMN last_request_id TEXT NOT NULL DEFAULT ''`},
+		{table: "thread_locks", column: "lease_expires_at", sql: `ALTER TABLE thread_locks ADD COLUMN lease_expires_at TEXT`},
+	}
+
+	for _, migration := range migrations {
+		exists, err := tableColumnExists(ctx, tx, migration.table, migration.column)
+		if err != nil {
+			return fmt.Errorf("inspect %s.%s column: %w", migration.table, migration.column, err)
+		}
+		if exists {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, migration.sql); err != nil {
+			return fmt.Errorf("add %s.%s column: %w", migration.table, migration.column, err)
+		}
+	}
+
+	return nil
+}
+
+func migrateExecutionStateTable(ctx context.Context, tx *sql.Tx) error {
 	columns, err := tableColumns(ctx, tx, "executions")
 	if err != nil {
 		return fmt.Errorf("inspect executions schema: %w", err)
@@ -864,7 +987,7 @@ func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
 	if len(columns) == 0 {
 		return nil
 	}
-	if columns["session_key"] && columns["diagnostic_context"] {
+	if columns["session_name"] && columns["queued_at"] {
 		return nil
 	}
 
@@ -873,39 +996,36 @@ func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
 			execution_id TEXT PRIMARY KEY,
 			source_type TEXT NOT NULL,
 			delivery_id TEXT NOT NULL,
-			channel_id TEXT NOT NULL,
 			project_name TEXT NOT NULL,
-			session_key TEXT NOT NULL,
+			channel_id TEXT NOT NULL,
 			thread_ts TEXT NOT NULL DEFAULT '',
-			command_text TEXT NOT NULL DEFAULT '',
+			session_name TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL,
-			diagnostic_context TEXT NOT NULL DEFAULT '',
-			created_at TEXT NOT NULL,
+			queued_at TEXT NOT NULL,
 			started_at TEXT,
-			updated_at TEXT NOT NULL,
+			rendering_started_at TEXT,
 			completed_at TEXT,
+			cancelled_at TEXT,
+			updated_at TEXT NOT NULL,
+			last_error TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_kind TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_summary TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_at TEXT,
 			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
 		)
 	`); err != nil {
 		return fmt.Errorf("create executions_v2 table: %w", err)
 	}
 
-	sessionKeyExpr := `CASE
+	sessionNameExpr := `CASE
 		WHEN TRIM(COALESCE(thread_ts, '')) <> '' THEN 'slack-' || TRIM(thread_ts)
 		WHEN TRIM(COALESCE(channel_id, '')) <> '' THEN 'legacy-channel-' || TRIM(channel_id)
 		ELSE 'legacy-execution-' || execution_id
 	END`
-	if columns["session_key"] {
-		sessionKeyExpr = `COALESCE(NULLIF(TRIM(session_key), ''), ` + sessionKeyExpr + `)`
-	} else if columns["session_name"] {
-		sessionKeyExpr = `COALESCE(NULLIF(TRIM(session_name), ''), ` + sessionKeyExpr + `)`
-	}
-
-	diagnosticContextExpr := `''`
-	if columns["diagnostic_context"] {
-		diagnosticContextExpr = `COALESCE(diagnostic_context, '')`
-	} else if columns["last_error"] {
-		diagnosticContextExpr = `COALESCE(last_error, '')`
+	if columns["session_name"] {
+		sessionNameExpr = `COALESCE(NULLIF(TRIM(session_name), ''), ` + sessionNameExpr + `)`
+	} else if columns["session_key"] {
+		sessionNameExpr = `COALESCE(NULLIF(TRIM(session_key), ''), ` + sessionNameExpr + `)`
 	}
 
 	threadTSExpr := `''`
@@ -913,14 +1033,18 @@ func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
 		threadTSExpr = `COALESCE(thread_ts, '')`
 	}
 
-	commandTextExpr := `''`
-	if columns["command_text"] {
-		commandTextExpr = `COALESCE(command_text, '')`
-	}
-
 	statusExpr := `'queued'`
 	if columns["status"] {
 		statusExpr = `status`
+	}
+
+	queuedAtExpr := `CURRENT_TIMESTAMP`
+	if columns["queued_at"] {
+		queuedAtExpr = `queued_at`
+	} else if columns["created_at"] {
+		queuedAtExpr = `created_at`
+	} else if columns["updated_at"] {
+		queuedAtExpr = `updated_at`
 	}
 
 	startedAtExpr := `NULL`
@@ -928,16 +1052,9 @@ func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
 		startedAtExpr = `started_at`
 	}
 
-	createdAtExpr := `CURRENT_TIMESTAMP`
-	if columns["created_at"] {
-		createdAtExpr = `created_at`
-	} else if columns["queued_at"] {
-		createdAtExpr = `queued_at`
-	}
-
-	updatedAtExpr := createdAtExpr
-	if columns["updated_at"] {
-		updatedAtExpr = `updated_at`
+	renderingStartedAtExpr := `NULL`
+	if columns["rendering_started_at"] {
+		renderingStartedAtExpr = `rendering_started_at`
 	}
 
 	completedAtExpr := `NULL`
@@ -945,17 +1062,54 @@ func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
 		completedAtExpr = `completed_at`
 	}
 
+	cancelledAtExpr := `NULL`
+	if columns["cancelled_at"] {
+		cancelledAtExpr = `cancelled_at`
+	}
+
+	updatedAtExpr := queuedAtExpr
+	if columns["updated_at"] {
+		updatedAtExpr = `updated_at`
+	}
+
+	lastErrorExpr := `''`
+	if columns["last_error"] {
+		lastErrorExpr = `COALESCE(last_error, '')`
+	} else if columns["diagnostic_context"] {
+		lastErrorExpr = `COALESCE(diagnostic_context, '')`
+	}
+
+	publisherCheckpointKindExpr := `''`
+	if columns["publisher_checkpoint_kind"] {
+		publisherCheckpointKindExpr = `COALESCE(publisher_checkpoint_kind, '')`
+	}
+
+	publisherCheckpointSummaryExpr := `''`
+	if columns["publisher_checkpoint_summary"] {
+		publisherCheckpointSummaryExpr = `COALESCE(publisher_checkpoint_summary, '')`
+	}
+
+	publisherCheckpointAtExpr := `NULL`
+	if columns["publisher_checkpoint_at"] {
+		publisherCheckpointAtExpr = `publisher_checkpoint_at`
+	}
+
 	insertStmt := fmt.Sprintf(`
 		INSERT INTO executions_v2 (
-			execution_id, source_type, delivery_id, channel_id, project_name, session_key,
-			thread_ts, command_text, status, diagnostic_context, created_at, started_at, updated_at, completed_at
+			execution_id, source_type, delivery_id, project_name, channel_id, thread_ts, session_name,
+			status, queued_at, started_at, rendering_started_at, completed_at, cancelled_at, updated_at,
+			last_error, publisher_checkpoint_kind, publisher_checkpoint_summary, publisher_checkpoint_at
 		)
 		SELECT
 			execution_id,
 			source_type,
 			delivery_id,
-			channel_id,
 			project_name,
+			channel_id,
+			%s,
+			%s,
+			%s,
+			%s,
 			%s,
 			%s,
 			%s,
@@ -966,7 +1120,7 @@ func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
 			%s,
 			%s
 		FROM executions
-	`, sessionKeyExpr, threadTSExpr, commandTextExpr, statusExpr, diagnosticContextExpr, createdAtExpr, startedAtExpr, updatedAtExpr, completedAtExpr)
+	`, threadTSExpr, sessionNameExpr, statusExpr, queuedAtExpr, startedAtExpr, renderingStartedAtExpr, completedAtExpr, cancelledAtExpr, updatedAtExpr, lastErrorExpr, publisherCheckpointKindExpr, publisherCheckpointSummaryExpr, publisherCheckpointAtExpr)
 	if _, err := tx.ExecContext(ctx, insertStmt); err != nil {
 		return fmt.Errorf("copy legacy executions into executions_v2: %w", err)
 	}
@@ -981,23 +1135,8 @@ func migrateExecutionsTable(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-func ensureExecutionIndexes(ctx context.Context, tx *sql.Tx) error {
-	stmts := []string{
-		`CREATE INDEX IF NOT EXISTS idx_executions_project_name ON executions(project_name)`,
-		`CREATE INDEX IF NOT EXISTS idx_executions_session_key ON executions(session_key)`,
-		`CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status)`,
-		`CREATE INDEX IF NOT EXISTS idx_executions_source_delivery ON executions(source_type, delivery_id)`,
-	}
-	for _, stmt := range stmts {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("ensure execution index: %w", err)
-		}
-	}
-	return nil
-}
-
-func tableColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]bool, error) {
-	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+func tableColumns(ctx context.Context, tx *sql.Tx, tableName string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
 		return nil, err
 	}
@@ -1006,14 +1145,14 @@ func tableColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]boo
 	columns := make(map[string]bool)
 	for rows.Next() {
 		var (
-			cid        int
-			name       string
-			columnType string
-			notNull    int
-			defaultVal sql.NullString
-			primaryKey int
+			cid       int
+			name      string
+			valueType string
+			notNull   int
+			defaults  sql.NullString
+			pk        int
 		)
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey); err != nil {
+		if err := rows.Scan(&cid, &name, &valueType, &notNull, &defaults, &pk); err != nil {
 			return nil, err
 		}
 		columns[name] = true
@@ -1158,6 +1297,92 @@ func (r *RuntimeRepository) DeleteThreadLock(ctx context.Context, threadTS strin
 	return nil
 }
 
+func executionSelectSQL(suffix string) string {
+	return `
+		SELECT execution_id, source_type, delivery_id, project_name, channel_id, thread_ts, session_name,
+			status, queued_at, started_at, rendering_started_at, completed_at, cancelled_at, updated_at,
+			last_error, publisher_checkpoint_kind, publisher_checkpoint_summary, publisher_checkpoint_at
+		FROM executions
+	` + suffix
+}
+
+func scanExecutionState(scanner interface {
+	Scan(dest ...any) error
+}) (runtimemodel.ExecutionState, error) {
+	var state runtimemodel.ExecutionState
+	var (
+		queuedAtText              string
+		startedAtText             sql.NullString
+		renderingStartedAtText    sql.NullString
+		completedAtText           sql.NullString
+		cancelledAtText           sql.NullString
+		updatedAtText             string
+		publisherCheckpointAtText sql.NullString
+	)
+
+	if err := scanner.Scan(
+		&state.ExecutionID,
+		&state.SourceType,
+		&state.DeliveryID,
+		&state.ProjectName,
+		&state.ChannelID,
+		&state.ThreadTS,
+		&state.SessionName,
+		&state.Status,
+		&queuedAtText,
+		&startedAtText,
+		&renderingStartedAtText,
+		&completedAtText,
+		&cancelledAtText,
+		&updatedAtText,
+		&state.LastError,
+		&state.PublisherCheckpointKind,
+		&state.PublisherCheckpointSummary,
+		&publisherCheckpointAtText,
+	); err != nil {
+		return runtimemodel.ExecutionState{}, err
+	}
+
+	var err error
+	state.QueuedAt, err = parseTime(queuedAtText)
+	if err != nil {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("parse queued_at for execution %q: %w", state.ExecutionID, err)
+	}
+	if state.StartedAt, err = parseNullableTime(startedAtText); err != nil {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("parse started_at for execution %q: %w", state.ExecutionID, err)
+	}
+	if state.RenderingStartedAt, err = parseNullableTime(renderingStartedAtText); err != nil {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("parse rendering_started_at for execution %q: %w", state.ExecutionID, err)
+	}
+	if state.CompletedAt, err = parseNullableTime(completedAtText); err != nil {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("parse completed_at for execution %q: %w", state.ExecutionID, err)
+	}
+	if state.CancelledAt, err = parseNullableTime(cancelledAtText); err != nil {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("parse cancelled_at for execution %q: %w", state.ExecutionID, err)
+	}
+	state.UpdatedAt, err = parseTime(updatedAtText)
+	if err != nil {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("parse updated_at for execution %q: %w", state.ExecutionID, err)
+	}
+	if state.PublisherCheckpointAt, err = parseNullableTime(publisherCheckpointAtText); err != nil {
+		return runtimemodel.ExecutionState{}, fmt.Errorf("parse publisher_checkpoint_at for execution %q: %w", state.ExecutionID, err)
+	}
+
+	return state, nil
+}
+
+func parseNullableTime(value sql.NullString) (*time.Time, error) {
+	if !value.Valid {
+		return nil, nil
+	}
+
+	parsed, err := parseTime(value.String)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
 func scanProject(scanner interface {
 	Scan(dest ...any) error
 }) (registry.Project, error) {
@@ -1191,64 +1416,6 @@ func scanProject(scanner interface {
 	return project, nil
 }
 
-func scanExecution(scanner interface {
-	Scan(dest ...any) error
-}) (runtimemodel.ExecutionRequest, error) {
-	var execution runtimemodel.ExecutionRequest
-	var createdAtText string
-	var updatedAtText string
-	var startedAtText sql.NullString
-	var completedAtText sql.NullString
-
-	if err := scanner.Scan(
-		&execution.ExecutionID,
-		&execution.SourceType,
-		&execution.DeliveryID,
-		&execution.ChannelID,
-		&execution.ProjectName,
-		&execution.SessionKey,
-		&execution.ThreadTS,
-		&execution.CommandText,
-		&execution.Status,
-		&execution.DiagnosticContext,
-		&createdAtText,
-		&startedAtText,
-		&updatedAtText,
-		&completedAtText,
-	); err != nil {
-		return runtimemodel.ExecutionRequest{}, err
-	}
-
-	createdAt, err := parseTime(createdAtText)
-	if err != nil {
-		return runtimemodel.ExecutionRequest{}, fmt.Errorf("parse created_at for execution %q: %w", execution.ExecutionID, err)
-	}
-	updatedAt, err := parseTime(updatedAtText)
-	if err != nil {
-		return runtimemodel.ExecutionRequest{}, fmt.Errorf("parse updated_at for execution %q: %w", execution.ExecutionID, err)
-	}
-
-	execution.CreatedAt = createdAt
-	execution.UpdatedAt = updatedAt
-
-	if startedAtText.Valid {
-		startedAt, err := parseTime(startedAtText.String)
-		if err != nil {
-			return runtimemodel.ExecutionRequest{}, fmt.Errorf("parse started_at for execution %q: %w", execution.ExecutionID, err)
-		}
-		execution.StartedAt = &startedAt
-	}
-	if completedAtText.Valid {
-		completedAt, err := parseTime(completedAtText.String)
-		if err != nil {
-			return runtimemodel.ExecutionRequest{}, fmt.Errorf("parse completed_at for execution %q: %w", execution.ExecutionID, err)
-		}
-		execution.CompletedAt = &completedAt
-	}
-
-	return execution, nil
-}
-
 func parseTime(value string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, value)
 }
@@ -1262,37 +1429,6 @@ func formatNullableTime(value *time.Time) any {
 
 func storageDSN(path string) string {
 	return path + "?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL"
-}
-
-func validateExecutionStatus(status runtimemodel.ExecutionLifecycleState) error {
-	switch status {
-	case runtimemodel.ExecutionStateQueued,
-		runtimemodel.ExecutionStateRunning,
-		runtimemodel.ExecutionStateSucceeded,
-		runtimemodel.ExecutionStateFailed,
-		runtimemodel.ExecutionStateCancelled:
-		return nil
-	case "":
-		return fmt.Errorf("execution status is required")
-	default:
-		return fmt.Errorf("unsupported execution status %q", status)
-	}
-}
-
-func isTerminalExecutionState(status runtimemodel.ExecutionLifecycleState) bool {
-	switch status {
-	case runtimemodel.ExecutionStateSucceeded,
-		runtimemodel.ExecutionStateFailed,
-		runtimemodel.ExecutionStateCancelled:
-		return true
-	default:
-		return false
-	}
-}
-
-func timePtr(value time.Time) *time.Time {
-	value = value.UTC()
-	return &value
 }
 
 func ensureFilePermissions(path string) error {

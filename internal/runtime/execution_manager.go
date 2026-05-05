@@ -3,310 +3,202 @@ package runtime
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 )
 
-var liveExecutionAdmission sync.Map
+const DefaultExecutionConcurrency = 4
 
-type ExecutionManager interface {
-	ScheduleAccepted(context.Context, ManagedExecution) (ExecutionScheduleResult, error)
+type ExecutionManagerConfig struct {
+	GlobalConcurrency int
+	LifecycleRecorder ExecutionLifecycleRecorder
 }
 
-type ManagedExecution struct {
-	Accepted  AcceptedSlackExecution
-	Execute   func(context.Context, PreparedSlackEvent) error
-	Callbacks ExecutionCallbacks
+type ExecutionManager struct {
+	ctx           context.Context
+	handler       func(context.Context, ExecutionRequest)
+	maxConcurrent int
+	lifecycle     ExecutionLifecycleRecorder
+
+	mu       sync.Mutex
+	active   int
+	ready    []string
+	sessions map[string]*executionSessionQueue
+	wg       sync.WaitGroup
 }
 
-type ExecutionCallbacks struct {
-	OnCompleted func(SlackTurnExecutionResult)
-	OnFailed    func(error)
+type executionSessionQueue struct {
+	running bool
+	pending []queuedExecution
 }
 
-type ExecutionScheduleResult struct {
-	ExecutionID string
-	Started     bool
-	Decision    ExecutionStartDecision
+type queuedExecution struct {
+	ctx     context.Context
+	request ExecutionRequest
 }
 
-type ExecutionStartDecision struct {
-	Start  bool
-	Reason string
-}
-
-type ExecutionAdmissionSnapshot struct {
-	RunningExecutions int
-	RunningSessions   map[string]int
-}
-
-type ExecutionAdmissionPolicy interface {
-	DecideStart(context.Context, ExecutionAdmissionSnapshot, ExecutionRequest) (ExecutionStartDecision, error)
-}
-
-type queuedExecutionManager struct {
-	coordinator *SlackTurnCoordinator
-	policy      ExecutionAdmissionPolicy
-	mu          sync.Mutex
-	queue       []scheduledExecution
-	running     map[string]ExecutionRequest
-}
-
-type scheduledExecution struct {
-	ctx       context.Context
-	managed   ManagedExecution
-	request   ExecutionRequest
-	accepted  AcceptedSlackExecution
-	callbacks ExecutionCallbacks
-}
-
-func NewExecutionManager(coordinator *SlackTurnCoordinator, policy ExecutionAdmissionPolicy) ExecutionManager {
-	if policy == nil {
-		policy = boundedExecutionAdmissionPolicy{globalLimit: defaultExecutionConcurrencyLimit}
+func NewExecutionManager(ctx context.Context, cfg ExecutionManagerConfig, handler func(context.Context, ExecutionRequest)) *ExecutionManager {
+	maxConcurrent := cfg.GlobalConcurrency
+	if maxConcurrent <= 0 {
+		maxConcurrent = DefaultExecutionConcurrency
 	}
-	return &queuedExecutionManager{
-		coordinator: coordinator,
-		policy:      policy,
-		running:     make(map[string]ExecutionRequest),
-	}
-}
-
-func (m *queuedExecutionManager) ScheduleAccepted(ctx context.Context, execution ManagedExecution) (ExecutionScheduleResult, error) {
-	if err := ctx.Err(); err != nil {
-		return ExecutionScheduleResult{}, err
-	}
-	if m == nil {
-		return ExecutionScheduleResult{}, errors.New("execution manager is required")
-	}
-	if m.coordinator == nil {
-		return ExecutionScheduleResult{}, errors.New("slack turn coordinator is required")
-	}
-	if m.coordinator.store == nil {
-		return ExecutionScheduleResult{}, errors.New("runtime store is required")
-	}
-	if execution.Execute == nil {
-		return ExecutionScheduleResult{}, errors.New("execution callback is required")
-	}
-	if execution.Accepted.Execution.ExecutionID == "" {
-		return ExecutionScheduleResult{}, errors.New("execution id is required")
-	}
-
-	request, err := m.coordinator.store.LoadExecution(ctx, execution.Accepted.Execution.ExecutionID)
-	if err != nil {
-		return ExecutionScheduleResult{}, fmt.Errorf("load execution request %q: %w", execution.Accepted.Execution.ExecutionID, err)
-	}
-	if request.Status != ExecutionStateQueued {
-		return ExecutionScheduleResult{}, fmt.Errorf("execution %q is not queued", request.ExecutionID)
-	}
-
-	scheduled := scheduledExecution{
-		ctx:       ctx,
-		managed:   execution,
-		request:   request,
-		accepted:  execution.Accepted,
-		callbacks: execution.Callbacks,
-	}
-
-	toStart, decisions, err := m.enqueueAndCollectStarts(ctx, scheduled)
-	if err != nil {
-		return ExecutionScheduleResult{}, fmt.Errorf("decide execution startup for %q: %w", request.ExecutionID, err)
-	}
-
-	decision := decisions[request.ExecutionID]
-	result := ExecutionScheduleResult{
-		ExecutionID: request.ExecutionID,
-		Started:     decision.Start,
-		Decision:    decision,
-	}
-
-	for _, candidate := range toStart {
-		go m.runAccepted(candidate)
-	}
-
-	return result, nil
-}
-
-func (m *queuedExecutionManager) enqueueAndCollectStarts(ctx context.Context, execution scheduledExecution) ([]scheduledExecution, map[string]ExecutionStartDecision, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.queue = append(m.queue, execution)
-	toStart, decisions, err := m.collectStartableLocked(ctx)
-	if err != nil {
-		m.removeQueuedExecutionLocked(execution.request.ExecutionID)
-		return nil, nil, err
-	}
-	return toStart, decisions, nil
-}
-
-func (m *queuedExecutionManager) collectStartsAfterCompletion(ctx context.Context, executionID string) ([]scheduledExecution, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	delete(m.running, executionID)
-	liveExecutionAdmission.Delete(executionID)
-	toStart, _, err := m.collectStartableLocked(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return toStart, nil
-}
-
-func (m *queuedExecutionManager) collectStartableLocked(ctx context.Context) ([]scheduledExecution, map[string]ExecutionStartDecision, error) {
-	snapshot, err := m.admissionSnapshotLocked(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	ready := make([]scheduledExecution, 0, len(m.queue))
-	decisions := make(map[string]ExecutionStartDecision, len(m.queue))
-	remaining := make([]scheduledExecution, 0, len(m.queue))
-	for _, candidate := range m.queue {
-		decision, err := m.policy.DecideStart(ctx, snapshot, candidate.request)
-		if err != nil {
-			return nil, nil, err
-		}
-		decisions[candidate.request.ExecutionID] = decision
-		if !decision.Start {
-			remaining = append(remaining, candidate)
-			continue
-		}
-
-		m.running[candidate.request.ExecutionID] = candidate.request
-		liveExecutionAdmission.Store(candidate.request.ExecutionID, m)
-		ready = append(ready, candidate)
-		snapshot.RunningExecutions++
-		snapshot.RunningSessions[candidate.request.SessionKey]++
-	}
-	m.queue = remaining
-
-	return ready, decisions, nil
-}
-
-func (m *queuedExecutionManager) admissionSnapshotLocked(ctx context.Context) (ExecutionAdmissionSnapshot, error) {
-	running := make(map[string]ExecutionRequest, len(m.running))
-	for executionID, request := range m.running {
-		running[executionID] = request
-	}
-
-	persisted, err := m.coordinator.store.ListExecutions(ctx, []ExecutionLifecycleState{ExecutionStateRunning})
-	if err != nil {
-		return ExecutionAdmissionSnapshot{}, err
-	}
-	for _, request := range persisted {
-		running[request.ExecutionID] = request
-	}
-
-	snapshot := ExecutionAdmissionSnapshot{
-		RunningExecutions: len(running),
-		RunningSessions:   make(map[string]int, len(running)),
-	}
-	for _, request := range running {
-		snapshot.RunningSessions[request.SessionKey]++
-	}
-
-	return snapshot, nil
-}
-
-func (m *queuedExecutionManager) removeQueuedExecutionLocked(executionID string) {
-	filtered := m.queue[:0]
-	for _, candidate := range m.queue {
-		if candidate.request.ExecutionID == executionID {
-			continue
-		}
-		filtered = append(filtered, candidate)
-	}
-	m.queue = filtered
-}
-
-func (m *queuedExecutionManager) releaseExecutionAdmission(ctx context.Context, executionID string) ([]scheduledExecution, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, ok := m.running[executionID]; !ok {
-		liveExecutionAdmission.Delete(executionID)
-		return nil, nil
-	}
-
-	delete(m.running, executionID)
-	liveExecutionAdmission.Delete(executionID)
-	toStart, _, err := m.collectStartableLocked(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return toStart, nil
-}
-
-func (m *queuedExecutionManager) runAccepted(execution scheduledExecution) {
-	result, err := m.coordinator.ExecuteAccepted(execution.ctx, execution.accepted, execution.managed.Execute)
-	next, _ := m.collectStartsAfterCompletion(execution.ctx, execution.request.ExecutionID)
-	for _, candidate := range next {
-		go m.runAccepted(candidate)
-	}
-	if err != nil {
-		if execution.callbacks.OnFailed != nil {
-			execution.callbacks.OnFailed(err)
-		}
-		return
-	}
-	if execution.callbacks.OnCompleted != nil {
-		execution.callbacks.OnCompleted(result)
-	}
-}
-
-func ReleaseExecutionAdmission(ctx context.Context, executionID string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if executionID == "" {
-		return nil
-	}
 
-	managerAny, ok := liveExecutionAdmission.Load(executionID)
-	if !ok {
-		return nil
+	return &ExecutionManager{
+		ctx:           ctx,
+		handler:       handler,
+		maxConcurrent: maxConcurrent,
+		lifecycle:     cfg.LifecycleRecorder,
+		sessions:      make(map[string]*executionSessionQueue),
 	}
+}
 
-	manager, ok := managerAny.(*queuedExecutionManager)
-	if !ok || manager == nil {
-		liveExecutionAdmission.Delete(executionID)
-		return nil
+func NewAsyncExecutionQueue(handler func(context.Context, ExecutionRequest)) *ExecutionManager {
+	return NewExecutionManager(context.Background(), ExecutionManagerConfig{}, handler)
+}
+
+func (m *ExecutionManager) Wait() {
+	if m == nil {
+		return
 	}
+	m.wg.Wait()
+}
 
-	next, err := manager.releaseExecutionAdmission(ctx, executionID)
-	if err != nil {
+func (m *ExecutionManager) Enqueue(ctx context.Context, request ExecutionRequest) error {
+	if m != nil && m.ctx != nil {
+		if err := m.ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if ctx == nil {
+		if m != nil && m.ctx != nil {
+			ctx = m.ctx
+		} else {
+			ctx = context.Background()
+		}
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	for _, candidate := range next {
-		go manager.runAccepted(candidate)
+	if m == nil {
+		return errors.New("execution manager is required")
 	}
+	if m.handler == nil {
+		return errors.New("execution manager handler is required")
+	}
+	if err := request.validateForEnqueue(); err != nil {
+		return err
+	}
+	if m.lifecycle != nil {
+		if err := m.lifecycle.RecordQueued(ctx, request); err != nil {
+			return err
+		}
+	}
+
+	m.mu.Lock()
+	sessionKey := request.SessionKey()
+	sessionQueue := m.sessions[sessionKey]
+	if sessionQueue == nil {
+		sessionQueue = &executionSessionQueue{}
+		m.sessions[sessionKey] = sessionQueue
+	}
+
+	sessionQueue.pending = append(sessionQueue.pending, queuedExecution{
+		ctx:     ctx,
+		request: request,
+	})
+	if !sessionQueue.running && len(sessionQueue.pending) == 1 {
+		m.ready = append(m.ready, sessionKey)
+	}
+	m.mu.Unlock()
+
+	m.scheduleReady()
 	return nil
 }
 
-const defaultExecutionConcurrencyLimit = 2
+func (m *ExecutionManager) scheduleReady() {
+	for {
+		sessionKey, execution, ok := m.dequeueReady()
+		if !ok {
+			return
+		}
 
-type boundedExecutionAdmissionPolicy struct {
-	globalLimit int
+		m.wg.Add(1)
+		go m.run(sessionKey, execution)
+	}
 }
 
-func (p boundedExecutionAdmissionPolicy) DecideStart(_ context.Context, snapshot ExecutionAdmissionSnapshot, request ExecutionRequest) (ExecutionStartDecision, error) {
-	limit := p.globalLimit
-	if limit < 1 {
-		limit = 1
+func (m *ExecutionManager) dequeueReady() (string, queuedExecution, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for m.active < m.maxConcurrent && len(m.ready) > 0 {
+		sessionKey := m.ready[0]
+		m.ready = m.ready[1:]
+
+		sessionQueue := m.sessions[sessionKey]
+		if sessionQueue == nil {
+			continue
+		}
+		if sessionQueue.running {
+			continue
+		}
+		if len(sessionQueue.pending) == 0 {
+			delete(m.sessions, sessionKey)
+			continue
+		}
+
+		execution := sessionQueue.pending[0]
+		sessionQueue.pending = sessionQueue.pending[1:]
+		sessionQueue.running = true
+		m.active++
+		return sessionKey, execution, true
 	}
 
-	if snapshot.RunningSessions[request.SessionKey] > 0 {
-		return ExecutionStartDecision{
-			Start:  false,
-			Reason: fmt.Sprintf("session key %q already running", request.SessionKey),
-		}, nil
+	return "", queuedExecution{}, false
+}
+
+func (m *ExecutionManager) run(sessionKey string, execution queuedExecution) {
+	defer m.wg.Done()
+	defer m.complete(sessionKey)
+
+	if execution.ctx == nil {
+		if m.ctx != nil {
+			execution.ctx = m.ctx
+		} else {
+			execution.ctx = context.Background()
+		}
 	}
-	if snapshot.RunningExecutions >= limit {
-		return ExecutionStartDecision{
-			Start:  false,
-			Reason: fmt.Sprintf("global concurrency limit reached (%d/%d running)", snapshot.RunningExecutions, limit),
-		}, nil
+	if execution.ctx.Err() != nil {
+		return
+	}
+	if m.lifecycle != nil {
+		if err := m.lifecycle.RecordRunning(execution.ctx, execution.request); err != nil {
+			_ = m.lifecycle.RecordFailed(execution.ctx, execution.request, err)
+			return
+		}
 	}
 
-	return ExecutionStartDecision{Start: true}, nil
+	m.handler(execution.ctx, execution.request)
+}
+
+func (m *ExecutionManager) complete(sessionKey string) {
+	m.mu.Lock()
+	if m.active > 0 {
+		m.active--
+	}
+
+	sessionQueue := m.sessions[sessionKey]
+	if sessionQueue != nil {
+		sessionQueue.running = false
+		if len(sessionQueue.pending) > 0 {
+			m.ready = append(m.ready, sessionKey)
+		} else {
+			delete(m.sessions, sessionKey)
+		}
+	}
+	m.mu.Unlock()
+
+	m.scheduleReady()
 }

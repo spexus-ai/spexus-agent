@@ -16,7 +16,7 @@ The project provides three main command groups:
 
 - `config`: initialize and validate local configuration, including Slack credentials
 - `project`: import repositories, provision Slack channels, and inspect the local project registry
-- `runtime`: run the Slack-facing foreground event loop, reload state, inspect health, and cancel active thread sessions
+- `runtime`: run the Slack-facing foreground event loop, reload state, inspect health, and close active thread sessions
 
 At runtime, Spexus Agent:
 
@@ -33,10 +33,9 @@ At runtime, Spexus Agent:
 This repository is focused on the local agent and runtime workflow. It does not include:
 
 - a hosted control plane
-- a background Linux service manager integration unit
 - packaged installers
 
-The current runtime is intended to be run in the foreground from a terminal, or wrapped later by a user-level service manager.
+The current runtime is intended to be run in the foreground from a terminal. It also includes local user-level systemd helper targets in the `Makefile` for operators who want to install and restart the runtime as a per-user service.
 
 ## Requirements
 
@@ -83,7 +82,7 @@ The runtime uses:
 - Slack Socket Mode for inbound message delivery
 - ACPX in strict JSON mode for prompt execution and structured event output
 
-In Slack threads, a normal human reply without an agent mention is sent to ACPX as the prompt text. Mention the agent when you want the local command surface, such as `status`, `ask <prompt>`, or `cancel`.
+In Slack threads, a normal human reply without an agent mention is sent to ACPX as the prompt text. Mention the agent when you want the local command surface, such as `status`, `ask <prompt>`, or `close`.
 
 Assistant output is streamed into the Slack thread: the runtime posts the first partial answer, updates that message while it remains under the Slack text limit, and opens the next thread message when the current chunk reaches the limit.
 

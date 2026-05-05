@@ -74,19 +74,18 @@ func (c *HTTPClient) UpdateMessage(ctx context.Context, update MessageUpdate) er
 	if c == nil {
 		return fmt.Errorf("slack http client is nil")
 	}
-	if strings.TrimSpace(update.ChannelID) == "" {
+	channelID := strings.TrimSpace(update.ChannelID)
+	if channelID == "" {
 		return fmt.Errorf("channel id is required")
 	}
-	if strings.TrimSpace(update.Timestamp) == "" {
+	timestamp := strings.TrimSpace(update.Timestamp)
+	if timestamp == "" {
 		return fmt.Errorf("message timestamp is required")
-	}
-	if len([]rune(update.Text)) > MessageTextSoftLimit {
-		return fmt.Errorf("message text exceeds slack soft limit")
 	}
 
 	payload := map[string]string{
-		"channel": strings.TrimSpace(update.ChannelID),
-		"ts":      strings.TrimSpace(update.Timestamp),
+		"channel": channelID,
+		"ts":      timestamp,
 		"text":    update.Text,
 	}
 

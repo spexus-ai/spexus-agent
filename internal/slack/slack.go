@@ -20,12 +20,6 @@ type Message struct {
 	Text      string
 }
 
-type MessageUpdate struct {
-	ChannelID string
-	Timestamp string
-	Text      string
-}
-
 const ResponseTypeEphemeral = "ephemeral"
 
 type ResponseURLMessage struct {
@@ -37,6 +31,16 @@ type ResponseURLMessage struct {
 type PostedMessage struct {
 	ChannelID string
 	Timestamp string
+}
+
+type MessageUpdate struct {
+	ChannelID string
+	Timestamp string
+	Text      string
+}
+
+type MessageUpdater interface {
+	UpdateMessage(context.Context, MessageUpdate) error
 }
 
 type Event struct {
@@ -63,6 +67,7 @@ type InboundInvocation struct {
 	ThreadTS      string
 	ResponseURL   string
 	AckEnvelopeID string
+	Acked         bool
 }
 
 type Channel struct {

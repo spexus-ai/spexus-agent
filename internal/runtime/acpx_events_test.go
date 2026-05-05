@@ -19,23 +19,29 @@ func TestTranslateACPXTurnOutputParsesStrictJSONRPCEvents(t *testing.T) {
 		t.Fatalf("TranslateACPXTurnOutput() error = %v", err)
 	}
 
-	if got, want := len(events), 5; got != want {
+	if got, want := len(events), 7; got != want {
 		t.Fatalf("TranslateACPXTurnOutput() events = %d, want %d", got, want)
 	}
 	if events[0].Kind != ACPXEventSessionStarted || events[0].Text != "019db13d-f733-7ce0-8186-5aced7cdb2a7" {
 		t.Fatalf("TranslateACPXTurnOutput() first event = %#v", events[0])
 	}
-	if events[1].Kind != ACPXEventAssistantMessageFinal || events[1].Text != "Hello world" {
+	if events[1].Kind != ACPXEventAssistantMessageChunk || events[1].Text != "Hello" {
 		t.Fatalf("TranslateACPXTurnOutput() second event = %#v", events[1])
 	}
-	if events[2].Kind != ACPXEventToolStarted || events[2].ToolName != "Run pwd" {
+	if events[2].Kind != ACPXEventAssistantMessageChunk || events[2].Text != " world" {
 		t.Fatalf("TranslateACPXTurnOutput() third event = %#v", events[2])
 	}
-	if events[3].Kind != ACPXEventToolFinished || events[3].ToolName != "Run pwd" || events[3].ToolStatus != "completed" {
+	if events[3].Kind != ACPXEventToolStarted || events[3].ToolName != "Run pwd" {
 		t.Fatalf("TranslateACPXTurnOutput() fourth event = %#v", events[3])
 	}
-	if events[4].Kind != ACPXEventSessionDone {
+	if events[4].Kind != ACPXEventToolFinished || events[4].ToolName != "Run pwd" || events[4].ToolStatus != "completed" {
 		t.Fatalf("TranslateACPXTurnOutput() fifth event = %#v", events[4])
+	}
+	if events[5].Kind != ACPXEventAssistantMessageFinal || events[5].Text != "Hello world" {
+		t.Fatalf("TranslateACPXTurnOutput() sixth event = %#v", events[5])
+	}
+	if events[6].Kind != ACPXEventSessionDone {
+		t.Fatalf("TranslateACPXTurnOutput() seventh event = %#v", events[6])
 	}
 }
 
@@ -66,13 +72,16 @@ func TestTranslateACPXTurnOutputParsesArrayContentChunks(t *testing.T) {
 		t.Fatalf("TranslateACPXTurnOutput() error = %v", err)
 	}
 
-	if got, want := len(events), 2; got != want {
+	if got, want := len(events), 3; got != want {
 		t.Fatalf("TranslateACPXTurnOutput() events = %d, want %d", got, want)
 	}
-	if events[0].Kind != ACPXEventAssistantMessageFinal || events[0].Text != "hello world" {
+	if events[0].Kind != ACPXEventAssistantMessageChunk || events[0].Text != "hello world" {
 		t.Fatalf("TranslateACPXTurnOutput() first event = %#v", events[0])
 	}
-	if events[1].Kind != ACPXEventSessionDone {
+	if events[1].Kind != ACPXEventAssistantMessageFinal || events[1].Text != "hello world" {
 		t.Fatalf("TranslateACPXTurnOutput() second event = %#v", events[1])
+	}
+	if events[2].Kind != ACPXEventSessionDone {
+		t.Fatalf("TranslateACPXTurnOutput() third event = %#v", events[2])
 	}
 }

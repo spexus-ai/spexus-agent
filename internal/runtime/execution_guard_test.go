@@ -14,10 +14,11 @@ import (
 type fakeExecutionStore struct {
 	mu            sync.Mutex
 	dedupe        map[string]EventDedupe
-	executions    map[string]ExecutionRequest
+	executions    map[string]ExecutionState
 	threadStates  map[string]ThreadState
 	threadLocks   map[string]ThreadLock
 	saveEventErr  error
+	saveExecErr   error
 	saveStateErr  error
 	saveLockErr   error
 	deleteLockErr error
@@ -26,69 +27,10 @@ type fakeExecutionStore struct {
 func newFakeExecutionStore() *fakeExecutionStore {
 	return &fakeExecutionStore{
 		dedupe:       make(map[string]EventDedupe),
-		executions:   make(map[string]ExecutionRequest),
+		executions:   make(map[string]ExecutionState),
 		threadStates: make(map[string]ThreadState),
 		threadLocks:  make(map[string]ThreadLock),
 	}
-}
-
-func (f *fakeExecutionStore) CreateExecution(_ context.Context, request ExecutionRequest) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.executions[request.ExecutionID] = request
-	return nil
-}
-
-func (f *fakeExecutionStore) LoadExecution(_ context.Context, executionID string) (ExecutionRequest, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	request, ok := f.executions[executionID]
-	if !ok {
-		return ExecutionRequest{}, ErrNotFound
-	}
-	return request, nil
-}
-
-func (f *fakeExecutionStore) ListExecutions(_ context.Context, statuses []ExecutionLifecycleState) ([]ExecutionRequest, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	filtered := make([]ExecutionRequest, 0, len(f.executions))
-	for _, request := range f.executions {
-		if len(statuses) == 0 {
-			filtered = append(filtered, request)
-			continue
-		}
-
-		for _, status := range statuses {
-			if request.Status == status {
-				filtered = append(filtered, request)
-				break
-			}
-		}
-	}
-
-	return filtered, nil
-}
-
-func (f *fakeExecutionStore) UpdateExecutionState(_ context.Context, state ExecutionState) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	request, ok := f.executions[state.ExecutionID]
-	if !ok {
-		return ErrNotFound
-	}
-	request.Status = state.Status
-	request.DiagnosticContext = state.DiagnosticContext
-	if state.StartedAt != nil {
-		request.StartedAt = state.StartedAt
-	}
-	request.UpdatedAt = state.UpdatedAt
-	if state.CompletedAt != nil {
-		request.CompletedAt = state.CompletedAt
-	}
-	f.executions[state.ExecutionID] = request
-	return nil
 }
 
 func (f *fakeExecutionStore) SaveThreadState(_ context.Context, state ThreadState) error {
@@ -119,6 +61,62 @@ func (f *fakeExecutionStore) SaveEventDedupe(_ context.Context, dedupe EventDedu
 	}
 	f.dedupe[dedupe.SourceType+":"+dedupe.DeliveryID] = dedupe
 	return nil
+}
+
+func (f *fakeExecutionStore) SaveClaimedExecution(_ context.Context, dedupe EventDedupe, state ExecutionState) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.saveEventErr != nil {
+		return f.saveEventErr
+	}
+	if f.saveExecErr != nil {
+		return f.saveExecErr
+	}
+	f.dedupe[dedupe.SourceType+":"+dedupe.DeliveryID] = dedupe
+	f.executions[state.SourceType+":"+state.DeliveryID] = state
+	return nil
+}
+
+func (f *fakeExecutionStore) SaveExecutionState(_ context.Context, state ExecutionState) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.saveExecErr != nil {
+		return f.saveExecErr
+	}
+	f.executions[state.SourceType+":"+state.DeliveryID] = state
+	return nil
+}
+
+func (f *fakeExecutionStore) LoadExecutionState(_ context.Context, executionID string) (ExecutionState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, state := range f.executions {
+		if state.ExecutionID == executionID {
+			return state, nil
+		}
+	}
+	return ExecutionState{}, ErrNotFound
+}
+
+func (f *fakeExecutionStore) LoadExecutionStateByDelivery(_ context.Context, sourceType, deliveryID string) (ExecutionState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state, ok := f.executions[sourceType+":"+deliveryID]
+	if !ok {
+		return ExecutionState{}, ErrNotFound
+	}
+	return state, nil
+}
+
+func (f *fakeExecutionStore) LoadLatestExecutionByThread(_ context.Context, threadTS string) (ExecutionState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, state := range f.executions {
+		if state.ThreadTS == threadTS {
+			return state, nil
+		}
+	}
+	return ExecutionState{}, ErrNotFound
 }
 
 func (f *fakeExecutionStore) LoadEventDedupe(_ context.Context, sourceType, deliveryID string) (EventDedupe, error) {
@@ -201,185 +199,6 @@ func TestSlackTurnCoordinatorSkipsDuplicateSlackEvent(t *testing.T) {
 	}
 	if called {
 		t.Fatalf("Execute() callback was called for duplicate event")
-	}
-}
-
-// Test: accepted Slack invocations are persisted as queued execution requests before async execution starts.
-// Validates: AC-2107 (REQ-1572 - accepted invocation persists an execution request with a unique execution identifier), AC-2108 (REQ-1574 - invalid or duplicate invocations do not create a second execution request)
-func TestSlackTurnCoordinatorAcceptPersistsQueuedExecutionRequest(t *testing.T) {
-	t.Parallel()
-
-	store := newFakeExecutionStore()
-	coordinator := NewSlackTurnCoordinator(store, "runtime-1")
-	coordinator.SetExecutionIDGenerator(func() string { return "exec-1" })
-	coordinator.now = func() time.Time { return time.Unix(1713686400, 0).UTC() }
-
-	prepared := PreparedSlackEvent{
-		SourceType: "mention",
-		DeliveryID: "Ev-accept",
-		Event: slack.Event{
-			ID:        "Ev-accept",
-			ChannelID: "C12345678",
-			Text:      "status",
-		},
-		Project: registry.Project{
-			Name: "alpha",
-		},
-		ThreadTS:    "1713686400.000100",
-		SessionName: "slack-1713686400.000100",
-		ThreadState: ThreadState{
-			ThreadTS:    "1713686400.000100",
-			ChannelID:   "C12345678",
-			ProjectName: "alpha",
-			SessionName: "slack-1713686400.000100",
-		},
-	}
-
-	accepted, result, err := coordinator.Accept(context.Background(), prepared)
-	if err != nil {
-		t.Fatalf("Accept() error = %v", err)
-	}
-	if !result.Executed || result.Duplicate {
-		t.Fatalf("Accept() result = %#v, want accepted and not duplicate", result)
-	}
-	if accepted.Execution.ExecutionID != "exec-1" {
-		t.Fatalf("Accept() execution id = %q, want exec-1", accepted.Execution.ExecutionID)
-	}
-	if got := store.executions["exec-1"]; got.Status != ExecutionStateQueued || got.CommandText != "status" {
-		t.Fatalf("persisted execution = %#v, want queued status and command text", got)
-	}
-	if got := store.dedupe["mention:Ev-accept"].Status; got != "queued" {
-		t.Fatalf("dedupe status after Accept() = %q, want queued", got)
-	}
-	if got := store.threadStates["1713686400.000100"].LastStatus; got != "queued" {
-		t.Fatalf("thread status after Accept() = %q, want queued", got)
-	}
-	if _, ok := store.threadLocks["1713686400.000100"]; !ok {
-		t.Fatalf("thread lock missing after Accept()")
-	}
-}
-
-// Test: duplicate accepted invocations are rejected before a second execution request can be persisted.
-// Validates: REQ-1574 (dedupe rejection does not create an execution request)
-func TestSlackTurnCoordinatorAcceptSkipsDuplicateWithoutCreatingExecution(t *testing.T) {
-	t.Parallel()
-
-	store := newFakeExecutionStore()
-	store.dedupe["mention:Ev-duplicate"] = EventDedupe{
-		SourceType:  "mention",
-		DeliveryID:  "Ev-duplicate",
-		ReceivedAt:  time.Unix(1713686400, 0).UTC(),
-		ProcessedAt: timePtr(time.Unix(1713686405, 0).UTC()),
-		Status:      "processed",
-	}
-
-	coordinator := NewSlackTurnCoordinator(store, "runtime-1")
-	coordinator.SetExecutionIDGenerator(func() string { return "exec-duplicate" })
-
-	accepted, result, err := coordinator.Accept(context.Background(), PreparedSlackEvent{
-		SourceType: "mention",
-		DeliveryID: "Ev-duplicate",
-		Event: slack.Event{
-			ID:        "Ev-duplicate",
-			ChannelID: "C12345678",
-			Text:      "status",
-		},
-		Project: registry.Project{
-			Name: "alpha",
-		},
-		ThreadTS:    "1713686400.000100",
-		SessionName: "slack-1713686400.000100",
-		ThreadState: ThreadState{
-			ThreadTS:    "1713686400.000100",
-			ChannelID:   "C12345678",
-			ProjectName: "alpha",
-			SessionName: "slack-1713686400.000100",
-		},
-	})
-	if err != nil {
-		t.Fatalf("Accept() error = %v", err)
-	}
-	if !result.Duplicate || result.Executed {
-		t.Fatalf("Accept() result = %#v, want duplicate without execution", result)
-	}
-	if accepted.Execution.ExecutionID != "" {
-		t.Fatalf("Accept() execution = %#v, want empty accepted execution for duplicate", accepted.Execution)
-	}
-	if got := len(store.executions); got != 0 {
-		t.Fatalf("execution count after duplicate Accept() = %d, want 0", got)
-	}
-}
-
-// Test: accepted executions transition to running and terminal success when the async worker completes.
-// Validates: AC-2113 (REQ-1583 - lifecycle transitions persist timestamps for async execution requests)
-func TestSlackTurnCoordinatorExecuteAcceptedPersistsTerminalState(t *testing.T) {
-	t.Parallel()
-
-	store := newFakeExecutionStore()
-	coordinator := NewSlackTurnCoordinator(store, "runtime-1")
-	coordinator.SetExecutionIDGenerator(func() string { return "exec-2" })
-	now := time.Unix(1713686400, 0).UTC()
-	coordinator.now = func() time.Time {
-		now = now.Add(time.Second)
-		return now
-	}
-
-	prepared := PreparedSlackEvent{
-		SourceType: "message",
-		DeliveryID: "Ev-run",
-		Event: slack.Event{
-			ID:        "Ev-run",
-			ChannelID: "C12345678",
-			Text:      "summarize current state",
-		},
-		Project: registry.Project{
-			Name: "alpha",
-		},
-		ThreadTS:    "1713686400.000100",
-		SessionName: "slack-1713686400.000100",
-		ThreadState: ThreadState{
-			ThreadTS:    "1713686400.000100",
-			ChannelID:   "C12345678",
-			ProjectName: "alpha",
-			SessionName: "slack-1713686400.000100",
-		},
-	}
-
-	accepted, _, err := coordinator.Accept(context.Background(), prepared)
-	if err != nil {
-		t.Fatalf("Accept() error = %v", err)
-	}
-
-	called := false
-	result, err := coordinator.ExecuteAccepted(context.Background(), accepted, func(context.Context, PreparedSlackEvent) error {
-		called = true
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("ExecuteAccepted() error = %v", err)
-	}
-	if !called {
-		t.Fatalf("ExecuteAccepted() callback was not called")
-	}
-	if result.CompletedAt.IsZero() {
-		t.Fatalf("ExecuteAccepted() completed_at is zero")
-	}
-
-	execution := store.executions["exec-2"]
-	if execution.Status != ExecutionStateSucceeded {
-		t.Fatalf("execution status after ExecuteAccepted() = %q, want succeeded", execution.Status)
-	}
-	if execution.StartedAt == nil || execution.CompletedAt == nil {
-		t.Fatalf("execution timestamps after ExecuteAccepted() = %#v, want started and completed timestamps", execution)
-	}
-	if got := store.dedupe["message:Ev-run"].Status; got != "processed" {
-		t.Fatalf("dedupe status after ExecuteAccepted() = %q, want processed", got)
-	}
-	if got := store.threadStates["1713686400.000100"].LastStatus; got != "processed" {
-		t.Fatalf("thread status after ExecuteAccepted() = %q, want processed", got)
-	}
-	if len(store.threadLocks) != 0 {
-		t.Fatalf("thread locks left behind after ExecuteAccepted(): %#v", store.threadLocks)
 	}
 }
 
@@ -525,5 +344,62 @@ func TestSlackTurnCoordinatorFailsClosedOnPersistenceError(t *testing.T) {
 	}
 	if len(store.threadLocks) != 0 {
 		t.Fatalf("thread locks persisted unexpectedly: %#v", store.threadLocks)
+	}
+}
+
+// Test: accepting an invocation persists the dedupe claim together with a queued execution state before enqueue continues.
+// Validates: AC-1981 (REQ-1429 - accepted deliveries persist an initial queued execution state at claim time), AC-1982 (REQ-1432 - startup recovery can observe accepted deliveries before worker start)
+func TestSlackTurnCoordinatorClaimExecutionPersistsQueuedState(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeExecutionStore()
+	coordinator := NewSlackTurnCoordinator(store, "runtime-1")
+
+	claimedAt := time.Date(2026, time.April, 26, 19, 0, 0, 0, time.UTC)
+	coordinator.now = func() time.Time {
+		return claimedAt
+	}
+
+	request := ExecutionRequest{
+		SourceType:  "mention",
+		DeliveryID:  "Ev-queued",
+		ChannelID:   "C12345678",
+		CommandText: "@agent status",
+		Project: registry.Project{
+			Name:           "alpha",
+			SlackChannelID: "C12345678",
+		},
+		ThreadTS:    "1713686400.000100",
+		SessionName: "slack-1713686400.000100",
+	}
+
+	result, err := coordinator.ClaimExecution(context.Background(), request)
+	if err != nil {
+		t.Fatalf("ClaimExecution() error = %v", err)
+	}
+	if !result.Executed || result.Duplicate {
+		t.Fatalf("ClaimExecution() result = %#v, want executed non-duplicate claim", result)
+	}
+
+	dedupe, err := store.LoadEventDedupe(context.Background(), request.SourceType, request.DeliveryID)
+	if err != nil {
+		t.Fatalf("LoadEventDedupe() error = %v", err)
+	}
+	if dedupe.Status != "acked" || !dedupe.ReceivedAt.Equal(claimedAt) {
+		t.Fatalf("LoadEventDedupe() = %#v, want acked at %s", dedupe, claimedAt)
+	}
+
+	state, err := store.LoadExecutionStateByDelivery(context.Background(), request.SourceType, request.DeliveryID)
+	if err != nil {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
+	}
+	if state.ExecutionID != request.ExecutionID() || state.Status != ExecutionStatusQueued {
+		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want queued execution state", state)
+	}
+	if !state.QueuedAt.Equal(claimedAt) || !state.UpdatedAt.Equal(claimedAt) {
+		t.Fatalf("LoadExecutionStateByDelivery() timestamps = %#v, want queued/updated at claim time", state)
+	}
+	if state.ThreadTS != request.ThreadTS || state.SessionName != request.SessionName {
+		t.Fatalf("LoadExecutionStateByDelivery() thread/session = (%q, %q), want request thread/session", state.ThreadTS, state.SessionName)
 	}
 }
