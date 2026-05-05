@@ -170,6 +170,34 @@ func PrepareSlackMentionEvent(ctx context.Context, resolver ProjectContextResolv
 	}, nil
 }
 
+func PrepareSlackMessageEvent(ctx context.Context, resolver ProjectContextResolver, invocation slack.InboundInvocation) (PreparedSlackEvent, error) {
+	invocation.SourceType = slack.InboundSourceMessage
+	invocation.CommandText = strings.TrimSpace(invocation.CommandText)
+
+	prepared, err := PrepareSlackInvocation(ctx, resolver, invocation)
+	if err != nil {
+		return PreparedSlackEvent{}, err
+	}
+
+	return PreparedSlackEvent{
+		SourceType: prepared.Invocation.SourceType,
+		DeliveryID: strings.TrimSpace(invocation.DeliveryID),
+		Event: slack.Event{
+			ID:        strings.TrimSpace(invocation.DeliveryID),
+			ChannelID: strings.TrimSpace(invocation.ChannelID),
+			ThreadTS:  prepared.ThreadTS,
+			Timestamp: prepared.ThreadTS,
+			UserID:    strings.TrimSpace(invocation.UserID),
+			Text:      prepared.Invocation.CommandText,
+		},
+		Project:       prepared.Project,
+		ThreadTS:      prepared.ThreadTS,
+		SessionName:   prepared.SessionName,
+		IsThreadReply: true,
+		ThreadState:   prepared.ThreadState,
+	}, nil
+}
+
 func buildUnregisteredSlackInvocationRejection(invocation slack.InboundInvocation) SlackInvocationRejection {
 	rejection := SlackInvocationRejection{
 		SourceType: strings.TrimSpace(invocation.SourceType),

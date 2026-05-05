@@ -6,7 +6,7 @@ import (
 )
 
 // Test: the shared Slack command parser accepts the minimal command set for mention and slash routing.
-// Validates: AC-1820 (REQ-1189 - supported commands include help, status, ask, and cancel)
+// Validates: AC-1820 (REQ-1189 - supported commands include help, status, ask, and close)
 func TestParseSlackCommandRecognizesSupportedCommands(t *testing.T) {
 	t.Parallel()
 
@@ -19,7 +19,7 @@ func TestParseSlackCommandRecognizesSupportedCommands(t *testing.T) {
 		{name: "help", input: "help", kind: SlackCommandHelp},
 		{name: "status", input: "status", kind: SlackCommandStatus},
 		{name: "ask", input: "ask summarize current project state", kind: SlackCommandAsk, prompt: "summarize current project state"},
-		{name: "cancel", input: "cancel", kind: SlackCommandCancel},
+		{name: "close", input: "close", kind: SlackCommandClose},
 		{name: "case-insensitive", input: "ASK summarize current project state", kind: SlackCommandAsk, prompt: "summarize current project state"},
 	}
 
@@ -57,7 +57,7 @@ func TestParseSlackCommandBuildsACPXPromptOnlyForExecutableCommands(t *testing.T
 		{name: "ask missing prompt", input: "ask", shouldRun: false, expectKind: SlackCommandInvalid},
 		{name: "status", input: "status", shouldRun: true, acpxPrompt: "status", expectKind: SlackCommandStatus},
 		{name: "ask", input: "ask summarize open work", shouldRun: true, acpxPrompt: "summarize open work", expectKind: SlackCommandAsk},
-		{name: "cancel", input: "cancel", shouldRun: true, acpxPrompt: "cancel", expectKind: SlackCommandCancel},
+		{name: "close", input: "close", shouldRun: true, acpxPrompt: "cancel", expectKind: SlackCommandClose},
 	}
 
 	for _, tc := range cases {
@@ -80,7 +80,7 @@ func TestParseSlackCommandBuildsACPXPromptOnlyForExecutableCommands(t *testing.T
 }
 
 // Test: mention and slash help text expose the same supported command set with transport-specific usage examples.
-// Validates: AC-1817 (REQ-1184 - mention usage guidance is human-readable), AC-1820 (REQ-1189 - slash help includes status, ask, and cancel)
+// Validates: AC-1817 (REQ-1184 - mention usage guidance is human-readable), AC-1820 (REQ-1189 - slash help includes status, ask, and close)
 func TestSlackCommandHelpTextIncludesSupportedCommands(t *testing.T) {
 	t.Parallel()
 
@@ -88,7 +88,7 @@ func TestSlackCommandHelpTextIncludesSupportedCommands(t *testing.T) {
 	slash := SlackCommandHelpText(SlackCommandSurfaceSlash)
 
 	for _, text := range []string{mention, slash} {
-		for _, fragment := range []string{"help", "status", "ask <prompt>", "cancel"} {
+		for _, fragment := range []string{"help", "status", "ask <prompt>", "close"} {
 			if !strings.Contains(text, fragment) {
 				t.Fatalf("help text %q missing %q", text, fragment)
 			}

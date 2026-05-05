@@ -19,6 +19,8 @@ func (f *fakeChannelClient) PostMessage(context.Context, Message) (PostedMessage
 
 func (f *fakeChannelClient) PostThreadMessage(context.Context, Message) error { return nil }
 
+func (f *fakeChannelClient) UpdateMessage(context.Context, MessageUpdate) error { return nil }
+
 func (f *fakeChannelClient) CreateChannel(_ context.Context, request CreateChannelRequest) (Channel, error) {
 	f.requests = append(f.requests, request)
 	if f.err != nil {

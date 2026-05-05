@@ -35,6 +35,37 @@ func TestInvocationFromSocketModeEnvelopeNormalizesAppMention(t *testing.T) {
 	}
 }
 
+func TestInvocationFromSocketModeEnvelopeNormalizesThreadMessage(t *testing.T) {
+	t.Parallel()
+
+	envelope := socketModeEnvelope{
+		Type: SocketModeEnvelopeEventsAPI,
+		Payload: []byte(`{
+			"event_id": "Ev-message",
+			"type": "event_callback",
+			"event": {
+				"type": "message",
+				"channel": "C123",
+				"thread_ts": "1713686400.000100",
+				"ts": "1713686400.000200",
+				"user": "U123",
+				"text": "summarize current project state"
+			}
+		}`),
+	}
+
+	invocation, ok, err := invocationFromSocketModeEnvelope(envelope)
+	if err != nil {
+		t.Fatalf("invocationFromSocketModeEnvelope() error = %v", err)
+	}
+	if !ok {
+		t.Fatalf("invocationFromSocketModeEnvelope() ok = false, want true")
+	}
+	if invocation.SourceType != InboundSourceMessage || invocation.DeliveryID != "Ev-message" || invocation.ThreadTS != "1713686400.000100" {
+		t.Fatalf("invocation = %#v, want normalized message inbound invocation", invocation)
+	}
+}
+
 // Test: slash_commands Socket Mode envelopes map into the shared inbound invocation model and preserve the ack envelope id.
 // Validates: AC-1818 (REQ-1186 - slash invocations ack within the Slack window), AC-1824 (REQ-1193 - slash source classification)
 func TestInvocationFromSocketModeEnvelopeNormalizesSlashCommand(t *testing.T) {

@@ -16,26 +16,26 @@ The project provides three main command groups:
 
 - `config`: initialize and validate local configuration, including Slack credentials
 - `project`: import repositories, provision Slack channels, and inspect the local project registry
-- `runtime`: run the Slack-facing foreground event loop, reload state, inspect health, and cancel active thread sessions
+- `runtime`: run the Slack-facing foreground event loop, reload state, inspect health, and close active thread sessions
 
 At runtime, Spexus Agent:
 
 1. receives Slack events through Socket Mode
 2. resolves the Slack channel to a registered project
 3. maps the Slack thread to an ACPX session name
-4. invokes `acpx` in strict JSON mode
-5. translates ACPX events into Slack thread replies
-6. stores thread and deduplication state in SQLite
+4. treats agent mentions as command invocations and plain thread replies as prompts
+5. invokes `acpx` in strict JSON mode
+6. translates ACPX events into Slack thread replies
+7. stores thread and deduplication state in SQLite
 
 ## Repository Scope
 
 This repository is focused on the local agent and runtime workflow. It does not include:
 
 - a hosted control plane
-- a background Linux service manager integration unit
 - packaged installers
 
-The current runtime is intended to be run in the foreground from a terminal, or wrapped later by a user-level service manager.
+The current runtime is intended to be run in the foreground from a terminal. It also includes local user-level systemd helper targets in the `Makefile` for operators who want to install and restart the runtime as a per-user service.
 
 ## Requirements
 
@@ -81,6 +81,10 @@ The runtime uses:
 - Slack Web API for channel provisioning and thread replies
 - Slack Socket Mode for inbound message delivery
 - ACPX in strict JSON mode for prompt execution and structured event output
+
+In Slack threads, a normal human reply without an agent mention is sent to ACPX as the prompt text. Mention the agent when you want the local command surface, such as `status`, `ask <prompt>`, or `close`.
+
+Assistant output is streamed into the Slack thread: the runtime posts the first partial answer, updates that message while it remains under the Slack text limit, and opens the next thread message when the current chunk reaches the limit.
 
 Raw Socket Mode frame logging is disabled by default, even when `--debug` is enabled. To enable websocket-level tracing for troubleshooting:
 

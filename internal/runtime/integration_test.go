@@ -86,6 +86,7 @@ func (c acpxadapterPromptCommand) Close() error          { return nil }
 type recordingSlackClient struct {
 	mu       sync.Mutex
 	messages []slack.Message
+	updates  []slack.MessageUpdate
 }
 
 func (c *recordingSlackClient) PostMessage(_ context.Context, message slack.Message) (slack.PostedMessage, error) {
@@ -104,6 +105,14 @@ func (c *recordingSlackClient) PostThreadMessage(_ context.Context, message slac
 	defer c.mu.Unlock()
 
 	c.messages = append(c.messages, message)
+	return nil
+}
+
+func (c *recordingSlackClient) UpdateMessage(_ context.Context, update slack.MessageUpdate) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.updates = append(c.updates, update)
 	return nil
 }
 

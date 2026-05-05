@@ -230,6 +230,9 @@ func (s *Store) bootstrap(ctx context.Context) error {
 	if err := migrateAdditiveColumns(ctx, tx); err != nil {
 		return err
 	}
+	if err := migrateExecutionStateTable(ctx, tx); err != nil {
+		return err
+	}
 
 	for _, stmt := range indexStmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -974,6 +977,191 @@ func migrateAdditiveColumns(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	return nil
+}
+
+func migrateExecutionStateTable(ctx context.Context, tx *sql.Tx) error {
+	columns, err := tableColumns(ctx, tx, "executions")
+	if err != nil {
+		return fmt.Errorf("inspect executions schema: %w", err)
+	}
+	if len(columns) == 0 {
+		return nil
+	}
+	if columns["session_name"] && columns["queued_at"] {
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS executions_v2 (
+			execution_id TEXT PRIMARY KEY,
+			source_type TEXT NOT NULL,
+			delivery_id TEXT NOT NULL,
+			project_name TEXT NOT NULL,
+			channel_id TEXT NOT NULL,
+			thread_ts TEXT NOT NULL DEFAULT '',
+			session_name TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			queued_at TEXT NOT NULL,
+			started_at TEXT,
+			rendering_started_at TEXT,
+			completed_at TEXT,
+			cancelled_at TEXT,
+			updated_at TEXT NOT NULL,
+			last_error TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_kind TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_summary TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_at TEXT,
+			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
+		)
+	`); err != nil {
+		return fmt.Errorf("create executions_v2 table: %w", err)
+	}
+
+	sessionNameExpr := `CASE
+		WHEN TRIM(COALESCE(thread_ts, '')) <> '' THEN 'slack-' || TRIM(thread_ts)
+		WHEN TRIM(COALESCE(channel_id, '')) <> '' THEN 'legacy-channel-' || TRIM(channel_id)
+		ELSE 'legacy-execution-' || execution_id
+	END`
+	if columns["session_name"] {
+		sessionNameExpr = `COALESCE(NULLIF(TRIM(session_name), ''), ` + sessionNameExpr + `)`
+	} else if columns["session_key"] {
+		sessionNameExpr = `COALESCE(NULLIF(TRIM(session_key), ''), ` + sessionNameExpr + `)`
+	}
+
+	threadTSExpr := `''`
+	if columns["thread_ts"] {
+		threadTSExpr = `COALESCE(thread_ts, '')`
+	}
+
+	statusExpr := `'queued'`
+	if columns["status"] {
+		statusExpr = `status`
+	}
+
+	queuedAtExpr := `CURRENT_TIMESTAMP`
+	if columns["queued_at"] {
+		queuedAtExpr = `queued_at`
+	} else if columns["created_at"] {
+		queuedAtExpr = `created_at`
+	} else if columns["updated_at"] {
+		queuedAtExpr = `updated_at`
+	}
+
+	startedAtExpr := `NULL`
+	if columns["started_at"] {
+		startedAtExpr = `started_at`
+	}
+
+	renderingStartedAtExpr := `NULL`
+	if columns["rendering_started_at"] {
+		renderingStartedAtExpr = `rendering_started_at`
+	}
+
+	completedAtExpr := `NULL`
+	if columns["completed_at"] {
+		completedAtExpr = `completed_at`
+	}
+
+	cancelledAtExpr := `NULL`
+	if columns["cancelled_at"] {
+		cancelledAtExpr = `cancelled_at`
+	}
+
+	updatedAtExpr := queuedAtExpr
+	if columns["updated_at"] {
+		updatedAtExpr = `updated_at`
+	}
+
+	lastErrorExpr := `''`
+	if columns["last_error"] {
+		lastErrorExpr = `COALESCE(last_error, '')`
+	} else if columns["diagnostic_context"] {
+		lastErrorExpr = `COALESCE(diagnostic_context, '')`
+	}
+
+	publisherCheckpointKindExpr := `''`
+	if columns["publisher_checkpoint_kind"] {
+		publisherCheckpointKindExpr = `COALESCE(publisher_checkpoint_kind, '')`
+	}
+
+	publisherCheckpointSummaryExpr := `''`
+	if columns["publisher_checkpoint_summary"] {
+		publisherCheckpointSummaryExpr = `COALESCE(publisher_checkpoint_summary, '')`
+	}
+
+	publisherCheckpointAtExpr := `NULL`
+	if columns["publisher_checkpoint_at"] {
+		publisherCheckpointAtExpr = `publisher_checkpoint_at`
+	}
+
+	insertStmt := fmt.Sprintf(`
+		INSERT INTO executions_v2 (
+			execution_id, source_type, delivery_id, project_name, channel_id, thread_ts, session_name,
+			status, queued_at, started_at, rendering_started_at, completed_at, cancelled_at, updated_at,
+			last_error, publisher_checkpoint_kind, publisher_checkpoint_summary, publisher_checkpoint_at
+		)
+		SELECT
+			execution_id,
+			source_type,
+			delivery_id,
+			project_name,
+			channel_id,
+			%s,
+			%s,
+			%s,
+			%s,
+			%s,
+			%s,
+			%s,
+			%s,
+			%s,
+			%s,
+			%s,
+			%s,
+			%s
+		FROM executions
+	`, threadTSExpr, sessionNameExpr, statusExpr, queuedAtExpr, startedAtExpr, renderingStartedAtExpr, completedAtExpr, cancelledAtExpr, updatedAtExpr, lastErrorExpr, publisherCheckpointKindExpr, publisherCheckpointSummaryExpr, publisherCheckpointAtExpr)
+	if _, err := tx.ExecContext(ctx, insertStmt); err != nil {
+		return fmt.Errorf("copy legacy executions into executions_v2: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DROP TABLE executions`); err != nil {
+		return fmt.Errorf("drop legacy executions table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE executions_v2 RENAME TO executions`); err != nil {
+		return fmt.Errorf("rename executions_v2 table: %w", err)
+	}
+
+	return nil
+}
+
+func tableColumns(ctx context.Context, tx *sql.Tx, tableName string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			valueType string
+			notNull   int
+			defaults  sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &valueType, &notNull, &defaults, &pk); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return columns, nil
 }
 
 func tableColumnExists(ctx context.Context, tx *sql.Tx, tableName, columnName string) (bool, error) {

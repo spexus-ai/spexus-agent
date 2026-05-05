@@ -60,8 +60,16 @@ func (e SocketModeMessage) Normalize() (Event, error) {
 }
 
 func (e SocketModeMessage) NormalizeInbound() (InboundInvocation, error) {
+	sourceType := ""
+	threadTS := strings.TrimSpace(e.ThreadTS)
 	switch strings.TrimSpace(e.Type) {
-	case SocketModeMessageType, SocketModeAppMentionType:
+	case SocketModeAppMentionType:
+		sourceType = InboundSourceMention
+		if threadTS == "" {
+			threadTS = strings.TrimSpace(e.Timestamp)
+		}
+	case SocketModeMessageType:
+		sourceType = InboundSourceMessage
 	default:
 		return InboundInvocation{}, ErrSocketModeEventUnsupported
 	}
@@ -72,13 +80,8 @@ func (e SocketModeMessage) NormalizeInbound() (InboundInvocation, error) {
 		return InboundInvocation{}, fmt.Errorf("slack event user id is required")
 	}
 
-	threadTS := strings.TrimSpace(e.ThreadTS)
-	if threadTS == "" {
-		threadTS = strings.TrimSpace(e.Timestamp)
-	}
-
 	return InboundInvocation{
-		SourceType:  InboundSourceMention,
+		SourceType:  sourceType,
 		DeliveryID:  strings.TrimSpace(e.EventID),
 		ChannelID:   strings.TrimSpace(e.ChannelID),
 		UserID:      strings.TrimSpace(e.UserID),

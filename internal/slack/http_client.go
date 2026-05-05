@@ -11,6 +11,8 @@ import (
 )
 
 const defaultAPIBaseURL = "https://slack.com/api/"
+const MessageTextSoftLimit = 3900
+const slackMessageTextSoftLimit = MessageTextSoftLimit
 
 type HTTPClient struct {
 	token   string
@@ -27,16 +29,45 @@ func NewHTTPClient(token string) *HTTPClient {
 }
 
 func (c *HTTPClient) PostMessage(ctx context.Context, message Message) (PostedMessage, error) {
-	response, err := c.postMessage(ctx, message)
+	parts := splitSlackMessageText(message.Text)
+	if len(parts) == 0 {
+		parts = []string{message.Text}
+	}
+
+	first := message
+	first.Text = parts[0]
+	response, err := c.postMessage(ctx, first)
 	if err != nil {
 		return PostedMessage{}, err
+	}
+	threadTS := strings.TrimSpace(message.ThreadTS)
+	if threadTS == "" {
+		threadTS = response.Timestamp
+	}
+	for _, part := range parts[1:] {
+		next := message
+		next.ThreadTS = threadTS
+		next.Text = part
+		if _, err := c.postMessage(ctx, next); err != nil {
+			return PostedMessage{}, err
+		}
 	}
 	return response, nil
 }
 
 func (c *HTTPClient) PostThreadMessage(ctx context.Context, message Message) error {
-	_, err := c.postMessage(ctx, message)
-	return err
+	parts := splitSlackMessageText(message.Text)
+	if len(parts) == 0 {
+		parts = []string{message.Text}
+	}
+	for _, part := range parts {
+		next := message
+		next.Text = part
+		if _, err := c.postMessage(ctx, next); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *HTTPClient) UpdateMessage(ctx context.Context, update MessageUpdate) error {
@@ -81,38 +112,84 @@ func (c *HTTPClient) PostResponseURLMessage(ctx context.Context, message Respons
 		c.client = &http.Client{}
 	}
 
-	payload := map[string]string{
-		"text": message.Text,
-	}
 	if responseType := strings.TrimSpace(message.ResponseType); responseType != "" {
-		payload["response_type"] = responseType
+		message.ResponseType = responseType
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("encode slack response_url request: %w", err)
+	parts := splitSlackMessageText(message.Text)
+	if len(parts) == 0 {
+		parts = []string{message.Text}
 	}
+	for _, part := range parts {
+		payload := map[string]string{
+			"text": part,
+		}
+		if message.ResponseType != "" {
+			payload["response_type"] = message.ResponseType
+		}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, responseURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create slack response_url request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("encode slack response_url request: %w", err)
+		}
 
-	res, err := c.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("call slack response_url: %w", err)
-	}
-	defer res.Body.Close()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, responseURL, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create slack response_url request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
-	if _, err := io.ReadAll(res.Body); err != nil {
-		return fmt.Errorf("read slack response_url response: %w", err)
-	}
-	if res.StatusCode >= http.StatusBadRequest {
-		return fmt.Errorf("slack response_url request failed with status %s", res.Status)
+		res, err := c.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("call slack response_url: %w", err)
+		}
+
+		if _, err := io.ReadAll(res.Body); err != nil {
+			res.Body.Close()
+			return fmt.Errorf("read slack response_url response: %w", err)
+		}
+		if closeErr := res.Body.Close(); closeErr != nil {
+			return fmt.Errorf("close slack response_url response: %w", closeErr)
+		}
+		if res.StatusCode >= http.StatusBadRequest {
+			return fmt.Errorf("slack response_url request failed with status %s", res.Status)
+		}
 	}
 
 	return nil
+}
+
+func splitSlackMessageText(text string) []string {
+	if len([]rune(text)) <= slackMessageTextSoftLimit {
+		return []string{text}
+	}
+
+	remaining := []rune(text)
+	parts := make([]string, 0, len(remaining)/slackMessageTextSoftLimit+1)
+	for len(remaining) > slackMessageTextSoftLimit {
+		cut := slackMessageTextSoftLimit
+		for i := slackMessageTextSoftLimit; i > 0; i-- {
+			if remaining[i-1] == '\n' {
+				cut = i - 1
+				break
+			}
+		}
+		if cut == 0 {
+			cut = slackMessageTextSoftLimit
+		}
+		part := strings.TrimRight(string(remaining[:cut]), "\n")
+		if part != "" {
+			parts = append(parts, part)
+		}
+		remaining = remaining[cut:]
+		if len(remaining) > 0 && remaining[0] == '\n' {
+			remaining = remaining[1:]
+		}
+	}
+	if len(remaining) > 0 {
+		parts = append(parts, string(remaining))
+	}
+	return parts
 }
 
 func (c *HTTPClient) postMessage(ctx context.Context, message Message) (PostedMessage, error) {

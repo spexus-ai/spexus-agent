@@ -239,6 +239,35 @@ func TestPrepareSlackInvocationRejectsUnregisteredSlashChannel(t *testing.T) {
 	}
 }
 
+// Test: mention invocations without thread context are rejected before ingress can construct execution state.
+// Validates: REQ-1574 (invalid invocation does not create an execution request)
+func TestPrepareSlackMentionEventRequiresThreadContext(t *testing.T) {
+	t.Parallel()
+
+	resolver := &fakeProjectContextResolver{
+		project: registry.Project{
+			Name:             "alpha",
+			LocalPath:        "/workspace/alpha",
+			SlackChannelID:   "C12345678",
+			SlackChannelName: "spexus-alpha",
+		},
+	}
+
+	_, err := PrepareSlackMentionEvent(context.Background(), resolver, slack.InboundInvocation{
+		SourceType:  slack.InboundSourceMention,
+		DeliveryID:  "Ev127-invalid",
+		ChannelID:   "C12345678",
+		UserID:      "U123",
+		CommandText: "<@Ubot> status",
+	})
+	if !errors.Is(err, ErrSlackEventThreadContextMissing) {
+		t.Fatalf("PrepareSlackMentionEvent() error = %v, want ErrSlackEventThreadContextMissing", err)
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("GetByChannelID() calls = %d, want 1 before thread validation fails", resolver.calls)
+	}
+}
+
 // Test: root app_mention invocations strip the leading mention token and keep the root message timestamp as the execution thread anchor.
 // Validates: AC-1815 (REQ-1181 - root mentions start a new thread-oriented execution context), AC-1815 (REQ-1183 - mention command text is parsed from the payload)
 func TestPrepareSlackMentionEventResolvesRootMentionCommand(t *testing.T) {
@@ -341,5 +370,41 @@ func TestPrepareSlackMentionEventLeavesEmptyCommandForUsageHandling(t *testing.T
 	}
 	if prepared.ThreadTS != "1713686400.000100" {
 		t.Fatalf("PrepareSlackMentionEvent() thread ts = %q, want existing thread anchor", prepared.ThreadTS)
+	}
+}
+
+// Test: plain thread message invocations preserve their text as the direct ACPX prompt.
+func TestPrepareSlackMessageEventPreservesPromptText(t *testing.T) {
+	t.Parallel()
+
+	resolver := &fakeProjectContextResolver{
+		project: registry.Project{
+			Name:             "alpha",
+			LocalPath:        "/workspace/alpha",
+			SlackChannelID:   "C12345678",
+			SlackChannelName: "spexus-alpha",
+		},
+	}
+
+	prepared, err := PrepareSlackMessageEvent(context.Background(), resolver, slack.InboundInvocation{
+		SourceType:  slack.InboundSourceMessage,
+		DeliveryID:  "Ev130",
+		ChannelID:   "C12345678",
+		UserID:      "U123",
+		CommandText: "summarize current project state",
+		ThreadTS:    "1713686400.000100",
+	})
+	if err != nil {
+		t.Fatalf("PrepareSlackMessageEvent() error = %v", err)
+	}
+
+	if prepared.SourceType != slack.InboundSourceMessage {
+		t.Fatalf("PrepareSlackMessageEvent() source = %q, want message", prepared.SourceType)
+	}
+	if prepared.Event.Text != "summarize current project state" {
+		t.Fatalf("PrepareSlackMessageEvent() text = %q, want prompt text", prepared.Event.Text)
+	}
+	if prepared.ThreadTS != "1713686400.000100" || prepared.SessionName != "slack-1713686400.000100" {
+		t.Fatalf("PrepareSlackMessageEvent() thread/session = (%q, %q)", prepared.ThreadTS, prepared.SessionName)
 	}
 }

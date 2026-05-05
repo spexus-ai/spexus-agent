@@ -40,6 +40,7 @@ type fakeRuntimeHandler struct {
 	startCtx      context.Context
 	startWaitDone chan struct{}
 	statusArgs    []string
+	cancelArgs    []string
 }
 
 func (f *fakeRuntimeHandler) Start(ctx context.Context, args []string) error {
@@ -60,7 +61,10 @@ func (f *fakeRuntimeHandler) Status(_ context.Context, args []string) error {
 }
 func (f *fakeRuntimeHandler) Reload(context.Context, []string) error { return nil }
 func (f *fakeRuntimeHandler) Doctor(context.Context, []string) error { return nil }
-func (f *fakeRuntimeHandler) Cancel(context.Context, []string) error { return nil }
+func (f *fakeRuntimeHandler) Cancel(_ context.Context, args []string) error {
+	f.cancelArgs = append([]string(nil), args...)
+	return nil
+}
 
 // Test the config CLI routes set-base-workspace to the handler.
 // Validates: AC-1761 (REQ-1122 - config CLI manages base workspace path)
@@ -137,6 +141,48 @@ func TestAppRunRuntimeRoutesBareCommandToStatus(t *testing.T) {
 	}
 
 	if got, want := strings.Join(handler.statusArgs, ","), ""; got != want {
+		t.Fatalf("handler args = %q, want %q", got, want)
+	}
+}
+
+// Test the runtime status subcommand routes an execution identifier to the status handler.
+// Validates: AC-2115 (REQ-1585 - status lookup is exposed on the operator-facing runtime CLI surface)
+func TestAppRunRuntimeStatusRoutesExecutionIDToHandler(t *testing.T) {
+	t.Parallel()
+
+	handler := &fakeRuntimeHandler{}
+	app := &App{
+		Runtime: handler,
+		Out:     &bytes.Buffer{},
+		Err:     &bytes.Buffer{},
+	}
+
+	if code := app.Run([]string{"runtime", "status", "exec-123"}); code != 0 {
+		t.Fatalf("Run() exit code = %d, want 0", code)
+	}
+
+	if got, want := strings.Join(handler.statusArgs, ","), "exec-123"; got != want {
+		t.Fatalf("handler args = %q, want %q", got, want)
+	}
+}
+
+// Test the runtime cancel subcommand routes an execution identifier to the cancel handler.
+// Validates: AC-2116 (REQ-1586 - cancellation is exposed on the operator-facing runtime CLI surface)
+func TestAppRunRuntimeCancelRoutesExecutionIDToHandler(t *testing.T) {
+	t.Parallel()
+
+	handler := &fakeRuntimeHandler{}
+	app := &App{
+		Runtime: handler,
+		Out:     &bytes.Buffer{},
+		Err:     &bytes.Buffer{},
+	}
+
+	if code := app.Run([]string{"runtime", "cancel", "exec-123"}); code != 0 {
+		t.Fatalf("Run() exit code = %d, want 0", code)
+	}
+
+	if got, want := strings.Join(handler.cancelArgs, ","), "exec-123"; got != want {
 		t.Fatalf("handler args = %q, want %q", got, want)
 	}
 }
@@ -234,7 +280,7 @@ func TestRuntimeHelpIncludesLifecycleCommands(t *testing.T) {
 	var out bytes.Buffer
 	printRuntimeHelp(&out)
 
-	for _, command := range []string{"start [--debug]", "status", "reload", "cancel <thread-ts>"} {
+	for _, command := range []string{"start [--debug]", "status [execution-id]", "reload", "cancel <execution-id|thread-ts>"} {
 		if !strings.Contains(out.String(), command) {
 			t.Fatalf("runtime help missing %q: %s", command, out.String())
 		}

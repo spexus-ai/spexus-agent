@@ -54,6 +54,7 @@ type Event struct {
 
 const (
 	InboundSourceMention = "mention"
+	InboundSourceMessage = "message"
 	InboundSourceSlash   = "slash"
 )
 
@@ -81,6 +82,7 @@ type CreateChannelRequest struct {
 type Client interface {
 	PostMessage(context.Context, Message) (PostedMessage, error)
 	PostThreadMessage(context.Context, Message) error
+	UpdateMessage(context.Context, MessageUpdate) error
 	CreateChannel(context.Context, CreateChannelRequest) (Channel, error)
 	FindChannelByName(context.Context, string) (Channel, error)
 	Close() error

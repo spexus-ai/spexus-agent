@@ -19,7 +19,7 @@ const (
 	SlackCommandHelp    SlackCommandKind = "help"
 	SlackCommandStatus  SlackCommandKind = "status"
 	SlackCommandAsk     SlackCommandKind = "ask"
-	SlackCommandCancel  SlackCommandKind = "cancel"
+	SlackCommandClose   SlackCommandKind = "close"
 )
 
 type SlackCommand struct {
@@ -60,11 +60,11 @@ func ParseSlackCommand(text string) SlackCommand {
 			Kind:   SlackCommandAsk,
 			Prompt: remainder,
 		}
-	case string(SlackCommandCancel):
+	case string(SlackCommandClose):
 		if remainder != "" {
 			return SlackCommand{Kind: SlackCommandInvalid}
 		}
-		return SlackCommand{Kind: SlackCommandCancel}
+		return SlackCommand{Kind: SlackCommandClose}
 	default:
 		return SlackCommand{Kind: SlackCommandInvalid}
 	}
@@ -72,7 +72,7 @@ func ParseSlackCommand(text string) SlackCommand {
 
 func (c SlackCommand) ShouldExecute() bool {
 	switch c.Kind {
-	case SlackCommandStatus, SlackCommandAsk, SlackCommandCancel:
+	case SlackCommandStatus, SlackCommandAsk, SlackCommandClose:
 		return true
 	default:
 		return false
@@ -85,7 +85,7 @@ func (c SlackCommand) ACPXPrompt() string {
 		return "status"
 	case SlackCommandAsk:
 		return strings.TrimSpace(c.Prompt)
-	case SlackCommandCancel:
+	case SlackCommandClose:
 		return "cancel"
 	default:
 		return ""
@@ -95,10 +95,10 @@ func (c SlackCommand) ACPXPrompt() string {
 func SlackCommandHelpText(surface SlackCommandSurface) string {
 	switch surface {
 	case SlackCommandSurfaceSlash:
-		return "Supported commands: `help`, `status`, `ask <prompt>`, and `cancel`. Usage: `/spexus help`, `/spexus status`, `/spexus ask <prompt>`, or `/spexus cancel`."
+		return "Supported commands: `help`, `status`, `ask <prompt>`, and `close`. Usage: `/spexus help`, `/spexus status`, `/spexus ask <prompt>`, or `/spexus close`."
 	default:
 		return fmt.Sprintf(
-			"Supported commands: `help`, `status`, `ask <prompt>`, and `cancel`. Usage: mention the agent with one of those commands, for example `%s`.",
+			"Supported commands: `help`, `status`, `ask <prompt>`, and `close`. Usage: mention the agent with one of those commands, for example `%s`.",
 			"<@agent> ask summarize current project state",
 		)
 	}
