@@ -59,7 +59,7 @@ func TestInvocationFromSocketModeEnvelopeNormalizesSlashCommand(t *testing.T) {
 	if !ok {
 		t.Fatalf("invocationFromSocketModeEnvelope() ok = false, want true")
 	}
-	if invocation.SourceType != InboundSourceSlash || invocation.DeliveryID != "3-fwdc2" || invocation.AckEnvelopeID != "3-fwdc2" {
+	if invocation.SourceType != InboundSourceSlash || invocation.DeliveryID != "3-fwdc2" || invocation.AckEnvelopeID != "3-fwdc2" || !invocation.Acked {
 		t.Fatalf("invocation = %#v, want normalized slash inbound invocation", invocation)
 	}
 }

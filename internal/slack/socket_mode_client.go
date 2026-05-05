@@ -427,6 +427,7 @@ func invocationFromSocketModeEnvelope(envelope socketModeEnvelope) (InboundInvoc
 		if err != nil {
 			return InboundInvocation{}, false, err
 		}
+		invocation.Acked = true
 		return invocation, true, nil
 	default:
 		return InboundInvocation{}, false, nil
