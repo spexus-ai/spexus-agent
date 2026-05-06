@@ -637,15 +637,15 @@ func TestOpenMigratesExecutionsSessionKeyColumn(t *testing.T) {
 		}
 	}()
 
-	loaded, err := store.Runtime().LoadExecution(ctx, "exec-legacy")
+	loaded, err := store.Runtime().LoadExecutionState(ctx, "exec-legacy")
 	if err != nil {
-		t.Fatalf("LoadExecution() error = %v", err)
+		t.Fatalf("LoadExecutionState() error = %v", err)
 	}
-	if loaded.SessionKey != "slack-1713686400.000100" {
-		t.Fatalf("LoadExecution() session key = %q, want derived session key", loaded.SessionKey)
+	if loaded.SessionName != "slack-1713686400.000100" {
+		t.Fatalf("LoadExecutionState() session name = %q, want derived session name", loaded.SessionName)
 	}
-	if loaded.Status != runtimemodel.ExecutionStateRunning {
-		t.Fatalf("LoadExecution() status = %q, want %q", loaded.Status, runtimemodel.ExecutionStateRunning)
+	if loaded.Status != runtimemodel.ExecutionStatusRunning {
+		t.Fatalf("LoadExecutionState() status = %q, want %q", loaded.Status, runtimemodel.ExecutionStatusRunning)
 	}
 }
 
@@ -746,21 +746,21 @@ func TestOpenMigratesLegacyExecutionsSessionNameSchema(t *testing.T) {
 		}
 	}()
 
-	loaded, err := store.Runtime().LoadExecution(ctx, "exec-legacy-v0")
+	loaded, err := store.Runtime().LoadExecutionState(ctx, "exec-legacy-v0")
 	if err != nil {
-		t.Fatalf("LoadExecution() error = %v", err)
+		t.Fatalf("LoadExecutionState() error = %v", err)
 	}
-	if loaded.SessionKey != "slack-1713686400.000100" {
-		t.Fatalf("LoadExecution() session key = %q, want migrated session key", loaded.SessionKey)
+	if loaded.SessionName != "slack-1713686400.000100" {
+		t.Fatalf("LoadExecutionState() session name = %q, want migrated session name", loaded.SessionName)
 	}
-	if loaded.CreatedAt.IsZero() {
-		t.Fatalf("LoadExecution() createdAt is zero, want queued_at migrated")
+	if loaded.QueuedAt.IsZero() {
+		t.Fatalf("LoadExecutionState() queuedAt is zero, want queued_at migrated")
 	}
-	if loaded.DiagnosticContext != "ack window expired" {
-		t.Fatalf("LoadExecution() diagnostic context = %q, want last_error migrated", loaded.DiagnosticContext)
+	if loaded.LastError != "ack window expired" {
+		t.Fatalf("LoadExecutionState() last error = %q, want last_error migrated", loaded.LastError)
 	}
-	if loaded.Status != runtimemodel.ExecutionStateFailed {
-		t.Fatalf("LoadExecution() status = %q, want %q", loaded.Status, runtimemodel.ExecutionStateFailed)
+	if loaded.Status != runtimemodel.ExecutionStatusFailed {
+		t.Fatalf("LoadExecutionState() status = %q, want %q", loaded.Status, runtimemodel.ExecutionStatusFailed)
 	}
 }
 

@@ -708,41 +708,35 @@ func TestRuntimeStartRecoversStaleNonTerminalExecutions(t *testing.T) {
 		t.Fatalf("SaveThreadLock() error = %v", err)
 	}
 
-	if err := store.Runtime().CreateExecution(ctx, runtimemodel.ExecutionRequest{
+	startedAt := lockTime.Add(-30 * time.Second)
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
 		ExecutionID: "exec-stale-running",
 		SourceType:  "message",
 		DeliveryID:  "Ev-stale-running",
-		ChannelID:   project.SlackChannelID,
 		ProjectName: project.Name,
-		SessionKey:  "slack-1713686400.000500",
+		ChannelID:   project.SlackChannelID,
 		ThreadTS:    threadTS,
-		CommandText: "stale running execution",
-		CreatedAt:   lockTime.Add(-time.Minute),
-	}); err != nil {
-		t.Fatalf("CreateExecution(running) error = %v", err)
-	}
-	startedAt := lockTime.Add(-30 * time.Second)
-	if err := store.Runtime().UpdateExecutionState(ctx, runtimemodel.ExecutionState{
-		ExecutionID: "exec-stale-running",
-		Status:      runtimemodel.ExecutionStateRunning,
+		SessionName: "slack-1713686400.000500",
+		Status:      runtimemodel.ExecutionStatusRunning,
+		QueuedAt:    lockTime.Add(-time.Minute),
 		StartedAt:   &startedAt,
 		UpdatedAt:   startedAt,
 	}); err != nil {
-		t.Fatalf("UpdateExecutionState(running) error = %v", err)
+		t.Fatalf("SaveExecutionState(running) error = %v", err)
 	}
 
-	if err := store.Runtime().CreateExecution(ctx, runtimemodel.ExecutionRequest{
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
 		ExecutionID: "exec-stale-queued",
 		SourceType:  "message",
 		DeliveryID:  "Ev-stale-queued",
-		ChannelID:   project.SlackChannelID,
 		ProjectName: project.Name,
-		SessionKey:  "slack-1713686400.000500",
+		ChannelID:   project.SlackChannelID,
 		ThreadTS:    threadTS,
-		CommandText: "stale queued execution",
-		CreatedAt:   lockTime.Add(-45 * time.Second),
+		SessionName: "slack-1713686400.000500",
+		Status:      runtimemodel.ExecutionStatusQueued,
+		QueuedAt:    lockTime.Add(-45 * time.Second),
 	}); err != nil {
-		t.Fatalf("CreateExecution(queued) error = %v", err)
+		t.Fatalf("SaveExecutionState(queued) error = %v", err)
 	}
 
 	handler := &runtimeCommandHandler{
@@ -758,32 +752,32 @@ func TestRuntimeStartRecoversStaleNonTerminalExecutions(t *testing.T) {
 		t.Fatalf("snapshot status = %#v, want running and healthy", snapshot.status)
 	}
 
-	runningExecution, err := store.Runtime().LoadExecution(ctx, "exec-stale-running")
+	runningExecution, err := store.Runtime().LoadExecutionState(ctx, "exec-stale-running")
 	if err != nil {
-		t.Fatalf("LoadExecution(exec-stale-running) error = %v", err)
+		t.Fatalf("LoadExecutionState(exec-stale-running) error = %v", err)
 	}
-	if runningExecution.Status != runtimemodel.ExecutionStateFailed {
+	if runningExecution.Status != runtimemodel.ExecutionStatusFailed {
 		t.Fatalf("running execution status = %q, want failed", runningExecution.Status)
 	}
 	if runningExecution.CompletedAt == nil {
 		t.Fatalf("running execution completed_at = nil, want terminal timestamp")
 	}
-	if runningExecution.DiagnosticContext != "startup recovery: execution interrupted by runtime restart" {
-		t.Fatalf("running execution diagnostic context = %q, want startup recovery detail", runningExecution.DiagnosticContext)
+	if runningExecution.LastError != runtimemodel.StartupRecoveryFailureReason {
+		t.Fatalf("running execution last error = %q, want startup recovery detail", runningExecution.LastError)
 	}
 
-	queuedExecution, err := store.Runtime().LoadExecution(ctx, "exec-stale-queued")
+	queuedExecution, err := store.Runtime().LoadExecutionState(ctx, "exec-stale-queued")
 	if err != nil {
-		t.Fatalf("LoadExecution(exec-stale-queued) error = %v", err)
+		t.Fatalf("LoadExecutionState(exec-stale-queued) error = %v", err)
 	}
-	if queuedExecution.Status != runtimemodel.ExecutionStateFailed {
+	if queuedExecution.Status != runtimemodel.ExecutionStatusFailed {
 		t.Fatalf("queued execution status = %q, want failed", queuedExecution.Status)
 	}
 	if queuedExecution.CompletedAt == nil {
 		t.Fatalf("queued execution completed_at = nil, want terminal timestamp")
 	}
-	if queuedExecution.DiagnosticContext != "startup recovery: previous runtime stopped before execution reached a terminal state" {
-		t.Fatalf("queued execution diagnostic context = %q, want startup recovery detail", queuedExecution.DiagnosticContext)
+	if queuedExecution.LastError != runtimemodel.StartupRecoveryFailureReason {
+		t.Fatalf("queued execution last error = %q, want startup recovery detail", queuedExecution.LastError)
 	}
 
 	state, err := store.Runtime().LoadThreadState(ctx, threadTS)
@@ -3060,7 +3054,7 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 					ChannelID:   project.SlackChannelID,
 					ThreadTS:    "1713686400.000100",
 					UserID:      "U123",
-					CommandText: "<@Ubot> ask status",
+					CommandText: "<@Ubot> status",
 				},
 				{
 					SourceType:  slack.InboundSourceMention,
@@ -3068,7 +3062,7 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 					ChannelID:   project.SlackChannelID,
 					ThreadTS:    "1713686400.000100",
 					UserID:      "U123",
-					CommandText: "<@Ubot> ask status",
+					CommandText: "<@Ubot> status",
 				},
 			},
 		},
@@ -3121,39 +3115,18 @@ func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 	if dedupe.Status != "processed" || dedupe.ProcessedAt == nil {
 		t.Fatalf("LoadEventDedupe() = %#v, want processed mention delivery", dedupe)
 	}
-	executions, err := store.Runtime().ListExecutions(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("ListExecutions() error = %v", err)
-	}
-	if got := len(executions); got != 0 {
-		t.Fatalf("execution count = %d, want no ACPX execution records for local mention status", got)
-	}
-
-	executionState, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "mention", "Ev126")
-	if err != nil {
-		t.Fatalf("LoadExecutionStateByDelivery() error = %v", err)
-	}
-	if executionState.ExecutionID != "mention:Ev126" || executionState.Status != runtimemodel.ExecutionStatusProcessed {
-		t.Fatalf("LoadExecutionStateByDelivery() = %#v, want processed mention execution", executionState)
-	}
-	if executionState.ThreadTS != "1713686400.000100" || executionState.SessionName != "slack-1713686400.000100" {
-		t.Fatalf("LoadExecutionStateByDelivery() thread/session = (%q, %q), want mention thread/session", executionState.ThreadTS, executionState.SessionName)
-	}
-	if executionState.QueuedAt.IsZero() || executionState.StartedAt == nil || executionState.RenderingStartedAt == nil || executionState.CompletedAt == nil {
-		t.Fatalf("LoadExecutionStateByDelivery() timestamps = %#v, want queued/running/rendering/completed markers", executionState)
-	}
-	if executionState.PublisherCheckpointKind != string(runtimemodel.ACPXEventSessionDone) {
-		t.Fatalf("LoadExecutionStateByDelivery() checkpoint kind = %q, want %q", executionState.PublisherCheckpointKind, runtimemodel.ACPXEventSessionDone)
+	if _, err := store.Runtime().LoadExecutionStateByDelivery(context.Background(), "mention", "Ev126"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("LoadExecutionStateByDelivery() error = %v, want not found", err)
 	}
 
 	debugMu.Lock()
 	output := debug.String()
 	debugMu.Unlock()
 	for _, fragment := range []string{
-		"runtime.loop: lifecycle event=execution_enqueued source=mention delivery_id=Ev126 channel_id=C123 project=alpha status=queued session=slack-1713686400.000100",
 		"runtime.loop: lifecycle event=execution_started source=mention delivery_id=Ev126 channel_id=C123 project=alpha status=processing",
 		"runtime.loop: lifecycle event=execution_completed source=mention delivery_id=Ev126 channel_id=C123 project=alpha status=processed",
 		"runtime.loop: lifecycle event=duplicate_skipped source=mention delivery_id=Ev126 channel_id=C123 project=alpha status=duplicate",
+		"runtime.loop: local mention processed delivery=Ev126 session=slack-1713686400.000100 command=status",
 	} {
 		if !strings.Contains(output, fragment) {
 			t.Fatalf("debug output missing %q: %s", fragment, output)
@@ -4012,15 +3985,15 @@ func TestRuntimeCancelCancelsActiveThreadWithoutCorruptingMapping(t *testing.T) 
 	if loadedExecutionState.LastError != "cancelled by operator" {
 		t.Fatalf("LoadExecutionStateByDelivery() last error = %q, want cancellation reason", loadedExecutionState.LastError)
 	}
-	execution, err := store.Runtime().LoadExecution(ctx, "mention:Ev123")
+	execution, err := store.Runtime().LoadExecutionState(ctx, "mention:Ev123")
 	if err != nil {
-		t.Fatalf("LoadExecution() error = %v", err)
+		t.Fatalf("LoadExecutionState() error = %v", err)
 	}
 	if execution.CompletedAt == nil {
 		t.Fatalf("execution completed_at = nil, want terminal timestamp")
 	}
-	if execution.DiagnosticContext != "cancelled by operator" {
-		t.Fatalf("execution diagnostic context = %q, want cancelled by operator", execution.DiagnosticContext)
+	if execution.LastError != "cancelled by operator" {
+		t.Fatalf("execution last error = %q, want cancelled by operator", execution.LastError)
 	}
 }
 
@@ -4082,27 +4055,21 @@ func TestRuntimeCancelCancelsRunningExecutionWhenThreadSummaryIsQueued(t *testin
 	}); err != nil {
 		t.Fatalf("SaveThreadLock() error = %v", err)
 	}
-	if err := store.Runtime().CreateExecution(ctx, runtimemodel.ExecutionRequest{
+	startedAt := lockedAt.Add(-30 * time.Second)
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
 		ExecutionID: "exec-cancel-queued-summary",
 		SourceType:  "message",
 		DeliveryID:  "Ev-running-before-queued",
-		ChannelID:   state.ChannelID,
 		ProjectName: state.ProjectName,
-		SessionKey:  state.SessionName,
+		ChannelID:   state.ChannelID,
 		ThreadTS:    threadTS,
-		CommandText: "long running prompt",
-		CreatedAt:   lockedAt.Add(-time.Minute),
-	}); err != nil {
-		t.Fatalf("CreateExecution() error = %v", err)
-	}
-	startedAt := lockedAt.Add(-30 * time.Second)
-	if err := store.Runtime().UpdateExecutionState(ctx, runtimemodel.ExecutionState{
-		ExecutionID: "exec-cancel-queued-summary",
-		Status:      runtimemodel.ExecutionStateRunning,
+		SessionName: state.SessionName,
+		Status:      runtimemodel.ExecutionStatusRunning,
+		QueuedAt:    lockedAt.Add(-time.Minute),
 		StartedAt:   &startedAt,
 		UpdatedAt:   startedAt,
 	}); err != nil {
-		t.Fatalf("UpdateExecutionState(running) error = %v", err)
+		t.Fatalf("SaveExecutionState() error = %v", err)
 	}
 
 	var out bytes.Buffer
@@ -4128,11 +4095,11 @@ func TestRuntimeCancelCancelsRunningExecutionWhenThreadSummaryIsQueued(t *testin
 		t.Fatalf("Cancel() calls = %#v, want one call for %s", cancelAdapter.cancelCalls, threadTS)
 	}
 
-	execution, err := store.Runtime().LoadExecution(ctx, "exec-cancel-queued-summary")
+	execution, err := store.Runtime().LoadExecutionState(ctx, "exec-cancel-queued-summary")
 	if err != nil {
-		t.Fatalf("LoadExecution() error = %v", err)
+		t.Fatalf("LoadExecutionState() error = %v", err)
 	}
-	if execution.Status != runtimemodel.ExecutionStateCancelled {
+	if execution.Status != runtimemodel.ExecutionStatusCancelled {
 		t.Fatalf("execution status = %q, want cancelled", execution.Status)
 	}
 
@@ -4148,8 +4115,8 @@ func TestRuntimeCancelCancelsRunningExecutionWhenThreadSummaryIsQueued(t *testin
 	}
 }
 
-// Test: threaded app_mention cancel bypasses the prompt queue, calls local runtime cancel, and posts the cancel result back to Slack.
-// Validates: thread mention cancel uses the local runtime cancel surface instead of ACPX prompt routing
+// Test: threaded app_mention close still routes through the local cancel surface after startup recovery has already reconciled stale running work.
+// Validates: thread mention close uses the local runtime cancel surface instead of ACPX prompt routing, and reports a no-op when startup recovery already marked the thread inactive
 func TestForegroundRuntimeStarterCancelsActiveThreadFromMentionCommand(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -4211,27 +4178,21 @@ func TestForegroundRuntimeStarterCancelsActiveThreadFromMentionCommand(t *testin
 	}); err != nil {
 		t.Fatalf("SaveThreadLock() error = %v", err)
 	}
-	if err := store.Runtime().CreateExecution(ctx, runtimemodel.ExecutionRequest{
+	startedAt := lockedAt.Add(-30 * time.Second)
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
 		ExecutionID: "exec-mention-cancel-1",
 		SourceType:  "message",
 		DeliveryID:  state.LastRequestID,
-		ChannelID:   state.ChannelID,
 		ProjectName: state.ProjectName,
-		SessionKey:  state.SessionName,
+		ChannelID:   state.ChannelID,
 		ThreadTS:    threadTS,
-		CommandText: "long running prompt",
-		CreatedAt:   lockedAt.Add(-time.Minute),
-	}); err != nil {
-		t.Fatalf("CreateExecution() error = %v", err)
-	}
-	startedAt := lockedAt.Add(-30 * time.Second)
-	if err := store.Runtime().UpdateExecutionState(ctx, runtimemodel.ExecutionState{
-		ExecutionID: "exec-mention-cancel-1",
-		Status:      runtimemodel.ExecutionStateRunning,
+		SessionName: state.SessionName,
+		Status:      runtimemodel.ExecutionStatusRunning,
+		QueuedAt:    lockedAt.Add(-time.Minute),
 		StartedAt:   &startedAt,
 		UpdatedAt:   startedAt,
 	}); err != nil {
-		t.Fatalf("UpdateExecutionState(running) error = %v", err)
+		t.Fatalf("SaveExecutionState() error = %v", err)
 	}
 
 	client := &recordingSlackClient{}
@@ -4246,7 +4207,7 @@ func TestForegroundRuntimeStarterCancelsActiveThreadFromMentionCommand(t *testin
 					ChannelID:   project.SlackChannelID,
 					ThreadTS:    threadTS,
 					UserID:      "U123",
-					CommandText: "<@Ubot> cancel",
+					CommandText: "<@Ubot> close",
 				},
 			},
 		},
@@ -4265,33 +4226,41 @@ func TestForegroundRuntimeStarterCancelsActiveThreadFromMentionCommand(t *testin
 		errCh <- starter.Start(ctx, runtimemodel.Status{})
 	}()
 
-	waitForCondition(t, time.Second, func() bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
 		messages := client.snapshotMessages()
-		return len(messages) == 1 && messages[0].Text == "active ACPX execution cancelled"
-	})
+		if len(messages) == 2 &&
+			messages[0].Text == "Session error: execution was interrupted by a runtime restart and marked failed during startup recovery" &&
+			messages[1].Text == "thread is inactive" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	cancel()
 
 	if err := <-errCh; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Start() error = %v, want context canceled", err)
 	}
-	if len(cancelAdapter.cancelCalls) != 1 || cancelAdapter.cancelCalls[0] != threadTS {
-		t.Fatalf("Cancel() calls = %#v, want one cancel call for %s", cancelAdapter.cancelCalls, threadTS)
+	if messages := client.snapshotMessages(); len(messages) != 2 ||
+		messages[0].Text != "Session error: execution was interrupted by a runtime restart and marked failed during startup recovery" ||
+		messages[1].Text != "thread is inactive" {
+		t.Fatalf("slack messages = %#v, debug=%s", messages, debug.String())
 	}
-	if len(client.snapshotMessages()) != 1 {
-		t.Fatalf("slack messages = %#v, want one cancel response", client.snapshotMessages())
+	if len(cancelAdapter.cancelCalls) != 0 {
+		t.Fatalf("Cancel() calls = %#v, want no ACPX cancel after startup recovery", cancelAdapter.cancelCalls)
 	}
 	verifyCtx := context.Background()
-	execution, err := store.Runtime().LoadExecution(verifyCtx, "exec-mention-cancel-1")
+	execution, err := store.Runtime().LoadExecutionState(verifyCtx, "exec-mention-cancel-1")
 	if err != nil {
-		t.Fatalf("LoadExecution() error = %v", err)
+		t.Fatalf("LoadExecutionState() error = %v", err)
 	}
-	if execution.Status != runtimemodel.ExecutionStateCancelled {
-		t.Fatalf("execution status = %q, want cancelled", execution.Status)
+	if execution.Status != runtimemodel.ExecutionStatusFailed {
+		t.Fatalf("execution status = %q, want failed after startup recovery", execution.Status)
 	}
 	if _, err := store.Runtime().LoadThreadLock(verifyCtx, threadTS); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("LoadThreadLock() error = %v, want not found", err)
 	}
-	if !strings.Contains(debug.String(), "rendered mention cancel thread=1713686400.000100 session=slack-1713686400.000100 result=cancelled") {
+	if !strings.Contains(debug.String(), "rendered mention cancel thread=1713686400.000100 session=slack-1713686400.000100 result=no-op") {
 		t.Fatalf("debug output missing mention cancel trace: %s", debug.String())
 	}
 }
@@ -4354,27 +4323,21 @@ func TestRuntimeCancelRoutesRunningExecutionByExecutionID(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("SaveThreadLock() error = %v", err)
 	}
-	if err := store.Runtime().CreateExecution(ctx, runtimemodel.ExecutionRequest{
+	startedAt := lockedAt.Add(-30 * time.Second)
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
 		ExecutionID: "exec-cancel-by-id",
 		SourceType:  "message",
 		DeliveryID:  state.LastRequestID,
-		ChannelID:   state.ChannelID,
 		ProjectName: state.ProjectName,
-		SessionKey:  state.SessionName,
+		ChannelID:   state.ChannelID,
 		ThreadTS:    threadTS,
-		CommandText: "cancel via execution id",
-		CreatedAt:   lockedAt.Add(-time.Minute),
-	}); err != nil {
-		t.Fatalf("CreateExecution() error = %v", err)
-	}
-	startedAt := lockedAt.Add(-30 * time.Second)
-	if err := store.Runtime().UpdateExecutionState(ctx, runtimemodel.ExecutionState{
-		ExecutionID: "exec-cancel-by-id",
-		Status:      runtimemodel.ExecutionStateRunning,
+		SessionName: state.SessionName,
+		Status:      runtimemodel.ExecutionStatusRunning,
+		QueuedAt:    lockedAt.Add(-time.Minute),
 		StartedAt:   &startedAt,
 		UpdatedAt:   startedAt,
 	}); err != nil {
-		t.Fatalf("UpdateExecutionState(running) error = %v", err)
+		t.Fatalf("SaveExecutionState() error = %v", err)
 	}
 
 	var out bytes.Buffer
@@ -4406,18 +4369,18 @@ func TestRuntimeCancelRoutesRunningExecutionByExecutionID(t *testing.T) {
 		t.Fatalf("Cancel() calls = %#v, want one call for %s", cancelAdapter.cancelCalls, threadTS)
 	}
 
-	execution, err := store.Runtime().LoadExecution(ctx, "exec-cancel-by-id")
+	execution, err := store.Runtime().LoadExecutionState(ctx, "exec-cancel-by-id")
 	if err != nil {
-		t.Fatalf("LoadExecution() error = %v", err)
+		t.Fatalf("LoadExecutionState() error = %v", err)
 	}
-	if execution.Status != runtimemodel.ExecutionStateCancelled {
+	if execution.Status != runtimemodel.ExecutionStatusCancelled {
 		t.Fatalf("execution status = %q, want cancelled", execution.Status)
 	}
 	if execution.CompletedAt == nil {
 		t.Fatalf("execution completed_at = nil, want terminal timestamp")
 	}
-	if execution.DiagnosticContext != "cancelled by operator" {
-		t.Fatalf("execution diagnostic context = %q, want cancelled by operator", execution.DiagnosticContext)
+	if execution.LastError != "cancelled by operator" {
+		t.Fatalf("execution last error = %q, want cancelled by operator", execution.LastError)
 	}
 	if _, err := store.Runtime().LoadThreadLock(ctx, threadTS); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("LoadThreadLock() error = %v, want not found", err)
@@ -4481,6 +4444,22 @@ func TestRuntimeCancelPreservesStateOnAdapterError(t *testing.T) {
 		LeaseExpiresAt: &lockExpires,
 	}); err != nil {
 		t.Fatalf("SaveThreadLock() error = %v", err)
+	}
+	startedAt := lockedAt.Add(-30 * time.Second)
+	if err := store.Runtime().SaveExecutionState(ctx, runtimemodel.ExecutionState{
+		ExecutionID: "mention:Ev123",
+		SourceType:  "mention",
+		DeliveryID:  state.LastRequestID,
+		ProjectName: state.ProjectName,
+		ChannelID:   state.ChannelID,
+		ThreadTS:    threadTS,
+		SessionName: state.SessionName,
+		Status:      runtimemodel.ExecutionStatusRunning,
+		QueuedAt:    lockedAt.Add(-time.Minute),
+		StartedAt:   &startedAt,
+		UpdatedAt:   startedAt,
+	}); err != nil {
+		t.Fatalf("SaveExecutionState() error = %v", err)
 	}
 
 	var out bytes.Buffer
