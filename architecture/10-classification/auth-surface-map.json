@@ -1,0 +1,42 @@
+{
+  "surfaces": [
+    {
+      "id": "surface.slack-runtime-auth",
+      "surface_type": "backend",
+      "identity_provider": "ext.slack-platform",
+      "flow_type": "bot_token_plus_app_token",
+      "token_validation": "slack_managed",
+      "enforcement_points": [
+        {
+          "type": "config_gate",
+          "mechanism": "runtime start requires configured bot/app tokens and workspace id",
+          "evidence": [
+            {
+              "path": "internal/config/config.go",
+              "kind": "config_model",
+              "snippet": "type SlackAuth struct { BotToken string; AppToken string; WorkspaceID string }",
+              "confidence": "high",
+              "verified": true
+            }
+          ]
+        }
+      ],
+      "claims_used": [],
+      "gateway_features": {
+        "auth": true,
+        "auth_strict": true,
+        "api_key": false
+      },
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "HOWTO.md",
+          "kind": "operator_doc",
+          "snippet": "Spexus Agent requires a Slack app with both bot and app-level credentials.",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    }
+  ]
+}

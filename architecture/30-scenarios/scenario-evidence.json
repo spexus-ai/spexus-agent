@@ -1,0 +1,24 @@
+{
+  "evidence": [
+    {
+      "scenario_id": "scenario.import-local-project",
+      "paths": ["internal/cli/project_handler.go","internal/slack/http_client.go","internal/storage/storage.go"]
+    },
+    {
+      "scenario_id": "scenario.start-runtime",
+      "paths": ["internal/cli/runtime_handler.go","internal/slack/socket_mode_client.go","internal/config/config.go"]
+    },
+    {
+      "scenario_id": "scenario.mention-ask",
+      "paths": ["internal/cli/runtime_handler.go","internal/runtime/slack_ingestion.go","internal/acpxadapter/cli_adapter.go","internal/runtime/slack_renderer.go"]
+    },
+    {
+      "scenario_id": "scenario.thread-reply-prompt",
+      "paths": ["internal/cli/runtime_handler.go","internal/runtime/slack_ingestion.go","internal/runtime/execution_guard.go"]
+    },
+    {
+      "scenario_id": "scenario.slash-status",
+      "paths": ["internal/cli/runtime_handler.go","internal/slack/http_client.go"]
+    }
+  ]
+}

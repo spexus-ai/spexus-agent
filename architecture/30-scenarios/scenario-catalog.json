@@ -1,0 +1,39 @@
+{
+  "scenarios": [
+    {
+      "id": "scenario.import-local-project",
+      "title": "Import local repository and provision Slack channel",
+      "type": "system",
+      "source": "cli",
+      "involved_entities": ["product-requirements-agent","ext.slack-platform","db.local-sqlite"]
+    },
+    {
+      "id": "scenario.start-runtime",
+      "title": "Start foreground runtime and connect to Slack Socket Mode",
+      "type": "system",
+      "source": "cli",
+      "involved_entities": ["product-requirements-agent","ext.slack-platform","db.local-sqlite","storage.user-config-home"]
+    },
+    {
+      "id": "scenario.mention-ask",
+      "title": "Handle threaded mention ask command",
+      "type": "business",
+      "source": "slack_mention",
+      "involved_entities": ["product-requirements-agent","ext.slack-platform","ext.acpx-cli","db.local-sqlite"]
+    },
+    {
+      "id": "scenario.thread-reply-prompt",
+      "title": "Treat plain thread reply as next ACPX prompt",
+      "type": "business",
+      "source": "slack_message",
+      "involved_entities": ["product-requirements-agent","ext.slack-platform","ext.acpx-cli","db.local-sqlite"]
+    },
+    {
+      "id": "scenario.slash-status",
+      "title": "Acknowledge slash status and return channel-scoped execution result",
+      "type": "business",
+      "source": "slack_slash",
+      "involved_entities": ["product-requirements-agent","ext.slack-platform","ext.acpx-cli"]
+    }
+  ]
+}

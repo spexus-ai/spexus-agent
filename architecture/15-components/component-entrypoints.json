@@ -1,0 +1,29 @@
+{
+  "entrypoints": [
+    {
+      "id": "cli.root",
+      "component_id": "product-requirements-agent.component.cli-command-router",
+      "source": "cmd/spexus-agent/main.go"
+    },
+    {
+      "id": "cli.runtime.start",
+      "component_id": "product-requirements-agent.component.runtime-startup-orchestrator",
+      "source": "internal/cli/runtime_handler.go"
+    },
+    {
+      "id": "slack.socket_mode.events",
+      "component_id": "product-requirements-agent.component.slack-socket-transport",
+      "source": "internal/slack/socket_mode_client.go"
+    },
+    {
+      "id": "slack.socket_mode.slash_commands",
+      "component_id": "product-requirements-agent.component.slack-socket-transport",
+      "source": "internal/slack/socket_mode_client.go"
+    },
+    {
+      "id": "runtime.prepare_mention",
+      "component_id": "product-requirements-agent.component.invocation-preparer",
+      "source": "internal/runtime/slack_ingestion.go"
+    }
+  ]
+}

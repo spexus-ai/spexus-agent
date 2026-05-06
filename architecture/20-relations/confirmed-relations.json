@@ -1,0 +1,72 @@
+{
+  "relations": [
+    {
+      "id": "product-requirements-agent--socket_mode-->ext.slack-platform",
+      "source_id": "product-requirements-agent",
+      "target_id": "ext.slack-platform",
+      "relation_type": "socket_mode",
+      "confidence": "high",
+      "component_source": "product-requirements-agent.component.slack-socket-transport",
+      "evidence": [
+        {
+          "path": "internal/slack/socket_mode_client.go",
+          "kind": "websocket_client",
+          "snippet": "apps.connections.open; DialContext(ctx, socketURL, nil)",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "product-requirements-agent--web_api-->ext.slack-platform",
+      "source_id": "product-requirements-agent",
+      "target_id": "ext.slack-platform",
+      "relation_type": "http_api",
+      "confidence": "high",
+      "component_source": "product-requirements-agent.component.slack-web-api-client",
+      "evidence": [
+        {
+          "path": "internal/slack/http_client.go",
+          "kind": "http_client",
+          "snippet": "chat.postMessage; chat.update; conversations.create",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "product-requirements-agent--subprocess-->ext.acpx-cli",
+      "source_id": "product-requirements-agent",
+      "target_id": "ext.acpx-cli",
+      "relation_type": "subprocess",
+      "confidence": "high",
+      "component_source": "product-requirements-agent.component.acpx-cli-adapter",
+      "evidence": [
+        {
+          "path": "internal/acpxadapter/cli_adapter.go",
+          "kind": "process_exec",
+          "snippet": "exec.CommandContext(ctx, binary, args...)",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "product-requirements-agent--sql-->db.local-sqlite",
+      "source_id": "product-requirements-agent",
+      "target_id": "db.local-sqlite",
+      "relation_type": "sql",
+      "confidence": "high",
+      "component_source": "product-requirements-agent.component.sqlite-store",
+      "evidence": [
+        {
+          "path": "internal/storage/storage.go",
+          "kind": "sqlite_bootstrap",
+          "snippet": "sql.Open(\"sqlite3\", storageDSN(path))",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    }
+  ]
+}

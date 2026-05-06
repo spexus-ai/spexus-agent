@@ -1,0 +1,11 @@
+views {
+  view overview {
+    title "C0 Overview"
+    include operator
+    include slack_users
+    include slack
+    include acpx
+    include agent
+    include sqlite_store
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "service_id": "product-requirements-agent",
+  "deployments": [
+    {
+      "id": "deploy.local-cli",
+      "runtime": "manual local process",
+      "artifacts": ["bin/spexus-agent"]
+    },
+    {
+      "id": "deploy.foreground-runtime",
+      "runtime": "foreground terminal process",
+      "artifacts": ["~/.config/spexus-agent/config.json","~/.config/spexus-agent/storage.sqlite3"]
+    },
+    {
+      "id": "deploy.user-systemd-service",
+      "runtime": "systemd --user",
+      "artifacts": ["~/.config/systemd/user/spexus-agent.service","~/.config/spexus-agent/runtime.env"]
+    }
+  ]
+}

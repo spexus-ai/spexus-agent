@@ -1,0 +1,12 @@
+{
+  "relations": [
+    {
+      "id": "product-requirements-agent--spexus_context-->ext.spexus-control-plane",
+      "source_id": "product-requirements-agent",
+      "target_id": "ext.spexus-control-plane",
+      "relation_type": "conceptual",
+      "status": "partial",
+      "reason": "repository naming and docs refer to Spexus-managed context, but no direct Spexus API or MCP synchronization surface is implemented in current code"
+    }
+  ]
+}

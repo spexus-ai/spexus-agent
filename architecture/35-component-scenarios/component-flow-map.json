@@ -1,0 +1,27 @@
+{
+  "flows": [
+    {
+      "id": "component-flow.mention-ask",
+      "steps": [
+        "product-requirements-agent.component.slack-socket-transport",
+        "product-requirements-agent.component.runtime-startup-orchestrator",
+        "product-requirements-agent.component.invocation-preparer",
+        "product-requirements-agent.component.turn-coordinator",
+        "product-requirements-agent.component.execution-manager",
+        "product-requirements-agent.component.acpx-cli-adapter",
+        "product-requirements-agent.component.slack-thread-renderer",
+        "product-requirements-agent.component.slack-web-api-client"
+      ]
+    },
+    {
+      "id": "component-flow.project-import",
+      "steps": [
+        "product-requirements-agent.component.cli-command-router",
+        "product-requirements-agent.component.project-registry-service",
+        "product-requirements-agent.component.config-manager",
+        "product-requirements-agent.component.slack-web-api-client",
+        "product-requirements-agent.component.sqlite-store"
+      ]
+    }
+  ]
+}

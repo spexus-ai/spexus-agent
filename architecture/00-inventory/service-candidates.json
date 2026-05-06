@@ -1,0 +1,38 @@
+{
+  "services": [
+    {
+      "id": "product-requirements-agent",
+      "name": "Spexus Agent",
+      "status": "confirmed",
+      "detected_stack": "GO",
+      "entry_points": [
+        "cmd/spexus-agent/main.go"
+      ],
+      "platform_markers": {
+        "has_http_contract": false,
+        "has_rpc_contract": false,
+        "has_event_bus": false,
+        "has_queues": false,
+        "has_crons": false,
+        "has_workers": false,
+        "has_slack_socket_mode": true
+      },
+      "evidence": [
+        {
+          "path": "cmd/spexus-agent/main.go",
+          "kind": "entrypoint",
+          "snippet": "os.Exit(cli.New().Run(os.Args[1:]))",
+          "confidence": "high",
+          "verified": true
+        },
+        {
+          "path": "internal/cli/runtime_handler.go",
+          "kind": "runtime_wiring",
+          "snippet": "source := slack.NewSocketModeClient(cfg.Slack.AppToken)",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    }
+  ]
+}

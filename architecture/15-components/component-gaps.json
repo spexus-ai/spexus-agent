@@ -1,0 +1,20 @@
+{
+  "gaps": [
+    {
+      "service_id": "product-requirements-agent",
+      "status": "partial",
+      "reason": "codesearch was unavailable, so component discovery relied on direct file evidence rather than semantic index traversal",
+      "missing_evidence": [
+        "semantic search over call sites and constructors"
+      ]
+    },
+    {
+      "service_id": "product-requirements-agent",
+      "status": "partial",
+      "reason": "config handler internals were not split into a separate C3 component because command-surface behavior is mostly wired through internal/cli and file store abstractions",
+      "missing_evidence": [
+        "dedicated runtime-only component boundary for config login/status/logout"
+      ]
+    }
+  ]
+}

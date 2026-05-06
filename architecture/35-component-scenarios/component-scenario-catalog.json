@@ -1,0 +1,14 @@
+{
+  "scenarios": [
+    {
+      "id": "component-scenario.mention-ask",
+      "service_id": "product-requirements-agent",
+      "title": "Mention ask component flow"
+    },
+    {
+      "id": "component-scenario.project-import",
+      "service_id": "product-requirements-agent",
+      "title": "Project import component flow"
+    }
+  ]
+}

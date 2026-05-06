@@ -1,0 +1,1 @@
+{"stage":"40","seq":1,"entity":"deploy.user-systemd-service","decision":"model user-level systemd as a confirmed deployment variant because Makefile writes the unit and environment file explicitly","evidence_used":["Makefile"],"alternatives":["treat systemd support as external operator concern only"],"confidence":"high"}

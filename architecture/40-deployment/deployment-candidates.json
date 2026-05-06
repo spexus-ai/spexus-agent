@@ -1,0 +1,49 @@
+{
+  "deployments": [
+    {
+      "id": "deploy.local-cli",
+      "type": "binary",
+      "title": "Local CLI Binary",
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "Makefile",
+          "kind": "build_rule",
+          "snippet": "go build -o $(BIN_PATH) ./cmd/$(APP_NAME)",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "deploy.foreground-runtime",
+      "type": "process",
+      "title": "Foreground Runtime Process",
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "HOWTO.md",
+          "kind": "operator_doc",
+          "snippet": "./bin/spexus-agent runtime start --debug",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "deploy.user-systemd-service",
+      "type": "service",
+      "title": "User-Level systemd Runtime",
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "Makefile",
+          "kind": "service_unit",
+          "snippet": "install-service ... ExecStart=$(INSTALL_PATH) runtime start",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    }
+  ]
+}

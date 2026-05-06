@@ -1,0 +1,19 @@
+{
+  "items": [
+    {
+      "id": "unresolved.codesearch",
+      "type": "tooling_gap",
+      "reason": "codesearch worked with an explicit local db/config path, but indexing remained blocked because the local bootstrap config used unsupported embedding provider \"noop\""
+    },
+    {
+      "id": "unresolved.likec4_validation",
+      "type": "model_validation_failure",
+      "reason": "likec4 validate executed successfully with writable HOME/XDG paths and reported duplicate element names plus invalid standalone view files"
+    },
+    {
+      "id": "unresolved.spexus_api_surface",
+      "type": "external_relation",
+      "reason": "current repository references Spexus context in naming/docs but no direct Spexus API client is implemented"
+    }
+  ]
+}

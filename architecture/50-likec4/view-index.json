@@ -1,0 +1,13 @@
+{
+  "views": [
+    "50-likec4/views/00-overview.c4",
+    "50-likec4/views/10-domains.c4",
+    "50-likec4/views/20-services.c4",
+    "50-likec4/views/25-event-topology.c4",
+    "50-likec4/views/30-dynamics.c4",
+    "50-likec4/views/40-deployment.c4",
+    "50-likec4/views/per-service/product-requirements-agent.c4",
+    "50-likec4/views/components/product-requirements-agent.c4",
+    "50-likec4/views/50-integration.c4"
+  ]
+}

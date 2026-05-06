@@ -1,0 +1,32 @@
+{
+  "services": [
+    {
+      "id": "product-requirements-agent",
+      "detected_stack": "GO",
+      "compact_mode": true,
+      "entry_points": [
+        "cmd/spexus-agent/main.go"
+      ],
+      "key_paths": [
+        "internal/cli",
+        "internal/config",
+        "internal/registry",
+        "internal/runtime",
+        "internal/slack",
+        "internal/storage",
+        "internal/acpxadapter",
+        "README.md",
+        "HOWTO.md",
+        "Makefile"
+      ],
+      "platform_markers": {
+        "go_mod": true,
+        "docker": false,
+        "helm": false,
+        "openapi": false,
+        "proto": false,
+        "systemd_helper": true
+      }
+    }
+  ]
+}

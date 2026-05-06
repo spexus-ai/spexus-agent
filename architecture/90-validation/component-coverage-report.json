@@ -1,0 +1,9 @@
+{
+  "service_id": "product-requirements-agent",
+  "component_candidates": 13,
+  "components_confirmed": 12,
+  "components_rejected": 1,
+  "component_views_generated": 1,
+  "status": "partial",
+  "reason": "component boundaries are strong enough for a useful C3 view, but semantic cross-checking via codesearch was unavailable"
+}

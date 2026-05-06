@@ -1,0 +1,21 @@
+{
+  "services": [
+    {
+      "service_id": "product-requirements-agent",
+      "language": "Go 1.22",
+      "libraries": [
+        "github.com/mattn/go-sqlite3",
+        "github.com/gorilla/websocket"
+      ],
+      "transports": [
+        "Slack Web API",
+        "Slack Socket Mode websocket",
+        "local process execution"
+      ],
+      "storage": [
+        "SQLite",
+        "local JSON config file"
+      ]
+    }
+  ]
+}

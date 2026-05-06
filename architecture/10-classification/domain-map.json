@@ -1,0 +1,16 @@
+{
+  "domains": [
+    {
+      "id": "domain.agent-control",
+      "title": "Agent Control",
+      "service_ids": ["product-requirements-agent"],
+      "subdomains": [
+        "config_and_project_registry",
+        "runtime_execution",
+        "slack_transport",
+        "acpx_integration",
+        "local_persistence"
+      ]
+    }
+  ]
+}

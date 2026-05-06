@@ -1,0 +1,9 @@
+{
+  "component_views": [
+    {
+      "service_id": "product-requirements-agent",
+      "path": "50-likec4/views/components/product-requirements-agent.c4",
+      "components_included": 11
+    }
+  ]
+}

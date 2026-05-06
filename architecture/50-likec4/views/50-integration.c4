@@ -1,0 +1,11 @@
+views {
+  view integration {
+    title "Integration View"
+    include agent
+    include slack
+    include acpx
+    include repos
+    include git_cli
+    include sqlite_store
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "databases": [
+    {
+      "id": "db.local-sqlite",
+      "owner_service_id": "product-requirements-agent",
+      "tables": [
+        "projects",
+        "events_dedupe",
+        "threads",
+        "thread_locks",
+        "executions"
+      ],
+      "evidence": [
+        {
+          "path": "internal/storage/storage.go",
+          "kind": "schema_bootstrap",
+          "snippet": "CREATE TABLE IF NOT EXISTS projects ... events_dedupe ... threads ... thread_locks ... executions",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+views {
+  view deployment {
+    title "Deployment Variants"
+    include agent
+    include systemd_user
+    include sqlite_store
+    include config_store
+  }
+}

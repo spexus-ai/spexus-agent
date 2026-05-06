@@ -1,0 +1,22 @@
+{
+  "evidence": [
+    {"id":"ev-001","path":"README.md","kind":"repo_doc","verified":true},
+    {"id":"ev-002","path":"HOWTO.md","kind":"operator_doc","verified":true},
+    {"id":"ev-003","path":"go.mod","kind":"module_manifest","verified":true},
+    {"id":"ev-004","path":"cmd/spexus-agent/main.go","kind":"entrypoint","verified":true},
+    {"id":"ev-005","path":"internal/cli/app.go","kind":"command_router","verified":true},
+    {"id":"ev-006","path":"internal/cli/runtime_handler.go","kind":"runtime_wiring","verified":true},
+    {"id":"ev-007","path":"internal/runtime/execution_guard.go","kind":"execution_coordination","verified":true},
+    {"id":"ev-008","path":"internal/runtime/execution_manager.go","kind":"admission_queue","verified":true},
+    {"id":"ev-009","path":"internal/runtime/slack_ingestion.go","kind":"ingestion_mapping","verified":true},
+    {"id":"ev-010","path":"internal/runtime/slack_renderer.go","kind":"output_rendering","verified":true},
+    {"id":"ev-011","path":"internal/slack/socket_mode_client.go","kind":"socket_transport","verified":true},
+    {"id":"ev-012","path":"internal/slack/http_client.go","kind":"slack_http_transport","verified":true},
+    {"id":"ev-013","path":"internal/acpxadapter/cli_adapter.go","kind":"external_execution_adapter","verified":true},
+    {"id":"ev-014","path":"internal/storage/storage.go","kind":"sqlite_persistence","verified":true},
+    {"id":"ev-015","path":"Makefile","kind":"deployment_helper","verified":true},
+    {"id":"ev-016","path":"internal/cli/project_handler.go","kind":"git_repository_import","verified":true},
+    {"id":"ev-017","path":"internal/cli/config_handler.go","kind":"config_command_handler","verified":true},
+    {"id":"ev-018","path":"internal/config/config.go","kind":"config_store","verified":true}
+  ]
+}

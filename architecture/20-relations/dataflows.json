@@ -1,0 +1,51 @@
+{
+  "flows": [
+    {
+      "id": "flow.project-import-local",
+      "type": "sync",
+      "steps": [
+        "cli.project.import-local",
+        "config-manager",
+        "slack-web-api-client",
+        "sqlite-store"
+      ]
+    },
+    {
+      "id": "flow.slack-mention-ask",
+      "type": "hybrid",
+      "steps": [
+        "slack-socket-transport",
+        "runtime-startup-orchestrator",
+        "invocation-preparer",
+        "turn-coordinator",
+        "execution-manager",
+        "acpx-cli-adapter",
+        "slack-thread-renderer",
+        "slack-web-api-client"
+      ]
+    },
+    {
+      "id": "flow.thread-reply-prompt",
+      "type": "hybrid",
+      "steps": [
+        "slack-socket-transport",
+        "runtime-startup-orchestrator",
+        "invocation-preparer",
+        "turn-coordinator",
+        "execution-manager",
+        "acpx-cli-adapter",
+        "slack-thread-renderer"
+      ]
+    },
+    {
+      "id": "flow.runtime-cancel",
+      "type": "sync",
+      "steps": [
+        "cli.runtime.cancel",
+        "sqlite-store",
+        "acpx-cli-adapter",
+        "slack-web-api-client"
+      ]
+    }
+  ]
+}

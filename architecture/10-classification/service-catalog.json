@@ -1,0 +1,32 @@
+{
+  "services": [
+    {
+      "id": "product-requirements-agent",
+      "type": "service",
+      "stack": "go",
+      "title": "Spexus Agent",
+      "status": "confirmed",
+      "service_shape": "single-binary",
+      "decomposition_style": "layered",
+      "platform_features": {
+        "has_http_contract": false,
+        "has_rpc_contract": false,
+        "has_event_bus": false,
+        "has_queues": false,
+        "has_crons": false,
+        "has_workers": false,
+        "has_slack_socket_mode": true,
+        "has_local_cli": true
+      },
+      "evidence": [
+        {
+          "path": "README.md",
+          "kind": "repo_doc",
+          "snippet": "Go-based command-line and foreground runtime bridge between Slack, ACPX, and Spexus-managed project context.",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    }
+  ]
+}

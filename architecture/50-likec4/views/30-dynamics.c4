@@ -1,0 +1,9 @@
+views {
+  view dynamics {
+    title "Runtime Scenario: Mention Ask"
+    include slack
+    include agent
+    include sqlite_store
+    include acpx
+  }
+}

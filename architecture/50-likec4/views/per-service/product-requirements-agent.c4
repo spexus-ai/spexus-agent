@@ -1,0 +1,11 @@
+views {
+  view per_service_product_requirements_agent {
+    title "C2 Per-Service View: Spexus Agent"
+    include agent
+    include slack
+    include acpx
+    include repos
+    include sqlite_store
+    include config_store
+  }
+}
