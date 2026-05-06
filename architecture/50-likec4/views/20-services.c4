@@ -1,0 +1,11 @@
+views {
+  view services {
+    title "C2 Service Topology"
+    include agent
+    include slack
+    include acpx
+    include repos
+    include sqlite_store
+    include config_store
+  }
+}

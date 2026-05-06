@@ -1,0 +1,11 @@
+// Validation pending: LikeC4 CLI was not available in the current environment.
+// This file is kept as a human-readable model draft aligned with the generated JSON inputs.
+specification {
+  element actor
+  element external_system
+  element service
+  element component
+  element database
+  element storage
+  element job
+}

@@ -1,0 +1,9 @@
+{
+  "crosscheck": [
+    {
+      "reference": "repository source files only",
+      "result": "completed",
+      "notes": "this rerun intentionally ignored previously generated docs and architecture outputs as evidence"
+    }
+  ]
+}

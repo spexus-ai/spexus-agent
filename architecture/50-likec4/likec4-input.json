@@ -1,0 +1,25 @@
+{
+  "actors": [
+    "actor.operator",
+    "actor.slack-users"
+  ],
+  "externals": [
+    "ext.slack-platform",
+    "ext.acpx-cli",
+    "ext.local-git-working-tree"
+  ],
+  "services": [
+    "product-requirements-agent"
+  ],
+  "infrastructure": [
+    "db.local-sqlite",
+    "storage.user-config-home",
+    "svc.user-systemd"
+  ],
+  "relations": [
+    "product-requirements-agent--socket_mode-->ext.slack-platform",
+    "product-requirements-agent--web_api-->ext.slack-platform",
+    "product-requirements-agent--subprocess-->ext.acpx-cli",
+    "product-requirements-agent--sql-->db.local-sqlite"
+  ]
+}

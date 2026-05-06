@@ -1,0 +1,25 @@
+{
+  "ownership": [
+    {
+      "resource_id": "db.local-sqlite",
+      "owner_service_id": "product-requirements-agent",
+      "access_patterns": [
+        "project registry",
+        "thread state",
+        "dedupe records",
+        "thread locks",
+        "executions",
+        "startup recovery mutations"
+      ]
+    },
+    {
+      "resource_id": "storage.user-config-home",
+      "owner_service_id": "product-requirements-agent",
+      "access_patterns": [
+        "global config",
+        "slack credentials",
+        "runtime options"
+      ]
+    }
+  ]
+}

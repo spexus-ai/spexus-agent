@@ -1,0 +1,6 @@
+model {
+  config_store = storage "User Config Home"
+  sqlite_store = database "SQLite Store"
+  systemd_user = job "systemd --user runtime service"
+  local_sqlite_db = database "Local SQLite File"
+}

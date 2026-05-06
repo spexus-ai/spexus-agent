@@ -1,0 +1,1 @@
+{"stage":"10","seq":1,"entity":"product-requirements-agent","decision":"classify as a single local service with Slack-facing runtime and local CLI entry surfaces","evidence_used":["README.md","internal/cli/app.go","internal/cli/runtime_handler.go"],"alternatives":["classify as pure CLI tool"],"confidence":"high"}

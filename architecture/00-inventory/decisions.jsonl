@@ -1,0 +1,1 @@
+{"stage":"01","seq":1,"entity":"product-requirements-agent","decision":"treat internal packages as component candidates within a single service rather than separate services","evidence_used":["internal/cli/app.go","internal/runtime/runtime.go","internal/storage/storage.go"],"alternatives":["split cli/runtime/storage into multiple services"],"confidence":"high"}

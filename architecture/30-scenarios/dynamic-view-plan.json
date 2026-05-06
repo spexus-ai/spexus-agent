@@ -1,0 +1,14 @@
+{
+  "dynamic_views": [
+    {
+      "id": "dynamic.mention-ask",
+      "scenario_id": "scenario.mention-ask",
+      "view_path": "50-likec4/views/30-dynamics.c4"
+    },
+    {
+      "id": "dynamic.thread-reply-prompt",
+      "scenario_id": "scenario.thread-reply-prompt",
+      "view_path": "50-likec4/views/30-dynamics.c4"
+    }
+  ]
+}

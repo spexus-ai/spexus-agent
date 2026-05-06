@@ -1,0 +1,10 @@
+{
+  "services_total": 1,
+  "services_confirmed": 1,
+  "services_partial": 0,
+  "relations_confirmed": 4,
+  "scenarios_documented": 5,
+  "deployment_variants_documented": 3,
+  "status": "partial",
+  "reason": "codesearch-based semantic scan and LikeC4 CLI validation were unavailable in the current environment"
+}

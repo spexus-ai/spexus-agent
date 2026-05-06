@@ -1,0 +1,6 @@
+views {
+  view event_topology {
+    title "Event Topology"
+    include agent
+  }
+}

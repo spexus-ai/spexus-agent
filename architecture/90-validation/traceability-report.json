@@ -1,0 +1,8 @@
+{
+  "traceability": [
+    {"artifact":"service-catalog","evidence_paths":["README.md","cmd/spexus-agent/main.go"]},
+    {"artifact":"component-catalog","evidence_paths":["internal/cli/runtime_handler.go","internal/runtime/execution_guard.go","internal/acpxadapter/cli_adapter.go","internal/storage/storage.go"]},
+    {"artifact":"relations","evidence_paths":["internal/slack/socket_mode_client.go","internal/slack/http_client.go","internal/acpxadapter/cli_adapter.go","internal/storage/storage.go"]},
+    {"artifact":"scenarios","evidence_paths":["README.md","HOWTO.md","internal/cli/project_handler.go","internal/cli/runtime_handler.go"]}
+  ]
+}

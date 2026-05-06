@@ -1,0 +1,13 @@
+{
+  "status": "SUCCESS",
+  "reason": "repository-grounded C0/C1/C2/C3 artifacts were generated successfully; LikeC4 validation passed and workspace-local codesearch indexing/search succeeded after repairing local tool configuration",
+  "services_analyzed": 1,
+  "services_confirmed": 1,
+  "confirmed_relations": 4,
+  "cross_repo_relations": 0,
+  "component_views": 1,
+  "open_questions_count": 3,
+  "warnings": [
+    "codesearch currently relies on repo-local Hugging Face cache environment variables in this sandboxed environment"
+  ]
+}

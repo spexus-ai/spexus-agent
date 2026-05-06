@@ -1,0 +1,13 @@
+model {
+  operator = actor "Operator / Developer"
+  slack_users = actor "Slack Users"
+  agent = service "Spexus Agent"
+
+  operator -> agent "configures and starts"
+  slack_users -> slack "mentions and thread replies"
+  slack -> agent "socket mode events and web api"
+  agent -> acpx "prompt/status/cancel"
+  agent -> repos "executes in project path"
+  agent -> config_store "reads config"
+  agent -> sqlite_store "persists runtime state"
+}

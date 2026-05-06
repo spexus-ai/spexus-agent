@@ -1,0 +1,39 @@
+{
+  "rerun_policy": {
+    "mode": "source_only_rebuild",
+    "ignored_paths_as_evidence": [
+      "docs/**",
+      "architecture/**"
+    ],
+    "reason": "previous derived context was rejected and the architecture was rebuilt from repository source files only"
+  },
+  "services": [
+    {
+      "name": "product-requirements-agent",
+      "clone_status": "success",
+      "clone_path": "/workspace/product-requirements-agent",
+      "codesearch_indexed": true,
+      "codesearch_chunks": 515,
+      "codesearch_status": "indexed via workspace-local db/config with repo-local huggingface cache",
+      "metadata_status": "derived_from_repo",
+      "owner": "unknown",
+      "runtime": "go",
+      "environments": [
+        "local-cli",
+        "foreground-runtime",
+        "user-systemd"
+      ],
+      "declared_dependencies": [
+        "ext.slack-platform",
+        "ext.acpx-cli",
+        "ext.git-cli",
+        "db.local-sqlite",
+        "storage.user-config-home"
+      ]
+    }
+  ],
+  "total": 1,
+  "cloned": 1,
+  "indexed": 1,
+  "metadata_enriched": 1
+}

@@ -1,0 +1,19 @@
+{
+  "schema_version": "2.0",
+  "input_services": [
+    "product-requirements-agent"
+  ],
+  "run_timestamp": "2026-05-03T23:08:29Z",
+  "workspace_root": "/workspace",
+  "compact_mode": true,
+  "services": [
+    {
+      "id": "product-requirements-agent",
+      "clone_status": "success",
+      "clone_path": "/workspace/product-requirements-agent",
+      "stack": "GO",
+      "decomposition_style": "layered",
+      "service_shape": "single-binary"
+    }
+  ]
+}

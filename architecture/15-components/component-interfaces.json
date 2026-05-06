@@ -1,0 +1,36 @@
+{
+  "interfaces": [
+    {
+      "id": "product-requirements-agent.component.acpx-cli-adapter.iface.adapter",
+      "component_id": "product-requirements-agent.component.acpx-cli-adapter",
+      "methods": [
+        "EnsureSession(context.Context, SessionRequest)",
+        "SendPrompt(context.Context, SessionRequest)",
+        "SendPromptStream(context.Context, SessionRequest, PromptStreamFunc)",
+        "Status(context.Context, string)",
+        "Cancel(context.Context, string)"
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.sqlite-store.iface.runtime_store",
+      "component_id": "product-requirements-agent.component.sqlite-store",
+      "methods": [
+        "CreateExecution(context.Context, ExecutionRequest)",
+        "LoadExecution(context.Context, string)",
+        "SaveThreadState(context.Context, ThreadState)",
+        "LoadThreadState(context.Context, string)",
+        "SaveEventDedupe(context.Context, EventDedupe)"
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.slack-web-api-client.iface.client",
+      "component_id": "product-requirements-agent.component.slack-web-api-client",
+      "methods": [
+        "PostMessage(context.Context, Message)",
+        "PostThreadMessage(context.Context, Message)",
+        "UpdateMessage(context.Context, MessageUpdate)",
+        "CreateChannel(context.Context, CreateChannelRequest)"
+      ]
+    }
+  ]
+}

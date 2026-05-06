@@ -1,0 +1,209 @@
+{
+  "components": [
+    {
+      "id": "product-requirements-agent.component.cli-command-router",
+      "service_id": "product-requirements-agent",
+      "component_type": "entrypoint_adapter",
+      "responsibility": "maps root CLI arguments to config, project, and runtime handlers",
+      "owned_paths": ["cmd/spexus-agent/main.go","internal/cli/app.go"],
+      "entrypoints": ["cli.root"],
+      "inbound_interfaces": ["Run(args []string) int"],
+      "outbound_dependencies": [
+        "product-requirements-agent.component.config-manager",
+        "product-requirements-agent.component.project-registry-service",
+        "product-requirements-agent.component.runtime-startup-orchestrator"
+      ],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"cmd/spexus-agent/main.go","kind":"entrypoint","snippet":"os.Exit(cli.New().Run(os.Args[1:]))","confidence":"high","verified":true},
+        {"path":"internal/cli/app.go","kind":"command_router","snippet":"switch args[0] { case \"config\": ... case \"project\": ... case \"runtime\": ... }","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.config-manager",
+      "service_id": "product-requirements-agent",
+      "component_type": "application_service",
+      "responsibility": "loads, validates, saves, and redacts global configuration and Slack auth",
+      "owned_paths": ["internal/config/config.go","internal/cli/config_handler.go"],
+      "entrypoints": ["cli.config.*"],
+      "inbound_interfaces": ["Load(ctx)","Save(ctx,cfg)","Init(ctx)","SetSlackAuth(ctx,auth)"],
+      "outbound_dependencies": ["storage.user-config-home"],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/config/config.go","kind":"file_store","snippet":"type FileStore struct { Path string }","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.project-registry-service",
+      "service_id": "product-requirements-agent",
+      "component_type": "application_service",
+      "responsibility": "imports project metadata, provisions Slack channels, and persists project registry rows",
+      "owned_paths": ["internal/cli/project_handler.go","internal/registry/registry.go"],
+      "entrypoints": ["cli.project.import-local","cli.project.import-remote","cli.project.list"],
+      "inbound_interfaces": ["ImportLocal(ctx,args)","ImportRemote(ctx,args)","List(ctx,args)"],
+      "outbound_dependencies": [
+        "product-requirements-agent.component.config-manager",
+        "product-requirements-agent.component.slack-web-api-client",
+        "product-requirements-agent.component.sqlite-store",
+        "ext.git-cli",
+        "ext.local-git-working-tree"
+      ],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/cli/project_handler.go","kind":"project_import","snippet":"project, err = h.provisionProjectChannelWithRegistry(ctx, repo, project)","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.runtime-startup-orchestrator",
+      "service_id": "product-requirements-agent",
+      "component_type": "workflow_orchestrator",
+      "responsibility": "assembles the foreground runtime, validates startup state, and dispatches Slack invocations",
+      "owned_paths": ["internal/cli/runtime_handler.go"],
+      "entrypoints": ["cli.runtime.start","cli.runtime.status","cli.runtime.reload","cli.runtime.doctor","cli.runtime.cancel"],
+      "inbound_interfaces": ["Start(ctx,args)","Status(ctx,args)","Reload(ctx,args)","Doctor(ctx,args)","Cancel(ctx,args)"],
+      "outbound_dependencies": [
+        "product-requirements-agent.component.config-manager",
+        "product-requirements-agent.component.project-registry-service",
+        "product-requirements-agent.component.sqlite-store",
+        "product-requirements-agent.component.slack-socket-transport",
+        "product-requirements-agent.component.slack-web-api-client",
+        "product-requirements-agent.component.turn-coordinator",
+        "product-requirements-agent.component.execution-manager",
+        "product-requirements-agent.component.invocation-preparer",
+        "product-requirements-agent.component.slack-thread-renderer",
+        "product-requirements-agent.component.acpx-cli-adapter"
+      ],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/cli/runtime_handler.go","kind":"runtime_wiring","snippet":"source := slack.NewSocketModeClient(cfg.Slack.AppToken); client := slack.NewHTTPClient(cfg.Slack.BotToken)","confidence":"high","verified":true},
+        {"path":"internal/cli/runtime_handler.go","kind":"runtime_loop","snippet":"switch invocation.SourceType { case slack.InboundSourceMention: ... case slack.InboundSourceMessage: ... case slack.InboundSourceSlash: ... }","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.slack-socket-transport",
+      "service_id": "product-requirements-agent",
+      "component_type": "entrypoint_adapter",
+      "responsibility": "opens Socket Mode websocket sessions, acknowledges envelopes, and normalizes Slack payloads into internal invocations",
+      "owned_paths": ["internal/slack/socket_mode.go","internal/slack/socket_mode_client.go"],
+      "entrypoints": ["slack.socket_mode.events","slack.socket_mode.slash_commands"],
+      "inbound_interfaces": ["InboundInvocations(ctx)","Events(ctx)"],
+      "outbound_dependencies": ["ext.slack-platform"],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/slack/socket_mode_client.go","kind":"websocket_client","snippet":"func (c *SocketModeClient) InboundInvocations(ctx context.Context) (<-chan InboundInvocation, error)","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.slack-web-api-client",
+      "service_id": "product-requirements-agent",
+      "component_type": "integration_client",
+      "responsibility": "posts messages, updates messages, provisions channels, and handles response_url callbacks",
+      "owned_paths": ["internal/slack/slack.go","internal/slack/http_client.go"],
+      "entrypoints": ["slack.web_api.chat.postMessage","slack.web_api.chat.update","slack.web_api.conversations.create"],
+      "inbound_interfaces": ["PostMessage(ctx,msg)","PostThreadMessage(ctx,msg)","UpdateMessage(ctx,update)","CreateChannel(ctx,request)","PostResponseURLMessage(ctx,msg)"],
+      "outbound_dependencies": ["ext.slack-platform"],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/slack/http_client.go","kind":"http_client","snippet":"const defaultAPIBaseURL = \"https://slack.com/api/\"","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.invocation-preparer",
+      "service_id": "product-requirements-agent",
+      "component_type": "entrypoint_adapter",
+      "responsibility": "resolves Slack channel context into a registered project and derives thread/session metadata plus command meaning",
+      "owned_paths": ["internal/runtime/slack_ingestion.go","internal/runtime/slack_commands.go"],
+      "entrypoints": ["runtime.prepare_mention","runtime.prepare_message","runtime.prepare_slash"],
+      "inbound_interfaces": ["PrepareSlackInvocation(...)","PrepareSlackMentionEvent(...)","PrepareSlackMessageEvent(...)","ParseSlackCommand(text)"],
+      "outbound_dependencies": [
+        "product-requirements-agent.component.project-registry-service"
+      ],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/runtime/slack_ingestion.go","kind":"context_mapping","snippet":"project, err := resolver.GetByChannelID(ctx, invocation.ChannelID)","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.turn-coordinator",
+      "service_id": "product-requirements-agent",
+      "component_type": "workflow_orchestrator",
+      "responsibility": "claims deliveries, persists queued/running/completed execution state, and coordinates per-thread locking",
+      "owned_paths": ["internal/runtime/execution_guard.go"],
+      "entrypoints": ["runtime.accept","runtime.execute","runtime.claim_delivery"],
+      "inbound_interfaces": ["Accept(ctx,prepared)","ExecuteAccepted(ctx,accepted,execute)"],
+      "outbound_dependencies": [
+        "product-requirements-agent.component.sqlite-store"
+      ],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/runtime/execution_guard.go","kind":"state_machine","snippet":"CreateExecution ... SaveThreadState ... SaveThreadLock ... UpdateExecutionState","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.execution-manager",
+      "service_id": "product-requirements-agent",
+      "component_type": "workflow_orchestrator",
+      "responsibility": "applies admission policy, queues accepted executions, and starts them when session/global limits allow",
+      "owned_paths": ["internal/runtime/execution_manager.go"],
+      "entrypoints": ["runtime.schedule_accepted"],
+      "inbound_interfaces": ["ScheduleAccepted(ctx,execution)"],
+      "outbound_dependencies": [
+        "product-requirements-agent.component.turn-coordinator"
+      ],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/runtime/execution_manager.go","kind":"admission_queue","snippet":"queuedExecutionManager ... collectStartableLocked ... boundedExecutionAdmissionPolicy","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.slack-thread-renderer",
+      "service_id": "product-requirements-agent",
+      "component_type": "entrypoint_adapter",
+      "responsibility": "translates ACPX session output into Slack thread messages and append-only streamed chunks",
+      "owned_paths": ["internal/runtime/acpx_events.go","internal/runtime/slack_renderer.go"],
+      "entrypoints": ["runtime.render_final","runtime.render_stream"],
+      "inbound_interfaces": ["Render(ctx,req,events)","NewStream(ctx,req)","RenderOutput(ctx,output)"],
+      "outbound_dependencies": [
+        "product-requirements-agent.component.slack-web-api-client"
+      ],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/runtime/slack_renderer.go","kind":"rendering_logic","snippet":"buildStreamingSlackThreadState(events); nextStreamingSlackChunk(...); PostMessage(ctx, slack.Message{...})","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.acpx-cli-adapter",
+      "service_id": "product-requirements-agent",
+      "component_type": "integration_client",
+      "responsibility": "creates/reuses ACPX sessions and invokes prompt/status/cancel subprocess calls in the project working tree",
+      "owned_paths": ["internal/acpxadapter/adapter.go","internal/acpxadapter/cli_adapter.go"],
+      "entrypoints": ["runtime.ensure_session","runtime.send_prompt","runtime.status","runtime.cancel"],
+      "inbound_interfaces": ["EnsureSession(ctx,req)","SendPrompt(ctx,req)","SendPromptStream(ctx,req,onOutput)","Status(ctx,threadTS)","Cancel(ctx,threadTS)"],
+      "outbound_dependencies": [
+        "ext.acpx-cli",
+        "ext.local-git-working-tree"
+      ],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/acpxadapter/cli_adapter.go","kind":"process_exec","snippet":"exec.CommandContext(ctx, binary, args...)","confidence":"high","verified":true}
+      ]
+    },
+    {
+      "id": "product-requirements-agent.component.sqlite-store",
+      "service_id": "product-requirements-agent",
+      "component_type": "repository",
+      "responsibility": "bootstraps SQLite schema and exposes project/runtime repositories for config-independent durable state",
+      "owned_paths": ["internal/storage/storage.go"],
+      "entrypoints": ["storage.open_default","storage.projects","storage.runtime"],
+      "inbound_interfaces": ["OpenDefault(ctx)","Projects()","Runtime()"],
+      "outbound_dependencies": [
+        "db.local-sqlite",
+        "storage.user-config-home"
+      ],
+      "status": "confirmed",
+      "evidence": [
+        {"path":"internal/storage/storage.go","kind":"repository","snippet":"type ProjectRepository struct {}; type RuntimeRepository struct {}","confidence":"high","verified":true}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "views": [
+    {
+      "id": "component-view.product-requirements-agent",
+      "path": "50-likec4/views/components/product-requirements-agent.c4",
+      "scenario_ids": [
+        "component-scenario.mention-ask",
+        "component-scenario.project-import"
+      ]
+    }
+  ]
+}

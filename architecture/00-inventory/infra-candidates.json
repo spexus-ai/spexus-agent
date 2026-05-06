@@ -1,0 +1,49 @@
+{
+  "infrastructure": [
+    {
+      "id": "db.local-sqlite",
+      "type": "database",
+      "title": "Local SQLite Store",
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "internal/storage/storage.go",
+          "kind": "sqlite_bootstrap",
+          "snippet": "sql.Open(\"sqlite3\", storageDSN(path))",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "storage.user-config-home",
+      "type": "storage",
+      "title": "User Config Home",
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "internal/config/config.go",
+          "kind": "file_store",
+          "snippet": "filepath.Join(home, configDirName, configAppDirName, configFileName)",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "svc.user-systemd",
+      "type": "job",
+      "title": "User-Level systemd Service",
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "Makefile",
+          "kind": "service_install",
+          "snippet": "ExecStart=$(INSTALL_PATH) runtime start",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    }
+  ]
+}

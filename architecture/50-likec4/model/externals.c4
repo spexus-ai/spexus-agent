@@ -1,0 +1,6 @@
+model {
+  slack = external_system "Slack Platform"
+  acpx = external_system "ACPX / Codex CLI"
+  repos = external_system "Registered Local Repositories"
+  git_cli = external_system "Git CLI"
+}

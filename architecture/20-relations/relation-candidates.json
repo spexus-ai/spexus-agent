@@ -1,0 +1,10 @@
+{
+  "relations": [
+    {"id":"product-requirements-agent--socket_mode--ext.slack-platform","status":"confirmed"},
+    {"id":"product-requirements-agent--web_api--ext.slack-platform","status":"confirmed"},
+    {"id":"product-requirements-agent--subprocess--ext.acpx-cli","status":"confirmed"},
+    {"id":"product-requirements-agent--sql--db.local-sqlite","status":"confirmed"},
+    {"id":"product-requirements-agent--filesystem--storage.user-config-home","status":"confirmed"},
+    {"id":"product-requirements-agent--working_tree--ext.local-git-working-tree","status":"confirmed"}
+  ]
+}

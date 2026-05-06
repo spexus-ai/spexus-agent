@@ -1,0 +1,9 @@
+{
+  "components": [
+    {"component_id":"product-requirements-agent.component.runtime-startup-orchestrator","evidence_paths":["internal/cli/runtime_handler.go"]},
+    {"component_id":"product-requirements-agent.component.turn-coordinator","evidence_paths":["internal/runtime/execution_guard.go"]},
+    {"component_id":"product-requirements-agent.component.execution-manager","evidence_paths":["internal/runtime/execution_manager.go"]},
+    {"component_id":"product-requirements-agent.component.slack-socket-transport","evidence_paths":["internal/slack/socket_mode.go","internal/slack/socket_mode_client.go"]},
+    {"component_id":"product-requirements-agent.component.acpx-cli-adapter","evidence_paths":["internal/acpxadapter/adapter.go","internal/acpxadapter/cli_adapter.go"]}
+  ]
+}

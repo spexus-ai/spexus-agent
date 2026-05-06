@@ -189,11 +189,17 @@ func (a *CLIAdapter) StartPrompt(ctx context.Context, req SessionRequest) (Promp
 		return nil, err
 	}
 
-	if _, err := a.EnsureSession(ctx, SessionRequest{
-		ProjectPath: req.ProjectPath,
-		ThreadTS:    req.ThreadTS,
-	}); err != nil {
-		return nil, err
+	if req.ForceNew {
+		if _, err := a.run(ctx, req.ProjectPath, "codex", "sessions", "new", "--name", sessionName); err != nil {
+			return nil, fmt.Errorf("create session %q: %w", sessionName, err)
+		}
+	} else {
+		if _, err := a.EnsureSession(ctx, SessionRequest{
+			ProjectPath: req.ProjectPath,
+			ThreadTS:    req.ThreadTS,
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	commandArgs, err := a.commandArgs("codex", "prompt", "-s", sessionName, req.Prompt)

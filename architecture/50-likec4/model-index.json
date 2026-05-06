@@ -1,0 +1,8 @@
+{
+  "models": [
+    "50-likec4/model/landscape.c4",
+    "50-likec4/model/externals.c4",
+    "50-likec4/model/shared.c4",
+    "50-likec4/model/components/product-requirements-agent.c4"
+  ]
+}

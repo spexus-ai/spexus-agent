@@ -1,0 +1,71 @@
+{
+  "external_systems": [
+    {
+      "id": "ext.slack-platform",
+      "type": "external_system",
+      "title": "Slack Platform",
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "README.md",
+          "kind": "repo_doc",
+          "snippet": "Slack Web API for channel provisioning and thread replies; Slack Socket Mode for inbound message delivery",
+          "confidence": "high",
+          "verified": true
+        },
+        {
+          "path": "internal/slack/socket_mode_client.go",
+          "kind": "websocket_client",
+          "snippet": "https://slack.com/api/apps.connections.open",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "ext.acpx-cli",
+      "type": "external_system",
+      "title": "ACPX / Codex CLI",
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "internal/acpxadapter/cli_adapter.go",
+          "kind": "process_exec",
+          "snippet": "binary = \"acpx\"; a.run(ctx, req.ProjectPath, \"codex\", \"prompt\", \"-s\", sessionName, req.Prompt)",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "ext.git-cli",
+      "type": "external_system",
+      "title": "Git CLI",
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "internal/cli/project_handler.go",
+          "kind": "process_exec",
+          "snippet": "exec.CommandContext(ctx, \"git\", cmdArgs...)",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "ext.local-git-working-tree",
+      "type": "external_system",
+      "title": "Registered Local Git Repositories",
+      "status": "confirmed",
+      "evidence": [
+        {
+          "path": "internal/cli/project_handler.go",
+          "kind": "project_import",
+          "snippet": "project import-local /absolute/path/to/repo",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    }
+  ]
+}

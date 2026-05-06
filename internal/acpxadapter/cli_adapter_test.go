@@ -376,6 +376,39 @@ func TestCLIAdapterStatusAndCancelResolveThreadSession(t *testing.T) {
 	}
 }
 
+func TestCLIAdapterStartPromptForceNewCreatesSessionBeforePrompt(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{
+		results: []runnerResult{{output: `{"jsonrpc":"2.0","result":{"sessionId":"slack-1713686400.000100"}}`}},
+		startResults: []startRunnerResult{{
+			stdout: `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+		}},
+	}
+	adapter := NewCLIAdapter("acpx", runner)
+
+	stream, err := adapter.StartPrompt(context.Background(), SessionRequest{
+		ProjectPath: "/workspace/alpha",
+		ThreadTS:    "1713686400.000100",
+		Prompt:      "summarize project",
+		ForceNew:    true,
+	})
+	if err != nil {
+		t.Fatalf("StartPrompt() error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	if got, want := len(runner.calls), 2; got != want {
+		t.Fatalf("runner calls = %d, want %d", got, want)
+	}
+	if fmt.Sprint(runner.calls[0].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "sessions", "new", "--name", "slack-1713686400.000100"}) {
+		t.Fatalf("first call args = %#v, want force-new session creation", runner.calls[0].args)
+	}
+	if fmt.Sprint(runner.calls[1].args) != fmt.Sprint([]string{"--format", "json", "--json-strict", "--approve-all", "codex", "prompt", "-s", "slack-1713686400.000100", "summarize project"}) {
+		t.Fatalf("second call args = %#v, want prompt args", runner.calls[1].args)
+	}
+}
+
 // Test: invalid thread context is rejected before the adapter can issue a CLI command.
 // Validates: AC-1787/AC-1788/AC-1795 session mapping inputs require a thread timestamp
 func TestCLIAdapterRejectsEmptyThreadTimestamp(t *testing.T) {

@@ -1,0 +1,16 @@
+{
+  "top_dependencies": [
+    {
+      "component_id": "product-requirements-agent.component.runtime-startup-orchestrator",
+      "outbound_dependency_count": 10
+    },
+    {
+      "component_id": "product-requirements-agent.component.project-registry-service",
+      "outbound_dependency_count": 5
+    },
+    {
+      "component_id": "product-requirements-agent.component.cli-command-router",
+      "outbound_dependency_count": 3
+    }
+  ]
+}

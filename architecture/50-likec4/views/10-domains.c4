@@ -1,0 +1,16 @@
+views {
+  view domain_internal {
+    title "C1/C2 Internal Domain"
+    include agent
+    include sqlite_store
+    include config_store
+  }
+
+  view domain_context {
+    title "C1 External Context"
+    include slack
+    include acpx
+    include repos
+    include agent
+  }
+}

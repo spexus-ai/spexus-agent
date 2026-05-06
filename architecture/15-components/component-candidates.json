@@ -1,0 +1,17 @@
+{
+  "components": [
+    {"id":"product-requirements-agent.component.cli-command-router","status":"confirmed","component_type":"entrypoint_adapter","owned_paths":["cmd/spexus-agent/main.go","internal/cli/app.go"]},
+    {"id":"product-requirements-agent.component.config-manager","status":"confirmed","component_type":"application_service","owned_paths":["internal/config/config.go","internal/cli/config_handler.go"]},
+    {"id":"product-requirements-agent.component.project-registry-service","status":"confirmed","component_type":"application_service","owned_paths":["internal/cli/project_handler.go","internal/registry/registry.go"]},
+    {"id":"product-requirements-agent.component.runtime-startup-orchestrator","status":"confirmed","component_type":"workflow_orchestrator","owned_paths":["internal/cli/runtime_handler.go"]},
+    {"id":"product-requirements-agent.component.slack-socket-transport","status":"confirmed","component_type":"entrypoint_adapter","owned_paths":["internal/slack/socket_mode.go","internal/slack/socket_mode_client.go"]},
+    {"id":"product-requirements-agent.component.slack-web-api-client","status":"confirmed","component_type":"integration_client","owned_paths":["internal/slack/slack.go","internal/slack/http_client.go"]},
+    {"id":"product-requirements-agent.component.invocation-preparer","status":"confirmed","component_type":"entrypoint_adapter","owned_paths":["internal/runtime/slack_ingestion.go","internal/runtime/slack_commands.go"]},
+    {"id":"product-requirements-agent.component.turn-coordinator","status":"confirmed","component_type":"workflow_orchestrator","owned_paths":["internal/runtime/execution_guard.go"]},
+    {"id":"product-requirements-agent.component.execution-manager","status":"confirmed","component_type":"workflow_orchestrator","owned_paths":["internal/runtime/execution_manager.go"]},
+    {"id":"product-requirements-agent.component.slack-thread-renderer","status":"confirmed","component_type":"entrypoint_adapter","owned_paths":["internal/runtime/acpx_events.go","internal/runtime/slack_renderer.go"]},
+    {"id":"product-requirements-agent.component.acpx-cli-adapter","status":"confirmed","component_type":"integration_client","owned_paths":["internal/acpxadapter/adapter.go","internal/acpxadapter/cli_adapter.go"]},
+    {"id":"product-requirements-agent.component.sqlite-store","status":"confirmed","component_type":"repository","owned_paths":["internal/storage/storage.go"]},
+    {"id":"product-requirements-agent.component.test-suites","status":"rejected","component_type":"utility","owned_paths":["internal/**/*_test.go"]}
+  ]
+}

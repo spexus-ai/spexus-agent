@@ -1,0 +1,12 @@
+{
+  "gaps": [
+    {
+      "id": "gap.no-container-deployment",
+      "reason": "no Docker, Helm, or Kubernetes manifests exist in the current repository"
+    },
+    {
+      "id": "gap.no-hosted-control-plane",
+      "reason": "runtime is local and foreground-oriented; repository does not implement hosted service deployment topology"
+    }
+  ]
+}

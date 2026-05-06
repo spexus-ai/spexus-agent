@@ -1,0 +1,18 @@
+{
+  "relations": [
+    {
+      "id": "storage.user-config-home--stores-->surface.slack-runtime-auth",
+      "source_id": "storage.user-config-home",
+      "target_id": "surface.slack-runtime-auth",
+      "relation_type": "stores_credentials",
+      "confidence": "high"
+    },
+    {
+      "id": "surface.slack-runtime-auth--authenticates_to-->ext.slack-platform",
+      "source_id": "surface.slack-runtime-auth",
+      "target_id": "ext.slack-platform",
+      "relation_type": "token_auth",
+      "confidence": "high"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "anomalies": [
+    {
+      "severity": "low",
+      "title": "codesearch depends on repo-local cache wiring in this sandbox",
+      "description": "semantic indexing and search succeed only when HF_HOME, HUGGINGFACE_HUB_CACHE, TRANSFORMERS_CACHE, and SENTENCE_TRANSFORMERS_HOME are pointed at the repo-local .codesearch-local/hf-cache directory"
+    },
+    {
+      "severity": "low",
+      "title": "runtime orchestrator is a hotspot",
+      "description": "internal/cli/runtime_handler.go owns startup, routing, local command handling, slash handling, render dispatch, and cancel/status flows"
+    }
+  ]
+}

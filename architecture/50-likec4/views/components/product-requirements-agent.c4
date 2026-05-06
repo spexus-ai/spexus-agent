@@ -1,0 +1,22 @@
+views {
+  view components_product_requirements_agent {
+    title "C3 Components: Spexus Agent"
+    include cli_router
+    include config_manager
+    include project_registry
+    include runtime_orchestrator
+    include socket_transport
+    include slack_api
+    include invocation_preparer
+    include turn_coordinator
+    include execution_manager
+    include renderer
+    include acpx_adapter
+    include sqlite_store_adapter
+    include slack
+    include acpx
+    include repos
+    include git_cli
+    include local_sqlite_db
+  }
+}

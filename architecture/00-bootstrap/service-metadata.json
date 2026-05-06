@@ -1,0 +1,46 @@
+{
+  "services": [
+    {
+      "id": "product-requirements-agent",
+      "title": "Spexus Agent",
+      "owner": "unknown",
+      "runtime": "go",
+      "entry_binary": "cmd/spexus-agent/main.go",
+      "storage": [
+        "~/.config/spexus-agent/config.json",
+        "~/.config/spexus-agent/storage.sqlite3"
+      ],
+      "execution_model": [
+        "local CLI",
+        "foreground Slack runtime",
+        "optional user-level systemd service"
+      ],
+      "dependencies": [
+        "github.com/mattn/go-sqlite3",
+        "github.com/gorilla/websocket"
+      ],
+      "external_dependencies": [
+        "Slack Web API",
+        "Slack Socket Mode",
+        "ACPX / Codex CLI",
+        "Git CLI"
+      ],
+      "evidence": [
+        {
+          "path": "README.md",
+          "kind": "repo_doc",
+          "snippet": "Go-based command-line and foreground runtime bridge between Slack, ACPX, and Spexus-managed project context.",
+          "confidence": "high",
+          "verified": true
+        },
+        {
+          "path": "go.mod",
+          "kind": "module_manifest",
+          "snippet": "require github.com/mattn/go-sqlite3 v1.14.22; require github.com/gorilla/websocket v1.5.3",
+          "confidence": "high",
+          "verified": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "codesearch": {
+    "binary": "/home/dvaletin/.local/bin/codesearch",
+    "status": "ok",
+    "checks": [
+      {
+        "command": "/home/dvaletin/.local/bin/codesearch --help",
+        "result": "ok"
+      },
+      {
+        "command": "/home/dvaletin/.local/bin/codesearch repo list",
+        "result": "failed",
+        "detail": "default database path was not writable or not openable in the current environment"
+      },
+      {
+        "command": "/home/dvaletin/.local/bin/codesearch --db /workspace/product-requirements-agent/.codesearch-local/index.db --config /workspace/product-requirements-agent/.codesearch-local/config.toml repo list",
+        "result": "ok",
+        "detail": "local writable db/config bootstrap worked"
+      },
+      {
+        "command": "/home/dvaletin/.local/bin/codesearch --db /workspace/product-requirements-agent/.codesearch-local/index.db --config /workspace/product-requirements-agent/.codesearch-local/config.toml repo add /workspace/product-requirements-agent",
+        "result": "ok"
+      },
+      {
+        "command": "HF_HOME=/workspace/product-requirements-agent/.codesearch-local/hf-cache HUGGINGFACE_HUB_CACHE=/workspace/product-requirements-agent/.codesearch-local/hf-cache TRANSFORMERS_CACHE=/workspace/product-requirements-agent/.codesearch-local/hf-cache SENTENCE_TRANSFORMERS_HOME=/workspace/product-requirements-agent/.codesearch-local/hf-cache /home/dvaletin/.local/bin/codesearch --db /workspace/product-requirements-agent/.codesearch-local/index.db --config /workspace/product-requirements-agent/.codesearch-local/config.toml index product-requirements-agent",
+        "result": "ok",
+        "detail": "indexed 54 files and 515 chunks after correcting embedding.provider to onnx and using a writable repo-local HF cache"
+      },
+      {
+        "command": "HF_HOME=/workspace/product-requirements-agent/.codesearch-local/hf-cache HUGGINGFACE_HUB_CACHE=/workspace/product-requirements-agent/.codesearch-local/hf-cache TRANSFORMERS_CACHE=/workspace/product-requirements-agent/.codesearch-local/hf-cache SENTENCE_TRANSFORMERS_HOME=/workspace/product-requirements-agent/.codesearch-local/hf-cache /home/dvaletin/.local/bin/codesearch --db /workspace/product-requirements-agent/.codesearch-local/index.db --config /workspace/product-requirements-agent/.codesearch-local/config.toml search \"internal architecture and main components\" --repo product-requirements-agent --format json --limit 3",
+        "result": "ok",
+        "detail": "semantic search returned ranked hits from indexed repository content"
+      }
+    ]
+  },
+  "likec4": {
+    "binary": "/home/dvaletin/.npm-global/bin/likec4",
+    "status": "ok",
+    "checks": [
+      {
+        "command": "XDG_CONFIG_HOME=/workspace/product-requirements-agent/.tmp-config HOME=/workspace/product-requirements-agent /home/dvaletin/.npm-global/bin/likec4 --help",
+        "result": "ok"
+      },
+      {
+        "command": "XDG_CONFIG_HOME=/workspace/product-requirements-agent/.tmp-config HOME=/workspace/product-requirements-agent /home/dvaletin/.npm-global/bin/likec4 validate architecture/50-likec4",
+        "result": "ok",
+        "detail": "validated successfully after converting split view files to views{} blocks and removing duplicate model element definitions"
+      }
+    ],
+    "top_errors": []
+  }
+}

@@ -551,6 +551,219 @@ func TestRuntimeRepositorySaveClaimedExecutionPersistsDedupeAndQueuedState(t *te
 	}
 }
 
+// Test: an existing executions table without session_key is migrated in place and derives a stable session key from thread state.
+// Validates: AC-2107 (REQ-1573 - persisted execution requests remain readable after schema upgrades)
+func TestOpenMigratesExecutionsSessionKeyColumn(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "storage.sqlite3")
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		PRAGMA foreign_keys = ON;
+		CREATE TABLE projects (
+			name TEXT PRIMARY KEY,
+			git_remote TEXT NOT NULL DEFAULT '',
+			local_path TEXT NOT NULL,
+			slack_channel_name TEXT NOT NULL DEFAULT '',
+			slack_channel_id TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE TABLE executions (
+			execution_id TEXT PRIMARY KEY,
+			source_type TEXT NOT NULL,
+			delivery_id TEXT NOT NULL,
+			channel_id TEXT NOT NULL,
+			project_name TEXT NOT NULL,
+			thread_ts TEXT NOT NULL DEFAULT '',
+			command_text TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			diagnostic_context TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			started_at TEXT,
+			updated_at TEXT NOT NULL,
+			completed_at TEXT,
+			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
+		);
+	`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO projects (
+			name, git_remote, local_path, slack_channel_name, slack_channel_id, created_at, updated_at
+		) VALUES (?, '', ?, ?, ?, ?, ?)
+	`, "alpha", filepath.Join(dir, "alpha"), "alpha", "C123", createdAt, createdAt); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO executions (
+			execution_id, source_type, delivery_id, channel_id, project_name,
+			thread_ts, command_text, status, diagnostic_context, created_at, started_at, updated_at, completed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		"exec-legacy",
+		"mention",
+		"Ev-legacy",
+		"C123",
+		"alpha",
+		"1713686400.000100",
+		"status",
+		"running",
+		"",
+		createdAt,
+		nil,
+		createdAt,
+		nil,
+	); err != nil {
+		t.Fatalf("insert legacy execution: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close() error = %v", err)
+	}
+
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	loaded, err := store.Runtime().LoadExecutionState(ctx, "exec-legacy")
+	if err != nil {
+		t.Fatalf("LoadExecutionState() error = %v", err)
+	}
+	if loaded.SessionName != "slack-1713686400.000100" {
+		t.Fatalf("LoadExecutionState() session name = %q, want derived session name", loaded.SessionName)
+	}
+	if loaded.Status != runtimemodel.ExecutionStatusRunning {
+		t.Fatalf("LoadExecutionState() status = %q, want %q", loaded.Status, runtimemodel.ExecutionStatusRunning)
+	}
+}
+
+// Test: the older executions schema with session_name and queued_at is migrated into the current execution model.
+// Validates: AC-2107 (REQ-1573 - persisted execution requests remain readable after schema upgrades)
+func TestOpenMigratesLegacyExecutionsSessionNameSchema(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "storage.sqlite3")
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		PRAGMA foreign_keys = ON;
+		CREATE TABLE projects (
+			name TEXT PRIMARY KEY,
+			git_remote TEXT NOT NULL DEFAULT '',
+			local_path TEXT NOT NULL,
+			slack_channel_name TEXT NOT NULL DEFAULT '',
+			slack_channel_id TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE TABLE executions (
+			execution_id TEXT PRIMARY KEY,
+			source_type TEXT NOT NULL,
+			delivery_id TEXT NOT NULL,
+			project_name TEXT NOT NULL,
+			channel_id TEXT NOT NULL,
+			thread_ts TEXT NOT NULL DEFAULT '',
+			session_name TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			queued_at TEXT NOT NULL,
+			started_at TEXT,
+			rendering_started_at TEXT,
+			completed_at TEXT,
+			cancelled_at TEXT,
+			updated_at TEXT NOT NULL,
+			last_error TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_kind TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_summary TEXT NOT NULL DEFAULT '',
+			publisher_checkpoint_at TEXT,
+			FOREIGN KEY(project_name) REFERENCES projects(name) ON UPDATE CASCADE ON DELETE RESTRICT
+		);
+	`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+
+	queuedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO projects (
+			name, git_remote, local_path, slack_channel_name, slack_channel_id, created_at, updated_at
+		) VALUES (?, '', ?, ?, ?, ?, ?)
+	`, "alpha", filepath.Join(dir, "alpha"), "alpha", "C123", queuedAt, queuedAt); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO executions (
+			execution_id, source_type, delivery_id, project_name, channel_id, thread_ts, session_name,
+			status, queued_at, started_at, rendering_started_at, completed_at, cancelled_at, updated_at,
+			last_error, publisher_checkpoint_kind, publisher_checkpoint_summary, publisher_checkpoint_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		"exec-legacy-v0",
+		"slash",
+		"Ev-legacy-v0",
+		"alpha",
+		"C123",
+		"1713686400.000100",
+		"slack-1713686400.000100",
+		"failed",
+		queuedAt,
+		nil,
+		nil,
+		nil,
+		nil,
+		queuedAt,
+		"ack window expired",
+		"",
+		"",
+		nil,
+	); err != nil {
+		t.Fatalf("insert legacy execution: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close() error = %v", err)
+	}
+
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	loaded, err := store.Runtime().LoadExecutionState(ctx, "exec-legacy-v0")
+	if err != nil {
+		t.Fatalf("LoadExecutionState() error = %v", err)
+	}
+	if loaded.SessionName != "slack-1713686400.000100" {
+		t.Fatalf("LoadExecutionState() session name = %q, want migrated session name", loaded.SessionName)
+	}
+	if loaded.QueuedAt.IsZero() {
+		t.Fatalf("LoadExecutionState() queuedAt is zero, want queued_at migrated")
+	}
+	if loaded.LastError != "ack window expired" {
+		t.Fatalf("LoadExecutionState() last error = %q, want last_error migrated", loaded.LastError)
+	}
+	if loaded.Status != runtimemodel.ExecutionStatusFailed {
+		t.Fatalf("LoadExecutionState() status = %q, want %q", loaded.Status, runtimemodel.ExecutionStatusFailed)
+	}
+}
+
 // Test: DefaultPath points storage bootstrap at the user config directory.
 // Validates: AC-1783 (REQ-1144 - runtime initializes SQLite storage under ~/.config/spexus-agent/storage.sqlite3)
 func TestDefaultPathUsesUserConfigDirectory(t *testing.T) {
