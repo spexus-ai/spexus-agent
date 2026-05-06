@@ -86,7 +86,7 @@ func TestSlackThreadRendererBatchesProgressAndFinalUpdates(t *testing.T) {
 	if got, want := len(client.messages), 2; got != want {
 		t.Fatalf("PostThreadMessage() calls = %d, want %d", got, want)
 	}
-	if client.messages[0].Text != "Progress:\n- Session started: slack-1713686400.000100\n- Thinking: analyzing\n- Tool started: grep - searching" {
+	if client.messages[0].Text != "Progress:\n- Session started: slack-1713686400.000100\n- Thinking: analyzing" {
 		t.Fatalf("first message text = %q", client.messages[0].Text)
 	}
 	if client.messages[1].Text != "final answer" {
@@ -181,8 +181,8 @@ func TestSlackThreadProgressPublisherFlushesBatchedProgressByCount(t *testing.T)
 	if publisher.ShouldFlushByCount() {
 		t.Fatal("ShouldFlushByCount() = true after one event, want false")
 	}
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventToolStarted, ToolName: "grep", Text: "searching"}); err != nil {
-		t.Fatalf("Consume(tool started) error = %v", err)
+	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantThinking, Text: "searching"}); err != nil {
+		t.Fatalf("Consume(thinking) error = %v", err)
 	}
 	if !publisher.ShouldFlushByCount() {
 		t.Fatal("ShouldFlushByCount() = false after two events, want true")
@@ -200,7 +200,7 @@ func TestSlackThreadProgressPublisherFlushesBatchedProgressByCount(t *testing.T)
 	if got, want := len(client.messages), 2; got != want {
 		t.Fatalf("message count = %d, want %d", got, want)
 	}
-	if client.messages[0].Text != "Progress:\n- Session started: slack-1713686400.000100\n- Tool started: grep - searching" {
+	if client.messages[0].Text != "Progress:\n- Session started: slack-1713686400.000100\n- Thinking: searching" {
 		t.Fatalf("progress message = %q", client.messages[0].Text)
 	}
 	if client.messages[1].Text != "final answer" {
@@ -245,7 +245,7 @@ func TestSlackThreadProgressPublisherBuffersProgressUntilFinalOutput(t *testing.
 	if got, want := len(client.messages), 1; got != want {
 		t.Fatalf("message count after final flush = %d, want %d", got, want)
 	}
-	if client.messages[0].Text != "Progress:\n- Session started: slack-1713686400.000100\n- Tool started: grep - searching" {
+	if client.messages[0].Text != "Progress:\n- Session started: slack-1713686400.000100" {
 		t.Fatalf("progress message = %q", client.messages[0].Text)
 	}
 
@@ -260,7 +260,7 @@ func TestSlackThreadProgressPublisherBuffersProgressUntilFinalOutput(t *testing.
 	}
 }
 
-func TestSlackThreadProgressPublisherUpdatesSingleAssistantProgressMessage(t *testing.T) {
+func TestSlackThreadProgressPublisherStreamsAssistantChunksAppendOnly(t *testing.T) {
 	t.Parallel()
 
 	client := &fakeThreadMessageClient{}
@@ -274,7 +274,7 @@ func TestSlackThreadProgressPublisherUpdatesSingleAssistantProgressMessage(t *te
 		t.Fatalf("NewProgressPublisher() error = %v", err)
 	}
 
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageChunk, Text: "Need"}); err != nil {
+	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageChunk, Text: "Need\n"}); err != nil {
 		t.Fatalf("Consume(first chunk) error = %v", err)
 	}
 	if err := publisher.Flush(context.Background()); err != nil {
@@ -286,14 +286,20 @@ func TestSlackThreadProgressPublisherUpdatesSingleAssistantProgressMessage(t *te
 	if err := publisher.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush(second chunk) error = %v", err)
 	}
+	if err := publisher.Finish(context.Background(), nil); err != nil {
+		t.Fatalf("Finish() error = %v", err)
+	}
 
-	if got, want := len(client.messages), 1; got != want {
+	if got, want := len(client.messages), 2; got != want {
 		t.Fatalf("message count = %d, want %d", got, want)
 	}
-	if client.messages[0].Text != "Need the epic ID" {
-		t.Fatalf("progress message = %q", client.messages[0].Text)
+	if client.messages[0].Text != "Need" {
+		t.Fatalf("first streamed message = %q", client.messages[0].Text)
 	}
-	if got, want := len(client.updates), 1; got != want {
+	if client.messages[1].Text != " the epic ID" {
+		t.Fatalf("second streamed message = %q", client.messages[1].Text)
+	}
+	if got, want := len(client.updates), 0; got != want {
 		t.Fatalf("update count = %d, want %d", got, want)
 	}
 }

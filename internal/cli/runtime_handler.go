@@ -702,7 +702,7 @@ func (s *foregroundRuntimeStarter) executeMentionRequest(ctx context.Context, co
 			return nil
 		}
 
-		promptResult, err := s.collectPromptEvents(ctx, prepared, request, command.ACPXPrompt())
+		promptResult, err := s.collectPromptEvents(ctx, prepared, request, command.ACPXPrompt(), command.Kind == runtime.SlackCommandAsk)
 		if err != nil {
 			if tracker != nil {
 				_ = tracker.RecordFailed(ctx, request, err)
@@ -802,7 +802,7 @@ func (s *foregroundRuntimeStarter) executeMessageRequest(ctx context.Context, co
 			return nil
 		}
 
-		promptResult, err := s.collectPromptEvents(ctx, prepared, request, prompt)
+		promptResult, err := s.collectPromptEvents(ctx, prepared, request, prompt, false)
 		if err != nil {
 			if tracker != nil {
 				_ = tracker.RecordFailed(ctx, request, err)
@@ -1079,7 +1079,7 @@ func (s *foregroundRuntimeStarter) executeSlashRequest(ctx context.Context, coor
 			return nil
 		}
 
-		promptResult, err := s.collectPromptEvents(ctx, prepared, request, command.ACPXPrompt())
+		promptResult, err := s.collectPromptEvents(ctx, prepared, request, command.ACPXPrompt(), command.Kind == runtime.SlackCommandAsk)
 		if err != nil {
 			if tracker != nil {
 				_ = tracker.RecordFailed(ctx, request, err)
@@ -1137,11 +1137,12 @@ func (s *foregroundRuntimeStarter) executeSlashRequest(ctx context.Context, coor
 	s.logf("runtime.loop: slash processed delivery=%s session=%s", request.DeliveryID, preparedEvent.SessionName)
 }
 
-func (s *foregroundRuntimeStarter) collectPromptEvents(ctx context.Context, prepared runtime.PreparedSlackEvent, request runtime.ExecutionRequest, prompt string) (promptExecutionResult, error) {
+func (s *foregroundRuntimeStarter) collectPromptEvents(ctx context.Context, prepared runtime.PreparedSlackEvent, request runtime.ExecutionRequest, prompt string, forceNew bool) (promptExecutionResult, error) {
 	stream, err := s.adapter.StartPrompt(ctx, acpxadapter.SessionRequest{
 		ProjectPath: prepared.Project.LocalPath,
 		ThreadTS:    prepared.ThreadTS,
 		Prompt:      prompt,
+		ForceNew:    forceNew,
 	})
 	if err != nil {
 		return promptExecutionResult{}, err

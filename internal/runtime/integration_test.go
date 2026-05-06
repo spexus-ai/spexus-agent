@@ -328,7 +328,7 @@ func TestSlackEventDispatchPersistsSQLiteStateAndRendersACPXOutput(t *testing.T)
 	if got, want := len(gotMessages), 3; got != want {
 		t.Fatalf("Slack thread message count = %d, want %d", got, want)
 	}
-	if gotMessages[0].Text != "Progress:\n- Session started: 019db13d-f733-7ce0-8186-5aced7cdb2a7\n- Tool started: Run grep\n- Tool finished: Run grep" {
+	if gotMessages[0].Text != "Progress:\n- Session started: 019db13d-f733-7ce0-8186-5aced7cdb2a7" {
 		t.Fatalf("first Slack message text = %q", gotMessages[0].Text)
 	}
 	if gotMessages[1].Text != "root final answer" {

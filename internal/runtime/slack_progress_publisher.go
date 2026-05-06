@@ -11,6 +11,7 @@ import (
 const (
 	defaultSlackProgressFlushEventCount = 4
 	defaultSlackProgressFlushInterval   = 2 * time.Second
+	streamingSlackMessageSoftLimit      = 2000
 )
 
 type SlackThreadProgressPublisherConfig struct {
@@ -26,15 +27,13 @@ type SlackThreadProgressPublisher struct {
 	flushInterval   time.Duration
 	now             func() time.Time
 
-	progress                 []string
-	flushedProgress          []string
-	assistantProgress        strings.Builder
-	flushedAssistantProgress string
-	finalParts               []string
-	terminal                 string
-	sessionDone              bool
-	pendingCount             int
-	progressMessageTS        string
+	progress           []string
+	assistantProgress  strings.Builder
+	assistantSawChunks bool
+	finalParts         []string
+	terminal           string
+	sessionDone        bool
+	pendingCount       int
 }
 
 func (r SlackThreadRenderer) NewProgressPublisher(req SlackThreadRenderRequest, cfg SlackThreadProgressPublisherConfig) (*SlackThreadProgressPublisher, error) {
@@ -79,9 +78,9 @@ func (p *SlackThreadProgressPublisher) Consume(ctx context.Context, event ACPXTu
 	case ACPXEventAssistantThinking:
 		p.appendProgress("Thinking"+suffixWithText(event.Text), true)
 	case ACPXEventToolStarted:
-		p.appendProgress(formatToolLine("started", event), true)
+		return nil
 	case ACPXEventToolFinished:
-		p.appendProgress(formatToolLine("finished", event), true)
+		return nil
 	case ACPXEventAssistantMessageChunk:
 		p.appendAssistantChunk(event.Text)
 	case ACPXEventAssistantMessageFinal:
@@ -102,8 +101,10 @@ func (p *SlackThreadProgressPublisher) Consume(ctx context.Context, event ACPXTu
 }
 
 func (p *SlackThreadProgressPublisher) HasPendingProgress() bool {
-	assistant := strings.TrimSpace(p.assistantProgress.String())
-	return len(p.progress) > 0 || assistant != p.flushedAssistantProgress
+	if len(p.progress) > 0 {
+		return true
+	}
+	return hasFlushableSlackStreamChunk(p.assistantProgress.String())
 }
 
 func (p *SlackThreadProgressPublisher) PendingProgressCount() int {
@@ -130,7 +131,7 @@ func (p *SlackThreadProgressPublisher) Flush(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return p.flush(ctx, true)
+	return p.flush(ctx, true, false)
 }
 
 func (p *SlackThreadProgressPublisher) Finish(ctx context.Context, terminalErr error) error {
@@ -139,22 +140,21 @@ func (p *SlackThreadProgressPublisher) Finish(ctx context.Context, terminalErr e
 		p.terminal = "Session error" + suffixWithText(terminalErr.Error())
 	}
 
-	publishedAssistant := strings.TrimSpace(p.flushedAssistantProgress)
-	publishedProgressLineCount := len(p.flushedProgress)
 	switch {
 	case p.terminal != "":
-		if err := p.flush(ctx, true); err != nil {
+		if err := p.flush(ctx, true, true); err != nil {
+			return err
+		}
+	case p.assistantSawChunks:
+		if err := p.flush(ctx, true, true); err != nil {
 			return err
 		}
 	case len(p.finalParts) > 0 || p.sessionDone:
-		if err := p.flush(ctx, false); err != nil {
+		if err := p.flush(ctx, false, false); err != nil {
 			return err
 		}
-		p.assistantProgress.Reset()
-		p.flushedAssistantProgress = ""
-		p.pendingCount = 0
 	default:
-		if err := p.flush(ctx, true); err != nil {
+		if err := p.flush(ctx, true, true); err != nil {
 			return err
 		}
 	}
@@ -163,15 +163,14 @@ func (p *SlackThreadProgressPublisher) Finish(ctx context.Context, terminalErr e
 	switch {
 	case p.terminal != "":
 		text = p.terminal
+	case p.assistantSawChunks:
+		return nil
 	case len(p.finalParts) > 0:
 		text = strings.Join(p.finalParts, "\n\n")
 	case p.sessionDone:
 		text = "Session complete."
 	}
 	if strings.TrimSpace(text) == "" {
-		return nil
-	}
-	if p.terminal == "" && publishedProgressLineCount == 0 && publishedAssistant != "" && text == publishedAssistant {
 		return nil
 	}
 
@@ -195,91 +194,133 @@ func (p *SlackThreadProgressPublisher) appendAssistantChunk(text string) {
 	if text == "" {
 		return
 	}
+	p.assistantSawChunks = true
 
 	if p.assistantProgress.Len() == 0 {
-		text = strings.TrimSpace(text)
-		if text == "" {
+		if strings.TrimSpace(text) == "" {
 			return
 		}
-		p.assistantProgress.WriteString(text)
-	} else {
-		p.assistantProgress.WriteString(text)
 	}
-
+	p.assistantProgress.WriteString(text)
 	p.pendingCount++
 }
 
-func (p *SlackThreadProgressPublisher) flush(ctx context.Context, includeAssistant bool) error {
-	if !p.HasPendingProgress() {
-		p.pendingCount = 0
-		return nil
-	}
-
-	progressLines := append([]string(nil), p.flushedProgress...)
-	progressLines = append(progressLines, p.progress...)
-	assistant := ""
-	if includeAssistant {
-		assistant = strings.TrimSpace(p.assistantProgress.String())
-	}
-
-	if len(progressLines) == 0 && assistant == "" {
-		p.progress = p.progress[:0]
-		if includeAssistant {
-			p.assistantProgress.Reset()
-			p.flushedAssistantProgress = ""
+func (p *SlackThreadProgressPublisher) flush(ctx context.Context, includeAssistant bool, forceAssistantTail bool) error {
+	if len(p.progress) > 0 {
+		text := formatBatchMessage("Progress", p.progress)
+		if strings.TrimSpace(text) != "" {
+			if err := p.client.PostThreadMessage(ctx, slack.Message{
+				ChannelID: p.req.ChannelID,
+				ThreadTS:  p.req.ThreadTS,
+				Text:      text,
+			}); err != nil {
+				return err
+			}
 		}
-		p.pendingCount = 0
-		return nil
-	}
-
-	text := formatLiveProgressMessage(progressLines, assistant)
-	if strings.TrimSpace(text) == "" {
 		p.progress = p.progress[:0]
-		if includeAssistant {
-			p.assistantProgress.Reset()
-			p.flushedAssistantProgress = ""
-		}
-		p.pendingCount = 0
-		return nil
 	}
-
-	if err := p.postOrUpdateProgress(ctx, text); err != nil {
-		return err
-	}
-
-	p.progress = p.progress[:0]
-	p.flushedProgress = progressLines
 	if includeAssistant {
-		p.flushedAssistantProgress = assistant
+		chunks, remainder := splitSlackStreamingText(p.assistantProgress.String(), forceAssistantTail)
+		for _, chunk := range chunks {
+			if err := p.client.PostThreadMessage(ctx, slack.Message{
+				ChannelID: p.req.ChannelID,
+				ThreadTS:  p.req.ThreadTS,
+				Text:      chunk,
+			}); err != nil {
+				return err
+			}
+		}
+		p.assistantProgress.Reset()
+		if remainder != "" {
+			p.assistantProgress.WriteString(remainder)
+		}
 	}
 	p.pendingCount = 0
 	return nil
 }
 
-func (p *SlackThreadProgressPublisher) postOrUpdateProgress(ctx context.Context, text string) error {
-	if p.progressMessageTS != "" {
-		if updater, ok := p.client.(slack.MessageUpdater); ok {
-			return updater.UpdateMessage(ctx, slack.MessageUpdate{
-				ChannelID: p.req.ChannelID,
-				Timestamp: p.progressMessageTS,
-				Text:      text,
-			})
+func hasFlushableSlackStreamChunk(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
+	}
+	runes := []rune(text)
+	if len(runes) > streamingSlackMessageSoftLimit {
+		return true
+	}
+	for _, r := range runes {
+		if r == '\n' {
+			return true
 		}
-		return p.client.PostThreadMessage(ctx, slack.Message{
-			ChannelID: p.req.ChannelID,
-			ThreadTS:  p.req.ThreadTS,
-			Text:      text,
-		})
+	}
+	return false
+}
+
+func splitSlackStreamingText(text string, flushTail bool) ([]string, string) {
+	remaining := []rune(text)
+	chunks := make([]string, 0, len(remaining)/streamingSlackMessageSoftLimit+1)
+
+	for len(remaining) > 0 {
+		cut := -1
+		if len(remaining) > streamingSlackMessageSoftLimit {
+			cut = streamingSlackMessageSoftLimit
+			for i := streamingSlackMessageSoftLimit; i > 0; i-- {
+				if remaining[i-1] == '\n' {
+					cut = i - 1
+					break
+				}
+			}
+		} else {
+			for i := len(remaining); i > 0; i-- {
+				if remaining[i-1] == '\n' {
+					cut = i - 1
+					break
+				}
+			}
+			if cut < 0 && !flushTail {
+				break
+			}
+			if cut < 0 {
+				cut = len(remaining)
+			}
+		}
+
+		if cut == 0 && len(remaining) > 0 && remaining[0] == '\n' {
+			remaining = remaining[1:]
+			continue
+		}
+		if cut <= 0 {
+			cut = minInt(len(remaining), streamingSlackMessageSoftLimit)
+		}
+
+		chunk := strings.TrimRight(string(remaining[:cut]), "\n")
+		if strings.TrimSpace(chunk) != "" {
+			chunks = append(chunks, chunk)
+		}
+		remaining = remaining[cut:]
+		if len(remaining) > 0 && remaining[0] == '\n' {
+			remaining = remaining[1:]
+		}
+		if !flushTail && len(remaining) <= streamingSlackMessageSoftLimit {
+			hasNewline := false
+			for _, r := range remaining {
+				if r == '\n' {
+					hasNewline = true
+					break
+				}
+			}
+			if !hasNewline {
+				break
+			}
+		}
 	}
 
-	posted, err := p.client.PostMessage(ctx, slack.Message{
-		ChannelID: p.req.ChannelID,
-		ThreadTS:  p.req.ThreadTS,
-		Text:      text,
-	})
-	if err != nil {
-		return err
+	return chunks, string(remaining)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
 	}
-	p.progressMessageTS = strings.TrimSpace(posted.Timestamp)
-	return nil
+	return b
 }

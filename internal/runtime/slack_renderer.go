@@ -124,9 +124,9 @@ func buildSlackThreadMessages(req SlackThreadRenderRequest, events []ACPXTurnEve
 		case ACPXEventAssistantThinking:
 			appendProgress("Thinking" + suffixWithText(event.Text))
 		case ACPXEventToolStarted:
-			appendProgress(formatToolLine("started", event))
+			continue
 		case ACPXEventToolFinished:
-			appendProgress(formatToolLine("finished", event))
+			continue
 		case ACPXEventAssistantMessageChunk:
 			appendAssistantChunk(event.Text)
 		case ACPXEventAssistantMessageFinal:

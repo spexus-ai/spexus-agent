@@ -981,14 +981,14 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesLiveProgressBeforeC
 		SessionName: prepared.SessionName,
 	}
 	go func() {
-		got, err := starter.collectPromptEvents(context.Background(), prepared, request, "status")
+		got, err := starter.collectPromptEvents(context.Background(), prepared, request, "status", false)
 		resultCh <- result{sessionName: got.sessionName, events: got.events, err: err}
 	}()
 
 	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventSessionStarted, Text: "slack-1713686400.000100"}
 	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantThinking, Text: "analyzing"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventToolStarted, ToolName: "grep", Text: "searching"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventToolFinished, ToolName: "grep", ToolStatus: "completed"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantThinking, Text: "checking"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantThinking, Text: "ready"}
 
 	waitForCondition(t, 2*time.Second, func() bool {
 		messages := client.snapshotMessages()
@@ -996,7 +996,7 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesLiveProgressBeforeC
 	})
 
 	messages := client.snapshotMessages()
-	if messages[0].Text != "Progress:\n- Session started: slack-1713686400.000100\n- Thinking: analyzing\n- Tool started: grep - searching\n- Tool finished: grep" {
+	if messages[0].Text != "Progress:\n- Session started: slack-1713686400.000100\n- Thinking: analyzing\n- Thinking: checking\n- Thinking: ready" {
 		t.Fatalf("live progress message = %q", messages[0].Text)
 	}
 
@@ -1076,21 +1076,21 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesAssistantOnlyProgre
 
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := starter.collectPromptEvents(context.Background(), prepared, request, "status")
+		_, err := starter.collectPromptEvents(context.Background(), prepared, request, "status", false)
 		resultCh <- err
 	}()
 
 	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: "hello"}
 	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: " world"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: " from"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: "\nfrom"}
 	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: " acpx"}
 
 	waitForCondition(t, 2*time.Second, func() bool {
 		messages := client.snapshotMessages()
-		return len(messages) == 1 && messages[0].Text == "hello world from acpx"
+		return len(messages) == 1 && messages[0].Text == "hello world"
 	})
 
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageFinal, Text: "hello world from acpx"}
+	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageFinal, Text: "hello world\nfrom acpx"}
 	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventSessionDone}
 	close(stream.events)
 	stream.waitCh <- nil
@@ -1100,11 +1100,14 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesAssistantOnlyProgre
 	}
 
 	messages := client.snapshotMessages()
-	if got, want := len(messages), 1; got != want {
+	if got, want := len(messages), 2; got != want {
 		t.Fatalf("slack message count = %d, want %d", got, want)
 	}
-	if messages[0].Text != "hello world from acpx" {
-		t.Fatalf("final slack message = %q, want final answer", messages[0].Text)
+	if messages[0].Text != "hello world" {
+		t.Fatalf("first slack message = %q, want streamed prefix", messages[0].Text)
+	}
+	if messages[1].Text != "from acpx" {
+		t.Fatalf("second slack message = %q, want final tail", messages[1].Text)
 	}
 }
 
@@ -1472,6 +1475,9 @@ func TestForegroundRuntimeStarterProcessesThreadedMentionCommand(t *testing.T) {
 	}
 	if adapter.calls[0].Prompt != "summarize current project state" {
 		t.Fatalf("adapter call prompt = %q, want ask payload without command prefix", adapter.calls[0].Prompt)
+	}
+	if !adapter.calls[0].ForceNew {
+		t.Fatal("adapter call ForceNew = false, want true for ask mention")
 	}
 	if adapter.calls[0].ThreadTS != "1713686400.000100" {
 		t.Fatalf("adapter call thread ts = %q, want existing thread anchor", adapter.calls[0].ThreadTS)
@@ -3428,7 +3434,7 @@ func TestForegroundRuntimeStarterPersistsCancelledExecutionState(t *testing.T) {
 				ChannelID:   project.SlackChannelID,
 				ThreadTS:    "1713686400.000100",
 				UserID:      "U123",
-					CommandText: "<@Ubot> ask status",
+				CommandText: "<@Ubot> ask status",
 			}},
 		},
 		client:      client,
