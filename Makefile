@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := cli
 
-.PHONY: build cli install install-service restart-service tests write-service-env
+.PHONY: build cli install install-service restart-service tests verify-sp-ep-016-agent-compat write-service-env
 
 APP_NAME := spexus-agent
 BIN_DIR := bin
@@ -71,3 +71,8 @@ restart-service: write-service-env
 
 tests:
 	go test ./...
+
+# SP-EP-016 release evidence: the agent has no direct Spexus backend/RBAC API
+# client. Keep that boundary and its supported Slack -> ACPX flow reproducible.
+verify-sp-ep-016-agent-compat:
+	./scripts/sp-ep-016-agent-compat.sh
