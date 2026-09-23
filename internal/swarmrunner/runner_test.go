@@ -67,6 +67,62 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+func TestWorkerCorrectsMalformedBlockedResultBeforePublishing(t *testing.T) {
+	var acceptedID string
+	var published []swarm.ResultPayload
+	handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.URL.Path == swarm.APIPrefix+"/messages" {
+			var message swarm.Envelope
+			if err := json.NewDecoder(q.Body).Decode(&message); err != nil {
+				t.Error(err)
+			}
+			if message.Type == "task.accepted" {
+				acceptedID = message.MessageID
+			}
+			if message.Type == "task.result" {
+				var result swarm.ResultPayload
+				if err := json.Unmarshal(message.Payload, &result); err != nil {
+					t.Error(err)
+				}
+				published = append(published, result)
+			}
+			writeJSON(w, swarm.Receipt{MessageID: message.MessageID, Receipt: "stored", MailboxSeq: 2})
+			return
+		}
+		if strings.Contains(q.URL.Path, "/jobs/") {
+			writeJSON(w, swarm.JobView{JobID: job, FeatureID: feature, CurrentAttemptID: attempt, Attempts: []swarm.Attempt{{AttemptID: attempt, AssignedAgentID: "worker-a", State: "running", AcceptedMessageID: acceptedID}}})
+			return
+		}
+		t.Errorf("unexpected request %s", q.URL.Path)
+		w.WriteHeader(404)
+	})
+	r, _ := runnerFixture(t, handler)
+	r.cfg.WireVersion = 2
+	d := dispatchFixture(r)
+	d.ProtocolVersion = 2
+	storeInput(t, r, d)
+	launches := 0
+	r.model = modelFunc(func(_ context.Context, _, input string) (string, bool, error) {
+		launches++
+		base := `{"outcome":"blocked","summary":"Нужен формат","evidence":[],"error":null,"blocker":{"reason":"Формат выбирает человек","context":"A ждёт","question":"Короткий или подробный?","options":[{"id":"short","label":"Короткий"},{"id":"detailed","label":"Подробный"}],"recommendation":"short","kind":"choice"`
+		if launches == 1 {
+			return base + `,"blocked_work":"A"}}`, false, nil
+		}
+		if !strings.Contains(input, "strict validation") {
+			t.Error("correction prompt missing")
+		}
+		return base + `}}`, false, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := r.process(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	if launches != 2 || len(published) != 1 || published[0].Outcome != "blocked" {
+		t.Fatalf("launches=%d results=%+v", launches, published)
+	}
+}
 func httpError(w http.ResponseWriter, status int, code string) {
 	w.WriteHeader(status)
 	writeJSON(w, map[string]any{"error": map[string]any{"code": code}})

@@ -394,7 +394,26 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 		result = failedResult("model_execution_failed")
 	} else {
 		result, e = r.workerResult(d, raw)
-		if e != nil {
+		if e != nil && ctx.Err() == nil {
+			// A malformed FINAL object has not been published. Give Pi one
+			// bounded correction before turning the attempt into a failure.
+			correction := input + "\nYour preceding FINAL JSON failed strict validation. Return the complete corrected JSON object only. For a blocked result, blocker has exactly reason, context, question, options, recommendation and kind; never add dependency_id or blocked_work. The runtime creates IDs. Do not claim that the work was completed."
+			var corrected string
+			corrected, cancelled, runErr = r.run(ctx, d, correction)
+			if corrected != "" {
+				if journalErr := r.journal.modelOutput(d.MailboxSeq, corrected); journalErr != nil {
+					return journalErr
+				}
+			}
+			if !cancelled && runErr == nil {
+				result, e = r.workerResult(d, corrected)
+			}
+		}
+		if cancelled {
+			result = cancelResult(false, nil)
+		} else if runErr != nil {
+			result = failedResult("model_execution_failed")
+		} else if e != nil {
 			result = failedResult("model_output_invalid")
 		}
 	}
