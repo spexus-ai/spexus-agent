@@ -56,6 +56,10 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 func fixturePi() {
+	if os.Getenv("SWARM_HUMAN_MODE") == "1" {
+		fixtureHumanPi()
+		return
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	if !scanner.Scan() {
