@@ -23,6 +23,10 @@ type SlackSource struct {
 	ActorID       string `json:"actor_id"`
 	Text          string `json:"text"`
 	EventID       string `json:"event_id,omitempty"`
+	SourceKind    string `json:"source_kind,omitempty"`
+	QuestionTS    string `json:"question_ts,omitempty"`
+	RequestID     string `json:"request_id,omitempty"`
+	OptionID      string `json:"option_id,omitempty"`
 	DuringCatchup bool   `json:"during_catchup,omitempty"`
 }
 
@@ -55,8 +59,11 @@ func slackTSCompare(a, b string) int {
 }
 
 func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, error) {
-	if s.cfg.WireVersion != 2 || !uuid(in.FeatureID) || in.WorkspaceID != s.cfg.Human.WorkspaceID || in.ChannelID == "" || in.ActorID == "" || !validSlackTS(in.MessageTS) || !validSlackTS(in.ThreadTS) || len(in.Text) > 16*1024 {
+	if s.cfg.WireVersion != 2 || !uuid(in.FeatureID) || in.WorkspaceID != s.cfg.Human.WorkspaceID || in.ChannelID == "" || in.ActorID == "" || !validSlackTS(in.MessageTS) || !validSlackTS(in.ThreadTS) || len(in.Text) > 16*1024 || in.SourceKind != "" && in.SourceKind != "block_action" {
 		return false, wireError(400, "invalid_slack_source")
+	}
+	if in.SourceKind == "block_action" && (!uuid(in.RequestID) || !validSlackTS(in.QuestionTS) || in.OptionID == "" || len(in.OptionID) > 64 || in.Text != "") {
+		return false, wireError(400, "invalid_slack_action")
 	}
 	duplicate := false
 	err := s.transaction(ctx, func(tx *sql.Tx) error {
@@ -66,6 +73,16 @@ func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, er
 		}
 		if f.ChannelID != in.ChannelID || f.ThreadTS != in.ThreadTS || !allowedActor(f, in.ActorID) {
 			return wireError(403, "untrusted_slack_source")
+		}
+		if in.SourceKind == "block_action" {
+			var raw []byte
+			if err := tx.QueryRowContext(ctx, "SELECT data FROM slack_outbox WHERE id=? AND feature_id=?", in.RequestID, in.FeatureID).Scan(&raw); err != nil {
+				return wireError(403, "unknown_slack_question")
+			}
+			var q SlackDelivery
+			if json.Unmarshal(raw, &q) != nil || q.Status != "sent" || q.ChannelID != in.ChannelID || q.ThreadTS != in.ThreadTS || q.SlackTS != in.QuestionTS {
+				return wireError(403, "untrusted_slack_question")
+			}
 		}
 		// The event ID is a delivery alias, not part of immutable source content.
 		canonical := in
@@ -108,6 +125,23 @@ func (s *Store) SlackSourceExists(ctx context.Context, workspace, channel, messa
 	var n int
 	err := s.db.QueryRowContext(ctx, "SELECT count(*) FROM slack_sources WHERE workspace_id=? AND channel_id=? AND message_ts=?", workspace, channel, messageTS).Scan(&n)
 	return n != 0, err
+}
+
+// PublishedHumanQuestion resolves the feature thread from the bot's recorded
+// message. Slack does not always include message.thread_ts in block_actions.
+func (s *Store) PublishedHumanQuestion(ctx context.Context, requestID, questionTS string) (string, string, error) {
+	if !uuid(requestID) || !validSlackTS(questionTS) {
+		return "", "", wireError(400, "invalid_slack_question")
+	}
+	var raw []byte
+	if err := s.db.QueryRowContext(ctx, "SELECT data FROM slack_outbox WHERE id=?", requestID).Scan(&raw); err != nil {
+		return "", "", wireError(404, "unknown_slack_question")
+	}
+	var d SlackDelivery
+	if json.Unmarshal(raw, &d) != nil || d.Status != "sent" || d.SlackTS != questionTS {
+		return "", "", wireError(403, "untrusted_slack_question")
+	}
+	return d.FeatureID, d.ThreadTS, nil
 }
 
 func (s *Store) PendingSlackSources(ctx context.Context, featureID string) ([]SlackSource, error) {

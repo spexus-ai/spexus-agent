@@ -51,6 +51,14 @@ type Event struct {
 	Timestamp   string
 	UserID      string
 	Text        string
+	HumanAction *HumanAction
+}
+
+// HumanAction is transport metadata from a Block Kit click, never model text.
+type HumanAction struct {
+	RequestID  string
+	OptionID   string
+	QuestionTS string
 }
 
 const (

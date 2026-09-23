@@ -355,6 +355,9 @@ func decodeSocketModeEnvelope(data []byte) (socketModeEnvelope, error) {
 }
 
 func eventFromSocketModeEnvelope(envelope socketModeEnvelope) (Event, bool, error) {
+	if strings.TrimSpace(envelope.Type) == "interactive" {
+		return humanActionFromSocketModeEnvelope(envelope)
+	}
 	if strings.TrimSpace(envelope.Type) != SocketModeEnvelopeEventsAPI {
 		return Event{}, false, nil
 	}

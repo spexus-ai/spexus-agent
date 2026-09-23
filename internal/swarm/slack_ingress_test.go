@@ -40,6 +40,55 @@ func TestSlackSourceDedupAndConflict(t *testing.T) {
 	}
 }
 
+// Test: the click is committed only for the published request's exact channel,
+// thread and bot message. A repeated Socket envelope has one local source.
+// Validates: AC-431/464 (REQ-349/391 - click provenance and deduplication).
+func TestHumanButtonSourceRequiresPublishedQuestion(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	requestID := NewID()
+	question := SlackDelivery{ID: requestID, FeatureID: f.feature.FeatureID, ChannelID: f.feature.ChannelID, ThreadTS: f.feature.ThreadTS, SlackTS: "123.000005", Status: "sent"}
+	if err := f.s.transaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, "INSERT INTO slack_outbox(id,feature_id,turn_id,status,data) VALUES(?,?,NULL,?,?)", question.ID, question.FeatureID, question.Status, mustJSON(question))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if featureID, thread, err := f.s.PublishedHumanQuestion(ctx, requestID, question.SlackTS); err != nil || featureID != f.feature.FeatureID || thread != f.feature.ThreadTS {
+		t.Fatalf("published question scope feature=%q thread=%q err=%v", featureID, thread, err)
+	}
+	if _, _, err := f.s.PublishedHumanQuestion(ctx, requestID, "123.000006"); err == nil {
+		t.Fatal("wrong bot timestamp resolved feature")
+	}
+	base := SlackSource{WorkspaceID: "workspace", ChannelID: f.feature.ChannelID, ThreadTS: f.feature.ThreadTS, MessageTS: "124.000001", FeatureID: f.feature.FeatureID, ActorID: "human", SourceKind: "block_action", QuestionTS: question.SlackTS, RequestID: requestID, OptionID: "a"}
+	for _, tc := range []struct {
+		name   string
+		change func(*SlackSource)
+	}{
+		{"wrong question", func(s *SlackSource) { s.QuestionTS = "123.000006" }},
+		{"wrong request", func(s *SlackSource) { s.RequestID = NewID() }},
+		{"foreign actor", func(s *SlackSource) { s.ActorID = "other" }},
+		{"foreign thread", func(s *SlackSource) { s.ThreadTS = "123.000009" }},
+	} {
+		in := base
+		tc.change(&in)
+		if _, err := f.s.CommitSlackSource(ctx, in); err == nil {
+			t.Fatalf("%s accepted", tc.name)
+		}
+	}
+	if duplicate, err := f.s.CommitSlackSource(ctx, base); err != nil || duplicate {
+		t.Fatalf("first click duplicate=%t err=%v", duplicate, err)
+	}
+	if duplicate, err := f.s.CommitSlackSource(ctx, base); err != nil || !duplicate {
+		t.Fatalf("repeat click duplicate=%t err=%v", duplicate, err)
+	}
+	conflict := base
+	conflict.OptionID = "b"
+	if _, err := f.s.CommitSlackSource(ctx, conflict); err == nil {
+		t.Fatal("one click timestamp changed option")
+	}
+}
+
 // Test: a valid but oversized request is rejected before backend create, so
 // Slack cannot truncate the decision options or answer syntax.
 // Validates: AC-464 (REQ-391 - complete human question and response options).

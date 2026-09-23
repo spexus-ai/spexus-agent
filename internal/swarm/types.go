@@ -304,14 +304,18 @@ type OwnerFinishReceipt struct {
 	ReplyStatus string `json:"reply_status"`
 }
 type SlackDelivery struct {
-	ID        string `json:"id"`
-	FeatureID string `json:"feature_id"`
-	TurnID    string `json:"turn_id"`
-	ChannelID string `json:"channel_id"`
-	ThreadTS  string `json:"thread_ts"`
-	Text      string `json:"text"`
-	Status    string `json:"status"`
-	SlackTS   string `json:"slack_ts"`
+	ID        string         `json:"id"`
+	FeatureID string         `json:"feature_id"`
+	TurnID    string         `json:"turn_id"`
+	ChannelID string         `json:"channel_id"`
+	ThreadTS  string         `json:"thread_ts"`
+	Text      string         `json:"text"`
+	Status    string         `json:"status"`
+	SlackTS   string         `json:"slack_ts"`
+	Question  *HumanQuestion `json:"question,omitempty"`
+}
+type HumanQuestion struct {
+	Options []HumanOption `json:"options"`
 }
 type AuditEvent struct {
 	Seq        int64  `json:"seq"`

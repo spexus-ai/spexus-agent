@@ -13,7 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/spexus-ai/spexus-agent/internal/slack"
 	"github.com/spexus-ai/spexus-agent/internal/swarm"
 )
 
@@ -212,7 +214,11 @@ func (a *API) Post(ctx context.Context, d swarm.SlackDelivery) (string, error) {
 		Error string `json:"error"`
 		TS    string `json:"ts"`
 	}
-	err := a.call(ctx, "chat.postMessage", map[string]any{"channel": d.ChannelID, "thread_ts": d.ThreadTS, "text": d.Text, "client_msg_id": d.ID, "metadata": map[string]any{"event_type": "spexus_swarm_reply", "event_payload": map[string]string{"delivery_id": d.ID, "turn_id": d.TurnID}}}, &res)
+	payload := map[string]any{"channel": d.ChannelID, "thread_ts": d.ThreadTS, "text": d.Text, "client_msg_id": d.ID, "metadata": map[string]any{"event_type": "spexus_swarm_reply", "event_payload": map[string]string{"delivery_id": d.ID, "turn_id": d.TurnID}}}
+	if d.Question != nil {
+		payload["blocks"] = humanQuestionBlocks(d.Text, d.ID, d.Question.Options, false)
+	}
+	err := a.call(ctx, "chat.postMessage", payload, &res)
 	if err != nil {
 		return "", err
 	}
@@ -223,6 +229,78 @@ func (a *API) Post(ctx context.Context, d swarm.SlackDelivery) (string, error) {
 		return "", errors.New("slack missing timestamp")
 	}
 	return res.TS, nil
+}
+
+// UpdateHumanQuestion is safe to repeat after an unknown chat.update outcome:
+// it replaces the same bot message with deterministic blocks and text.
+func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, options []swarm.HumanOption, state, result string) error {
+	if d.Status != "sent" || !validTimestamp(d.SlackTS) {
+		return errors.New("human question has no published Slack message")
+	}
+	message := humanReadableQuestionText(d.Text)
+	switch state {
+	case "open":
+	case "stopped":
+		message += "\nРабота остановлена. Ответы сейчас недоступны."
+	case "cancelled":
+		message += "\nЗапрос отменён. Ответы больше не принимаются."
+	case "answered", "denied":
+		message += "\nРешение записано в Spexus. Ответы больше не принимаются."
+		if result != "" {
+			message += " " + result
+		}
+	default:
+		return errors.New("unknown human question state")
+	}
+	var res struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := a.call(ctx, "chat.update", map[string]any{"channel": d.ChannelID, "ts": d.SlackTS, "text": message, "blocks": humanQuestionBlocks(message, d.ID, options, state != "open")}, &res); err != nil {
+		return err
+	}
+	if !res.OK {
+		return fmt.Errorf("slack question update rejected: %s", res.Error)
+	}
+	return nil
+}
+
+func humanReadableQuestionText(message string) string {
+	lines := strings.Split(message, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "Ответ: !answer ") {
+			lines[i] = "Выберите вариант кнопкой ниже."
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func humanQuestionBlocks(message, requestID string, options []swarm.HumanOption, closed bool) []map[string]any {
+	blocks := make([]map[string]any, 0, 18)
+	for len(message) > 0 {
+		cut := 2900
+		if len(message) < cut {
+			cut = len(message)
+		}
+		for cut > 0 && cut < len(message) && !utf8.RuneStart(message[cut]) {
+			cut--
+		}
+		blocks = append(blocks, map[string]any{"type": "section", "text": map[string]any{"type": "plain_text", "text": message[:cut], "emoji": false}})
+		message = message[cut:]
+	}
+	if !closed && len(options) > 0 {
+		elements := make([]map[string]any, 0, len(options))
+		for _, option := range options {
+			label := option.Label
+			if len([]rune(label)) > 70 {
+				label = string([]rune(label)[:69]) + "…"
+			}
+			value, _ := json.Marshal(map[string]string{"request_id": requestID, "option_id": option.ID})
+			elements = append(elements, map[string]any{"type": "button", "text": map[string]any{"type": "plain_text", "text": label, "emoji": false}, "action_id": slack.HumanAnswerActionID + ":" + option.ID, "value": string(value), "accessibility_label": label})
+		}
+		blocks = append(blocks, map[string]any{"type": "actions", "elements": elements})
+	}
+	return blocks
 }
 
 // Find checks every page of the original thread. An incomplete/unavailable

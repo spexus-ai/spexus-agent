@@ -104,8 +104,7 @@ func (s *Store) humanRequest(ctx context.Context, tx *sql.Tx, e Envelope, p Huma
 		d.Blocker.Context = contextWithWork
 	}
 	// Slack truncates long postMessage text. A human request must expose its
-	// full UUID, context, options, recommendation, blocked work and syntax in
-	// one complete question; reject oversized requests before canonical create.
+	// full UUID, context, options, recommendation and blocked work.
 	if len(questionText(d)) > 35*1024 {
 		return wireError(400, "slack_question_too_large")
 	}
@@ -371,10 +370,10 @@ func questionText(d Dependency) string {
 	for _, o := range d.Blocker.Options {
 		fmt.Fprintf(&b, "\n• %s — %s", o.ID, o.Label)
 	}
-	if len(d.Blocker.Options) == 0 {
-		fmt.Fprintf(&b, "\nОтвет: !answer %s text <текст> или !answer %s deny <причина>", d.RequestID, d.RequestID)
+	if len(d.Blocker.Options) > 0 {
+		b.WriteString("\nВыберите вариант кнопкой ниже.")
 	} else {
-		fmt.Fprintf(&b, "\nОтвет: !answer %s <option-id> [текст] или !answer %s deny <причина>", d.RequestID, d.RequestID)
+		b.WriteString("\nОтветьте через доступное действие в сообщении.")
 	}
 	return b.String()
 }

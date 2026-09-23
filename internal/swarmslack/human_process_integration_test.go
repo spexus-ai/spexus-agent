@@ -147,8 +147,9 @@ func fixtureHumanPi() {
 }
 
 type humanSlackFixture struct {
-	mu    sync.Mutex
-	posts []swarm.SlackDelivery
+	mu      sync.Mutex
+	posts   []swarm.SlackDelivery
+	updates []string
 }
 
 func (f *humanSlackFixture) VerifyWorkspace(_ context.Context, configured string) error {
@@ -173,6 +174,17 @@ func (f *humanSlackFixture) Find(_ context.Context, d swarm.SlackDelivery) (stri
 		}
 	}
 	return "", false, nil
+}
+func (f *humanSlackFixture) UpdateHumanQuestion(_ context.Context, d swarm.SlackDelivery, _ []swarm.HumanOption, state, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if d.SlackTS != "1790000000.000100" {
+		return fmt.Errorf("updated wrong question")
+	}
+	if state != "open" {
+		f.updates = append(f.updates, d.ID)
+	}
+	return nil
 }
 func (f *humanSlackFixture) ScanThread(context.Context, string, string, string, func(string, string, string, string, bool) error) (string, error) {
 	return "", nil
@@ -454,7 +466,7 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 	if h = history(); h.HumanRequests[0].BackendState != "open" || h.Dependencies[0].State != "human_waiting" {
 		t.Fatal("foreign Slack actor changed human request")
 	}
-	answer := slack.Event{ID: eventID("answer"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(3), UserID: "U-P3-HUMAN", Text: "!answer " + dep.RequestID + " safe Use the safe path"}
+	answer := slack.Event{ID: eventID("answer"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, Timestamp: ts(3), UserID: "U-P3-HUMAN", HumanAction: &slack.HumanAction{RequestID: dep.RequestID, OptionID: "safe", QuestionTS: "1790000000.000100"}}
 	if err = source.Send(ctx, answer); err != nil {
 		t.Fatal(err)
 	}
@@ -486,6 +498,16 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 	if len(after.Turns) != len(h.Turns) || len(after.Jobs) != 2 {
 		t.Fatal("duplicate Slack answer repeated owner work")
 	}
+	eventually(t, "answered question buttons disabled", func() bool {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		for _, id := range api.updates {
+			if id == dep.RequestID {
+				return true
+			}
+		}
+		return false
+	})
 	for _, j := range after.Jobs {
 		if j.JobID == dep.JobID && len(j.Attempts) != 2 {
 			t.Fatal("duplicate answer added A attempt")

@@ -2,6 +2,7 @@ package swarmslack
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -24,6 +25,7 @@ type HumanStore interface {
 	AdvanceSlackWatermark(context.Context, string, string) error
 	SetRecoveryBarrier(context.Context, string, string) error
 	RecordHumanAnswer(context.Context, swarm.HumanAnswerInput) (string, bool, error)
+	PublishedHumanQuestion(context.Context, string, string) (string, string, error)
 }
 
 type ThreadHistoryAPI interface {
@@ -32,12 +34,13 @@ type ThreadHistoryAPI interface {
 }
 
 type humanIngress struct {
-	bridge    *Bridge
-	store     HumanStore
-	history   ThreadHistoryAPI
-	workspace string
-	mu        sync.Mutex
-	stopMu    sync.Mutex
+	bridge          *Bridge
+	store           HumanStore
+	history         ThreadHistoryAPI
+	workspace       string
+	mu              sync.Mutex
+	stopMu          sync.Mutex
+	questionUpdates map[string]string
 }
 
 var requestIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
@@ -56,7 +59,7 @@ func (b *Bridge) RunHuman(ctx context.Context, source slack.DurableEventSource, 
 	if err := history.VerifyWorkspace(ctx, workspace); err != nil {
 		return err
 	}
-	h := &humanIngress{bridge: b, store: store, history: history, workspace: workspace}
+	h := &humanIngress{bridge: b, store: store, history: history, workspace: workspace, questionUpdates: map[string]string{}}
 	for _, f := range b.Features {
 		if _, err := store.SlackWatermark(ctx, f.FeatureID); err != nil {
 			return err
@@ -87,6 +90,9 @@ func (b *Bridge) RunHuman(ctx context.Context, source slack.DurableEventSource, 
 					}
 				}
 				h.mu.Unlock()
+				if err := h.syncQuestionMessages(ctx); err != nil {
+					b.log("Slack question update pending: %v", err)
+				}
 				if err := b.DeliverOne(ctx); err != nil {
 					b.log("Slack publication pending: %v", err)
 				}
@@ -103,6 +109,81 @@ func (b *Bridge) RunHuman(ctx context.Context, source slack.DurableEventSource, 
 		return nil
 	}
 	return err
+}
+
+type questionUpdater interface {
+	UpdateHumanQuestion(context.Context, swarm.SlackDelivery, []swarm.HumanOption, string, string) error
+}
+
+// Legacy text questions are upgraded in place; canonical backend state removes
+// buttons after a decision. chat.update is repeatable across coordinator restarts.
+func (h *humanIngress) syncQuestionMessages(ctx context.Context) error {
+	api, ok := h.bridge.API.(questionUpdater)
+	if !ok {
+		return errors.New("Slack question update API unavailable")
+	}
+	for _, f := range h.bridge.Features {
+		view, err := h.store.History(ctx, f.FeatureID)
+		if err != nil {
+			return err
+		}
+		for _, sent := range view.SlackOutbox {
+			if sent.Status != "sent" || sent.SlackTS == "" {
+				continue
+			}
+			for _, projection := range view.HumanRequests {
+				if projection.RequestID != sent.ID {
+					continue
+				}
+				state := projection.BackendState
+				if state == "open" && view.Feature.Stopped {
+					state = "stopped"
+				}
+				if h.questionUpdates[sent.ID] == state {
+					break
+				}
+				if sent.Question != nil && state == "open" {
+					h.questionUpdates[sent.ID] = state
+					break
+				}
+				options := []swarm.HumanOption{}
+				for _, d := range view.Dependencies {
+					if d.RequestID == sent.ID {
+						options = d.Blocker.Options
+						break
+					}
+				}
+				if err := api.UpdateHumanQuestion(ctx, sent, options, state, canonicalDecisionSummary(projection, options)); err != nil {
+					return err
+				}
+				h.questionUpdates[sent.ID] = state
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func canonicalDecisionSummary(projection swarm.HumanProjection, options []swarm.HumanOption) string {
+	if projection.BackendState != "answered" {
+		return ""
+	}
+	var view struct {
+		Terminal *struct {
+			Response struct {
+				OptionID *string `json:"option_id"`
+			} `json:"response"`
+		} `json:"terminal"`
+	}
+	if json.Unmarshal(projection.View, &view) != nil || view.Terminal == nil || view.Terminal.Response.OptionID == nil {
+		return ""
+	}
+	for _, option := range options {
+		if option.ID == *view.Terminal.Response.OptionID {
+			return "Выбран вариант: " + option.Label + "."
+		}
+	}
+	return ""
 }
 
 func (h *humanIngress) connected(ctx context.Context) error {
@@ -202,6 +283,23 @@ func (h *humanIngress) scanAll(ctx context.Context) error {
 }
 
 func (h *humanIngress) handle(ctx context.Context, event slack.Event) error {
+	if event.HumanAction != nil {
+		featureID, thread, err := h.store.PublishedHumanQuestion(ctx, event.HumanAction.RequestID, event.HumanAction.QuestionTS)
+		if err != nil {
+			return err
+		}
+		if event.ThreadTS != "" && event.ThreadTS != thread {
+			return errors.New("Slack action thread mismatch")
+		}
+		event.ThreadTS = thread
+		for _, f := range h.bridge.Features {
+			if f.FeatureID == featureID && f.ChannelID == event.ChannelID && f.ThreadTS == thread {
+				_, err = h.commit(ctx, f, event)
+				return err
+			}
+		}
+		return errors.New("Slack action feature mismatch")
+	}
 	for _, f := range h.bridge.Features {
 		if f.ChannelID != event.ChannelID || f.ThreadTS != event.ThreadTimestamp() {
 			continue
@@ -225,6 +323,9 @@ func (h *humanIngress) commit(ctx context.Context, f swarm.Feature, event slack.
 		defer h.stopMu.Unlock()
 	}
 	in := swarm.SlackSource{WorkspaceID: h.workspace, ChannelID: event.ChannelID, MessageTS: event.Timestamp, ThreadTS: event.ThreadTimestamp(), FeatureID: f.FeatureID, ActorID: event.UserID, Text: event.Text, EventID: event.ID}
+	if event.HumanAction != nil {
+		in.SourceKind, in.QuestionTS, in.RequestID, in.OptionID = "block_action", event.HumanAction.QuestionTS, event.HumanAction.RequestID, event.HumanAction.OptionID
+	}
 	duplicate, err := h.store.CommitSlackSource(ctx, in)
 	if err != nil {
 		return false, err
@@ -323,6 +424,21 @@ func (h *humanIngress) processStops(ctx context.Context, featureID string) error
 func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, recovering bool) error {
 	text := strings.TrimSpace(in.Text)
 	switch {
+	case in.SourceKind == "block_action":
+		answer := swarm.HumanAnswerInput{RequestID: in.RequestID, Kind: "answer", OptionID: in.OptionID, WorkspaceID: in.WorkspaceID, ChannelID: in.ChannelID, ThreadTS: in.ThreadTS, MessageTS: in.MessageTS, ActorID: in.ActorID}
+		if _, _, err := h.store.RecordHumanAnswer(ctx, answer); err != nil {
+			var api *swarm.APIError
+			if errors.As(err, &api) && api.Code == "request_not_waiting" {
+				return err
+			}
+			if !errors.As(err, &api) || api.Status >= 500 {
+				return err
+			}
+			return h.rejection(ctx, in, err)
+		}
+		if err := h.notice(ctx, in, "Выбор принят. Сохраняю решение в Spexus; оркестратор продолжит связанную работу после подтверждения."); err != nil {
+			return err
+		}
 	case text == "!continue":
 		if recovering || in.DuringCatchup {
 			if err := h.notice(ctx, in, "После сверки истории отправьте новую команду !continue, если хотите продолжить работу."); err != nil {
@@ -392,7 +508,11 @@ func (h *humanIngress) rejection(ctx context.Context, in swarm.SlackSource, reas
 	if errors.As(reason, &api) {
 		code = api.Code
 	}
-	if err := h.notice(ctx, in, "Запрос не принят: "+code+". Проверьте полный UUID и используйте !status."); err != nil {
+	message := "Запрос не принят: " + code + ". Проверьте полный UUID и используйте !status."
+	if in.SourceKind == "block_action" {
+		message = "Выбор не принят: " + code + ". Состояние запроса можно проверить командой !status."
+	}
+	if err := h.notice(ctx, in, message); err != nil {
 		return err
 	}
 	return h.store.SettleSlackSource(ctx, in)

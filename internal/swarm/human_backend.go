@@ -576,7 +576,7 @@ func (s *Store) acceptHumanEnvelope(ctx context.Context, requestID string, b []b
 				if err != nil {
 					return err
 				}
-				out := SlackDelivery{ID: d.RequestID, FeatureID: d.FeatureID, ChannelID: f.ChannelID, ThreadTS: f.ThreadTS, Text: questionText(d), Status: "queued"}
+				out := SlackDelivery{ID: d.RequestID, FeatureID: d.FeatureID, ChannelID: f.ChannelID, ThreadTS: f.ThreadTS, Text: questionText(d), Status: "queued", Question: &HumanQuestion{Options: d.Blocker.Options}}
 				_, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO slack_outbox(id,feature_id,turn_id,status,data) VALUES(?,?,NULL,?,?)", out.ID, out.FeatureID, out.Status, mustJSON(out))
 				return err
 			}
