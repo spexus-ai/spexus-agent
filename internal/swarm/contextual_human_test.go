@@ -25,7 +25,12 @@ func publishedHumanRequest(t *testing.T, f *fixture, options []HumanOption, stat
 		if _, err := tx.ExecContext(ctx, "INSERT INTO human_projections(request_id,dependency_id,state,revision,data) VALUES(?,?,?,?,?)", requestID, d.ID, p.BackendState, p.Revision, mustJSON(p)); err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(ctx, "INSERT INTO slack_outbox(id,feature_id,turn_id,status,data) VALUES(?,?,NULL,?,?)", requestID, f.feature.FeatureID, status, mustJSON(q))
+		selector, err := f.s.humanSelector(ctx, tx, f.feature.FeatureID, requestID)
+		if err != nil {
+			return err
+		}
+		q.ShortSelector = selector
+		_, err = tx.ExecContext(ctx, "INSERT INTO slack_outbox(id,feature_id,turn_id,status,data) VALUES(?,?,NULL,?,?)", requestID, f.feature.FeatureID, status, mustJSON(q))
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -45,7 +50,7 @@ func TestContextualAnswerBindingAndBackendDecisionProvenance(t *testing.T) {
 	if _, err := f.s.CommitSlackSource(ctx, in); err != nil {
 		t.Fatal(err)
 	}
-	bound, err := f.s.BindContextualHumanAnswer(ctx, in, "answer", "Подробно объяснить риск")
+	bound, err := f.s.BindContextualHumanAnswer(ctx, in, "answer", 0, "Подробно объяснить риск")
 	if err != nil || bound != requestID {
 		t.Fatalf("binding=%q err=%v", bound, err)
 	}
@@ -77,13 +82,13 @@ func TestContextualAnswerBindingAndBackendDecisionProvenance(t *testing.T) {
 	if _, err := f.s.db.ExecContext(ctx, "UPDATE human_projections SET state='answered' WHERE request_id=?", requestID); err != nil {
 		t.Fatal(err)
 	}
-	if rebound, err := f.s.BindContextualHumanAnswer(ctx, in, "answer", answer.Text); err != nil || rebound != requestID {
+	if rebound, err := f.s.BindContextualHumanAnswer(ctx, in, "answer", 0, answer.Text); err != nil || rebound != requestID {
 		t.Fatalf("replay binding=%q err=%v", rebound, err)
 	}
 	if same, duplicate, err := f.s.RecordHumanAnswer(ctx, answer); err != nil || !duplicate || same != op {
 		t.Fatalf("decision replay=%q duplicate=%t err=%v", same, duplicate, err)
 	}
-	if _, err := f.s.BindContextualHumanAnswer(ctx, in, "deny", answer.Text); err == nil {
+	if _, err := f.s.BindContextualHumanAnswer(ctx, in, "deny", 0, answer.Text); err == nil {
 		t.Fatal("changed decision intent rebound same Slack source")
 	}
 }
@@ -114,7 +119,7 @@ func TestContextualAnswerRequiresOnePublishedQuestionAndOptionPolicy(t *testing.
 			if _, err := f.s.CommitSlackSource(ctx, in); err != nil {
 				t.Fatal(err)
 			}
-			got, err := f.s.BindContextualHumanAnswer(ctx, in, tc.kind, tc.text)
+			got, err := f.s.BindContextualHumanAnswer(ctx, in, tc.kind, 0, tc.text)
 			if tc.wantError != "" {
 				var api *APIError
 				if !errors.As(err, &api) || api.Code != tc.wantError {
@@ -130,5 +135,131 @@ func TestContextualAnswerRequiresOnePublishedQuestionAndOptionPolicy(t *testing.
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestHumanSelectorsDisambiguateAndNeverReuse(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	first := publishedHumanRequest(t, f, nil, "sent")
+	second := publishedHumanRequest(t, f, nil, "sent")
+	var n1, n2 int
+	if err := f.s.db.QueryRowContext(ctx, `SELECT selector FROM human_request_selectors WHERE request_id=?`, first).Scan(&n1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.db.QueryRowContext(ctx, `SELECT selector FROM human_request_selectors WHERE request_id=?`, second).Scan(&n2); err != nil {
+		t.Fatal(err)
+	}
+	if n1 != 1 || n2 != 2 {
+		t.Fatalf("selectors %d, %d", n1, n2)
+	}
+	in := contextualSlackSource(f, "124.000003", "Ответ #2: второй вопрос")
+	if _, err := f.s.CommitSlackSource(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if selected, err := f.s.BindContextualHumanAnswer(ctx, in, "answer", 2, "второй вопрос"); err != nil || selected != second {
+		t.Fatalf("selected %q, err=%v", selected, err)
+	}
+	in2 := contextualSlackSource(f, "124.000004", "Ответ #3: неизвестный вопрос")
+	if _, err := f.s.CommitSlackSource(ctx, in2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.BindContextualHumanAnswer(ctx, in2, "answer", 3, "неизвестный вопрос"); err == nil {
+		t.Fatal("unknown selector was accepted")
+	}
+	if _, err := f.s.db.ExecContext(ctx, `UPDATE human_projections SET state='answered' WHERE request_id=?`, first); err != nil {
+		t.Fatal(err)
+	}
+	third := publishedHumanRequest(t, f, nil, "sent")
+	var n3 int
+	if err := f.s.db.QueryRowContext(ctx, `SELECT selector FROM human_request_selectors WHERE request_id=?`, third).Scan(&n3); err != nil || n3 != 3 {
+		t.Fatalf("third selector=%d err=%v", n3, err)
+	}
+}
+
+func TestSelectorBackfillAndBoundReplayAfterRevocation(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	first := publishedHumanRequest(t, f, nil, "sent")
+	second := publishedHumanRequest(t, f, nil, "sent")
+	// Simulate an old database whose questions predate short selectors.
+	if err := f.s.transaction(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM human_request_selectors`); err != nil {
+			return err
+		}
+		for _, id := range []string{first, second} {
+			var raw []byte
+			if err := tx.QueryRowContext(ctx, `SELECT data FROM slack_outbox WHERE id=?`, id).Scan(&raw); err != nil {
+				return err
+			}
+			var q SlackDelivery
+			if err := json.Unmarshal(raw, &q); err != nil {
+				return err
+			}
+			q.ShortSelector = 0
+			if _, err := tx.ExecContext(ctx, `UPDATE slack_outbox SET data=? WHERE id=?`, mustJSON(q), id); err != nil {
+				return err
+			}
+		}
+		return f.s.backfillHumanSelectors(ctx, tx)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.transaction(ctx, func(tx *sql.Tx) error { return f.s.backfillHumanSelectors(ctx, tx) }); err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range []string{first, second} {
+		var raw []byte
+		if err := f.s.db.QueryRowContext(ctx, `SELECT data FROM slack_outbox WHERE id=?`, id).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var q SlackDelivery
+		if err := json.Unmarshal(raw, &q); err != nil || q.ShortSelector != i+1 {
+			t.Fatalf("backfill question %d: %+v err=%v", i, q, err)
+		}
+	}
+	in := contextualSlackSource(f, "124.000005", "Отказ #2: недостаточно данных")
+	if _, err := f.s.CommitSlackSource(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.s.BindContextualHumanAnswer(ctx, in, "deny", 2, "недостаточно данных"); err != nil || got != second {
+		t.Fatalf("bind=%q err=%v", got, err)
+	}
+	if _, err := f.s.db.ExecContext(ctx, `UPDATE human_projections SET state='denied' WHERE request_id=?`, second); err != nil {
+		t.Fatal(err)
+	}
+	revoked := f.feature
+	revoked.AllowedActorIDs = []string{"someone-else"}
+	if err := f.s.RegisterFeature(ctx, revoked); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.s.BindContextualHumanAnswer(ctx, in, "deny", 2, "недостаточно данных"); err != nil || got != second {
+		t.Fatalf("replay after revocation=%q err=%v", got, err)
+	}
+	if err := f.s.StopFeature(ctx, f.feature.FeatureID, "someone-else", "operator stop"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.s.BindContextualHumanAnswer(ctx, in, "deny", 2, "недостаточно данных"); err != nil || got != second {
+		t.Fatalf("replay after stop=%q err=%v", got, err)
+	}
+	var dbPath string
+	if err := f.s.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.cfg.Features[0] = revoked
+	reopened, err := Open(ctx, dbPath, f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got, err := reopened.BindContextualHumanAnswer(ctx, in, "deny", 2, "недостаточно данных"); err != nil || got != second {
+		t.Fatalf("replay after restart=%q err=%v", got, err)
+	}
+	var retained int
+	if err := reopened.db.QueryRowContext(ctx, `SELECT selector FROM human_request_selectors WHERE request_id=?`, second).Scan(&retained); err != nil || retained != 2 {
+		t.Fatalf("retained selector=%d err=%v", retained, err)
 	}
 }

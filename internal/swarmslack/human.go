@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ type HumanStore interface {
 	AdvanceSlackWatermark(context.Context, string, string) error
 	SetRecoveryBarrier(context.Context, string, string) error
 	RecordHumanAnswer(context.Context, swarm.HumanAnswerInput) (string, bool, error)
-	BindContextualHumanAnswer(context.Context, swarm.SlackSource, string, string) (string, error)
+	BindContextualHumanAnswer(context.Context, swarm.SlackSource, string, int, string) (string, error)
 	PublishedHumanQuestion(context.Context, string, string) (string, string, error)
 }
 
@@ -141,10 +142,6 @@ func (h *humanIngress) syncQuestionMessages(ctx context.Context) error {
 					state = "stopped"
 				}
 				if h.questionUpdates[sent.ID] == state {
-					break
-				}
-				if sent.Question != nil && state == "open" {
-					h.questionUpdates[sent.ID] = state
 					break
 				}
 				options := []swarm.HumanOption{}
@@ -438,7 +435,7 @@ func (h *humanIngress) processStops(ctx context.Context, featureID string) error
 
 func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, recovering bool) error {
 	text := strings.TrimSpace(in.Text)
-	contextKind, contextText, contextual := parseContextualAnswer(text)
+	contextKind, contextSelector, contextText, contextual := parseContextualAnswer(text)
 	switch {
 	case in.SourceKind == "block_action":
 		answer := swarm.HumanAnswerInput{RequestID: in.RequestID, Kind: "answer", OptionID: in.OptionID, WorkspaceID: in.WorkspaceID, ChannelID: in.ChannelID, ThreadTS: in.ThreadTS, MessageTS: in.MessageTS, ActorID: in.ActorID}
@@ -506,16 +503,29 @@ func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, rec
 			return err
 		}
 	case contextual:
-		if contextText == "" {
-			return h.contextualRejection(ctx, in, "Напишите текст после «Ответ:» или причину после «Отказ:».")
+		if contextSelector < 0 || contextText == "" {
+			return h.contextualRejection(ctx, in, "Напишите «Ответ #номер: текст» или «Отказ #номер: причина». Если вопрос один, номер можно опустить.")
 		}
-		requestID, err := h.store.BindContextualHumanAnswer(ctx, in, contextKind, contextText)
+		requestID, err := h.store.BindContextualHumanAnswer(ctx, in, contextKind, contextSelector, contextText)
 		if err != nil {
 			var api *swarm.APIError
 			if !errors.As(err, &api) || api.Status >= 500 {
 				return err
 			}
 			return h.contextualRejection(ctx, in, contextualErrorText(api.Code))
+		}
+		view, err := h.store.History(ctx, in.FeatureID)
+		if err != nil {
+			return err
+		}
+		for _, projection := range view.HumanRequests {
+			if projection.RequestID != requestID || projection.BackendState == "open" {
+				continue
+			}
+			if err := h.notice(ctx, in, "Решение уже записано в Spexus. "+canonicalDecisionSummary(projection, nil)); err != nil {
+				return err
+			}
+			return h.store.SettleSlackSource(ctx, in)
 		}
 		answer := swarm.HumanAnswerInput{RequestID: requestID, Kind: contextKind, Text: contextText, WorkspaceID: in.WorkspaceID, ChannelID: in.ChannelID, ThreadTS: in.ThreadTS, MessageTS: in.MessageTS, ActorID: in.ActorID}
 		if _, _, err := h.store.RecordHumanAnswer(ctx, answer); err != nil {
@@ -550,19 +560,38 @@ func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, rec
 
 // Only an explicit, short prefix can consume a normal Slack message as a
 // human decision; all other thread messages remain owner input.
-func parseContextualAnswer(text string) (kind, body string, recognized bool) {
+func parseContextualAnswer(text string) (kind string, selector int, body string, recognized bool) {
 	prefix, rest, ok := strings.Cut(strings.TrimSpace(text), ":")
 	if !ok {
-		return "", "", false
+		return "", 0, "", false
 	}
-	switch strings.ToLower(strings.TrimSpace(prefix)) {
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(prefix)))
+	if len(fields) == 0 {
+		return "", 0, "", false
+	}
+	switch fields[0] {
 	case "ответ", "answer":
-		return "answer", strings.TrimSpace(rest), true
+		kind = "answer"
 	case "отказ", "deny":
-		return "deny", strings.TrimSpace(rest), true
+		kind = "deny"
 	default:
-		return "", "", false
+		return "", 0, "", false
 	}
+	if len(fields) == 1 {
+		return kind, 0, strings.TrimSpace(rest), true
+	}
+	if len(fields) != 2 || !strings.HasPrefix(fields[1], "#") {
+		return kind, -1, "", true
+	}
+	number := strings.TrimPrefix(fields[1], "#")
+	if number == "" || strings.Trim(number, "0123456789") != "" {
+		return kind, -1, "", true
+	}
+	selector, err := strconv.Atoi(number)
+	if err != nil || selector <= 0 || selector > 1000000 {
+		return kind, -1, "", true
+	}
+	return kind, selector, strings.TrimSpace(rest), true
 }
 
 func contextualErrorText(code string) string {
@@ -570,7 +599,9 @@ func contextualErrorText(code string) string {
 	case "no_open_human_request", "request_closed", "request_not_waiting":
 		return "Сейчас нет опубликованного вопроса, который ждёт этот ответ. Проверьте состояние через !status."
 	case "ambiguous_human_request":
-		return "В треде ждут ответа несколько вопросов. Короткая реплика неоднозначна; используйте техническую команду с ID нужного вопроса из его деталей."
+		return "В треде ждут ответа несколько вопросов. Укажите номер нужного: «Ответ #2: текст» или «Отказ #2: причина»."
+	case "unknown_human_selector":
+		return "В этом треде нет открытого вопроса с таким номером. Проверьте номер над вопросом."
 	case "option_button_required", "invalid_option":
 		return "Для этого вопроса выберите вариант кнопкой под ним. Отказ можно написать как «Отказ: причина»."
 	default:

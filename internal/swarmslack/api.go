@@ -216,7 +216,7 @@ func (a *API) Post(ctx context.Context, d swarm.SlackDelivery) (string, error) {
 	}
 	payload := map[string]any{"channel": d.ChannelID, "thread_ts": d.ThreadTS, "text": d.Text, "client_msg_id": d.ID, "metadata": map[string]any{"event_type": "spexus_swarm_reply", "event_payload": map[string]string{"delivery_id": d.ID, "turn_id": d.TurnID}}}
 	if d.Question != nil {
-		message := humanReadableQuestionText(d.Text, d.Question.Options)
+		message := humanReadableQuestionText(d.Text, d.Question.Options, d.ShortSelector)
 		payload["text"] = message
 		payload["blocks"] = humanQuestionBlocks(message, d.ID, d.Question.Options, false)
 	}
@@ -239,7 +239,7 @@ func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, op
 	if d.Status != "sent" || !validTimestamp(d.SlackTS) {
 		return errors.New("human question has no published Slack message")
 	}
-	message := humanReadableQuestionText(d.Text, options)
+	message := humanReadableQuestionText(d.Text, options, d.ShortSelector)
 	switch state {
 	case "open":
 	case "stopped":
@@ -267,7 +267,7 @@ func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, op
 	return nil
 }
 
-func humanReadableQuestionText(message string, options []swarm.HumanOption) string {
+func humanReadableQuestionText(message string, options []swarm.HumanOption, selector int) string {
 	lines := strings.Split(message, "\n")
 	readable := make([]string, 0, len(lines))
 	for _, line := range lines {
@@ -275,13 +275,20 @@ func humanReadableQuestionText(message string, options []swarm.HumanOption) stri
 			continue // Correlation stays in the button value and durable history.
 		}
 		if strings.HasPrefix(line, "Ответ: !answer ") || strings.HasPrefix(line, "Выберите вариант кнопкой ниже.") || strings.HasPrefix(line, "Ответьте через доступное действие в сообщении.") || strings.HasPrefix(line, "Напишите в этом треде: Ответ:") {
+			number := ""
+			if selector > 0 {
+				number = fmt.Sprintf(" #%d", selector)
+			}
 			if len(options) == 0 {
-				line = "Напишите в этом треде: Ответ: ваш текст. Для отказа: Отказ: причина."
+				line = "Напишите в этом треде: Ответ" + number + ": ваш текст. Для отказа: Отказ" + number + ": причина."
 			} else {
-				line = "Выберите вариант кнопкой ниже. Для отказа напишите в этом треде: Отказ: причина."
+				line = "Выберите вариант кнопкой ниже. Для отказа напишите в этом треде: Отказ" + number + ": причина."
 			}
 		}
 		readable = append(readable, line)
+	}
+	if selector > 0 {
+		return fmt.Sprintf("Вопрос #%d\n%s", selector, strings.Join(readable, "\n"))
 	}
 	return strings.Join(readable, "\n")
 }

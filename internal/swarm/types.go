@@ -304,15 +304,16 @@ type OwnerFinishReceipt struct {
 	ReplyStatus string `json:"reply_status"`
 }
 type SlackDelivery struct {
-	ID        string         `json:"id"`
-	FeatureID string         `json:"feature_id"`
-	TurnID    string         `json:"turn_id"`
-	ChannelID string         `json:"channel_id"`
-	ThreadTS  string         `json:"thread_ts"`
-	Text      string         `json:"text"`
-	Status    string         `json:"status"`
-	SlackTS   string         `json:"slack_ts"`
-	Question  *HumanQuestion `json:"question,omitempty"`
+	ID            string         `json:"id"`
+	FeatureID     string         `json:"feature_id"`
+	TurnID        string         `json:"turn_id"`
+	ChannelID     string         `json:"channel_id"`
+	ThreadTS      string         `json:"thread_ts"`
+	Text          string         `json:"text"`
+	Status        string         `json:"status"`
+	SlackTS       string         `json:"slack_ts"`
+	Question      *HumanQuestion `json:"question,omitempty"`
+	ShortSelector int            `json:"short_selector,omitempty"`
 }
 type HumanQuestion struct {
 	Options []HumanOption `json:"options"`

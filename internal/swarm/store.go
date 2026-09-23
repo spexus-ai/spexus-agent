@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS recovery_barriers (feature_id TEXT PRIMARY KEY REFERE
 CREATE TABLE IF NOT EXISTS human_gateway_writer (id INTEGER PRIMARY KEY CHECK(id=1),writer_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS owner_redeliveries (failed_turn_id TEXT PRIMARY KEY REFERENCES owner_turns(id),feature_id TEXT NOT NULL REFERENCES features(id),original_seq INTEGER NOT NULL,result_message_id TEXT NOT NULL,review_message_id TEXT NOT NULL,new_seq INTEGER NOT NULL,actor TEXT NOT NULL,reason TEXT NOT NULL,at TEXT NOT NULL,UNIQUE(feature_id,new_seq));
 CREATE TABLE IF NOT EXISTS contextual_human_bindings (workspace_id TEXT NOT NULL,channel_id TEXT NOT NULL,message_ts TEXT NOT NULL,feature_id TEXT NOT NULL REFERENCES features(id),request_id TEXT NOT NULL REFERENCES human_projections(request_id),actor_id TEXT NOT NULL,kind TEXT NOT NULL,text_sha256 TEXT NOT NULL,bound_at TEXT NOT NULL,PRIMARY KEY(workspace_id,channel_id,message_ts));
+CREATE TABLE IF NOT EXISTS human_request_selectors (feature_id TEXT NOT NULL REFERENCES features(id),request_id TEXT NOT NULL UNIQUE REFERENCES human_projections(request_id),selector INTEGER NOT NULL CHECK(selector > 0),PRIMARY KEY(feature_id,selector));
 `
 
 func Open(ctx context.Context, path string, cfg Config) (*Store, error) {
@@ -260,6 +261,11 @@ func (s *Store) bootstrapMode(ctx context.Context, serviceStart bool) error {
 			if _, err = tx.ExecContext(ctx, "INSERT INTO recovery_barriers(feature_id,reason) VALUES(?,?) ON CONFLICT(feature_id) DO UPDATE SET reason=excluded.reason", f.FeatureID, "source_catchup_required"); err != nil {
 				return err
 			}
+		}
+	}
+	if target == 2 {
+		if err = s.backfillHumanSelectors(ctx, tx); err != nil {
+			return err
 		}
 	}
 	// A send accepted by Slack but not settled locally must never be blindly replayed.

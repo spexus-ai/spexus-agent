@@ -107,12 +107,12 @@ func TestFreeTextQuestionShowsShortReplyAndDenyWithoutUUID(t *testing.T) {
 	a := NewAPI("test")
 	a.BaseURL, a.Client = server.URL+"/", server.Client()
 	id := "123e4567-e89b-42d3-a456-426614174000"
-	d := swarm.SlackDelivery{ID: id, ChannelID: "C", ThreadTS: "1.000001", Text: "Решение человека требуется.\nЗапрос: " + id + "\nВопрос: Что делать?\nОтвет: !answer " + id + " text <ответ>", Question: &swarm.HumanQuestion{Options: []swarm.HumanOption{}}}
+	d := swarm.SlackDelivery{ID: id, ChannelID: "C", ThreadTS: "1.000001", Text: "Решение человека требуется.\nЗапрос: " + id + "\nВопрос: Что делать?\nОтвет: !answer " + id + " text <ответ>", Question: &swarm.HumanQuestion{Options: []swarm.HumanOption{}}, ShortSelector: 2}
 	if _, err := a.Post(context.Background(), d); err != nil {
 		t.Fatal(err)
 	}
 	text := posted["text"].(string)
-	if strings.Contains(text, id) || strings.Contains(text, "!answer") || !strings.Contains(text, "Ответ: ваш текст") || !strings.Contains(text, "Отказ: причина") {
+	if strings.Contains(text, id) || strings.Contains(text, "!answer") || !strings.Contains(text, "Вопрос #2") || !strings.Contains(text, "Ответ #2: ваш текст") || !strings.Contains(text, "Отказ #2: причина") {
 		t.Fatalf("free-text question is not human-readable: %q", text)
 	}
 	for _, raw := range posted["blocks"].([]any) {
