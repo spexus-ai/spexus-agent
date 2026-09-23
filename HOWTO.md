@@ -76,8 +76,8 @@ relative to the directory containing `config.json`, unless absolute.
   "agent": {
     "id": "prototype",
     "provider": "openai-codex",
-    "model": "gpt-5.6-sol",
-    "thinking": "medium",
+    "model": "gpt-5.6-luna",
+    "thinking": "minimal",
     "promptFile": "prototype.md",
     "workspace": "/absolute/path/to/workspaces/project",
     "tools": ["read", "bash", "edit", "write", "grep", "find", "ls"]
