@@ -47,6 +47,7 @@ type humanIngress struct {
 	statusMu        sync.Mutex
 	questionUpdates map[string]string
 	statusUpdates   map[string]threadStatusMark
+	anchorStates    map[string]bool
 }
 
 type threadStatusMark struct {
@@ -69,7 +70,7 @@ func (b *Bridge) RunHuman(ctx context.Context, source slack.DurableEventSource, 
 	if err := history.VerifyWorkspace(ctx, workspace); err != nil {
 		return err
 	}
-	h := &humanIngress{bridge: b, store: store, history: history, workspace: workspace, questionUpdates: map[string]string{}, statusUpdates: map[string]threadStatusMark{}}
+	h := &humanIngress{bridge: b, store: store, history: history, workspace: workspace, questionUpdates: map[string]string{}, statusUpdates: map[string]threadStatusMark{}, anchorStates: map[string]bool{}}
 	defer h.clearThreadStatuses(context.Background())
 	for _, f := range b.Features {
 		if _, err := store.SlackWatermark(ctx, f.FeatureID); err != nil {
@@ -104,6 +105,9 @@ func (b *Bridge) RunHuman(ctx context.Context, source slack.DurableEventSource, 
 				if err := h.syncQuestionMessages(ctx); err != nil {
 					b.log("Slack question update pending: %v", err)
 				}
+				if err := h.syncFeatureAnchors(ctx); err != nil {
+					b.log("Slack anchor update pending: %v", err)
+				}
 				if err := b.DeliverOne(ctx); err != nil {
 					b.log("Slack publication pending: %v", err)
 				}
@@ -124,6 +128,31 @@ func (b *Bridge) RunHuman(ctx context.Context, source slack.DurableEventSource, 
 
 type questionUpdater interface {
 	UpdateHumanQuestion(context.Context, swarm.SlackDelivery, []swarm.HumanOption, string, string) error
+}
+
+type featureAnchorUpdater interface {
+	SyncFeatureAnchor(context.Context, swarm.Feature, bool) error
+}
+
+func (h *humanIngress) syncFeatureAnchors(ctx context.Context) error {
+	updater, ok := h.bridge.API.(featureAnchorUpdater)
+	if !ok {
+		return nil
+	}
+	for _, feature := range h.bridge.Features {
+		view, err := h.store.History(ctx, feature.FeatureID)
+		if err != nil {
+			return err
+		}
+		if previous, known := h.anchorStates[feature.FeatureID]; known && previous == view.Feature.Stopped {
+			continue
+		}
+		if err := updater.SyncFeatureAnchor(ctx, view.Feature, view.Feature.Stopped); err != nil {
+			return err
+		}
+		h.anchorStates[feature.FeatureID] = view.Feature.Stopped
+	}
+	return nil
 }
 
 type threadStatusUpdater interface {

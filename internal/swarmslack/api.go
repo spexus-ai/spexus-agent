@@ -303,6 +303,95 @@ func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, op
 	return nil
 }
 
+// SyncFeatureAnchor replaces the root control after stop or continue. Reading
+// the current message first makes retries safe after an unknown update result.
+func (a *API) SyncFeatureAnchor(ctx context.Context, feature swarm.Feature, stopped bool) error {
+	if feature.ChannelID == "" || !validTimestamp(feature.ThreadTS) {
+		return errors.New("invalid feature anchor")
+	}
+	query := url.Values{"channel": {feature.ChannelID}, "ts": {feature.ThreadTS}, "limit": {"1"}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.BaseURL+"conversations.replies?"+query.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.Token)
+	res, err := a.Client.Do(req)
+	if err != nil {
+		return errors.New("Slack anchor read unavailable")
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("Slack anchor read HTTP %d", res.StatusCode)
+	}
+	var page struct {
+		OK       bool `json:"ok"`
+		Messages []struct {
+			TS     string `json:"ts"`
+			Blocks []struct {
+				BlockID  string `json:"block_id"`
+				Elements []struct {
+					ActionID string `json:"action_id"`
+					Value    string `json:"value"`
+				} `json:"elements"`
+			} `json:"blocks"`
+		} `json:"messages"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 2*1024*1024)).Decode(&page); err != nil || !page.OK || len(page.Messages) != 1 || page.Messages[0].TS != feature.ThreadTS {
+		return errors.New("Slack anchor read invalid")
+	}
+	marker := ""
+	found := false
+	for _, block := range page.Messages[0].Blocks {
+		if marker == "" && strings.HasPrefix(block.BlockID, "P3-HR anchor ") {
+			marker = block.BlockID
+		}
+		for _, element := range block.Elements {
+			if element.ActionID != slack.FeatureControlActionID+":stop" {
+				continue
+			}
+			var value struct {
+				FeatureID string `json:"feature_id"`
+			}
+			if json.Unmarshal([]byte(element.Value), &value) != nil || value.FeatureID != feature.FeatureID {
+				return errors.New("Slack feature anchor mismatch")
+			}
+			found = true
+		}
+	}
+	if marker == "" {
+		return nil
+	}
+	if found == !stopped {
+		return nil
+	}
+	message := "Работа продолжается. Вопросы и ответы — в этом треде. Остановить можно в любой момент."
+	if stopped {
+		message = "Работа остановлена."
+	}
+	section := map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": message}}
+	section["block_id"] = marker
+	blocks := []map[string]any{section}
+	if !stopped {
+		value, _ := json.Marshal(map[string]string{"feature_id": feature.FeatureID})
+		blocks = append(blocks, map[string]any{"type": "actions", "elements": []map[string]any{{
+			"type": "button", "text": map[string]any{"type": "plain_text", "text": "Остановить", "emoji": false},
+			"action_id": slack.FeatureControlActionID + ":stop", "value": string(value),
+			"style": "danger", "accessibility_label": "Остановить работу",
+		}}})
+	}
+	var updated struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := a.call(ctx, "chat.update", map[string]any{"channel": feature.ChannelID, "ts": feature.ThreadTS, "text": message, "blocks": blocks}, &updated); err != nil {
+		return err
+	}
+	if !updated.OK {
+		return fmt.Errorf("Slack anchor update rejected: %s", updated.Error)
+	}
+	return nil
+}
+
 func humanReadableQuestionText(message string, options []swarm.HumanOption, _ int, actionable bool) string {
 	lines := strings.Split(message, "\n")
 	if len(lines) > 0 && lines[0] == "Решение человека требуется для работы." {
