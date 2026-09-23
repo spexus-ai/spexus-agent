@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // A failed owner turn may have committed its current review before a later
@@ -95,8 +97,26 @@ func TestOfflineOwnerResultRedeliveryIsScopedAndIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := f.history()
-	receipt, err := f.s.redeliverOwnerResult(ctx, r)
+	path := f.s.dbPath()
+	f.server.Close()
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newOwnerInstance := NewID()
+	if err := ReconcileOffline(ctx, path, f.cfg, ReconcileRequest{AgentID: "orchestrator", OldInstanceID: f.instances["orchestrator"], NewInstanceID: newOwnerInstance, Actor: "operator-test", Reason: "Replace stopped owner runner", ContainerID: "stopped-owner-test", ContainerStopped: true, CheckedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := RedeliverOwnerResultOffline(ctx, path, f.cfg, r)
 	if err != nil {
+		t.Fatal(err)
+	}
+	f.s, err = Open(ctx, path, f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.server = httptest.NewTLSServer(f.s.Handler())
+	f.instances["orchestrator"] = newOwnerInstance
+	if err = f.s.SetRecoveryBarrier(ctx, f.feature.FeatureID, ""); err != nil {
 		t.Fatal(err)
 	}
 	if receipt.Status != "queued" || receipt.NewSeq <= arr.MailboxSeq {

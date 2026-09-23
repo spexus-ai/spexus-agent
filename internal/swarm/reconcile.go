@@ -12,7 +12,10 @@ func ReconcileOffline(ctx context.Context, path string, cfg Config, r ReconcileR
 	if !uuid(r.OldInstanceID) || !uuid(r.NewInstanceID) || r.NewInstanceID == r.OldInstanceID || !safeText(r.Reason, 4096) || !safeText(r.Actor, 256) || !safeText(r.ContainerID, 256) || !r.ContainerStopped || r.CheckedAt.IsZero() || time.Since(r.CheckedAt) > 5*time.Minute || r.CheckedAt.After(time.Now().Add(5*time.Second)) {
 		return wireError(400, "cessation_evidence_required")
 	}
-	s, err := Open(ctx, path, cfg)
+	// Reconciliation is an offline operator action. The service will establish
+	// its Slack recovery barrier on the subsequent serve startup; doing so here
+	// would block other offline operations in the same stopped window.
+	s, err := openStore(ctx, path, cfg, false)
 	if err != nil {
 		return err
 	}
