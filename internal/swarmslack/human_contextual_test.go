@@ -85,6 +85,9 @@ func TestContextualReplyRoutesOnlyExplicitPrefix(t *testing.T) {
 		{"Отказ #3: нет данных", "deny", 3, "нет данных", true},
 		{"ответ 2: я тебе ответил и я не знаю что такое P3.", "answer", 2, "я тебе ответил и я не знаю что такое P3.", true},
 		{"ответ 3: отказ потому что не хочу", "deny", 3, "потому что не хочу", true},
+		{"ответ 3: отказ, потому что не хочу", "deny", 3, "потому что не хочу", true},
+		{"ответ 3: отказ: не хочу", "deny", 3, "не хочу", true},
+		{"Ответ 2: отказ от старого варианта, выбираю новый", "answer", 2, "отказ от старого варианта, выбираю новый", true},
 		{"ответ #2 я тебе ответил что такое P3", "answer", 2, "я тебе ответил что такое P3", true},
 		{"ОТВЕТ\u00a0#2 : ОтКаЗ  потому что не хочу", "deny", 2, "потому что не хочу", true},
 		{"Рассмотрите следующий шаг", "", 0, "", false},
@@ -121,7 +124,7 @@ func TestContextualReplayReadsCanonicalTerminalBeforeAnotherDecision(t *testing.
 }
 
 func TestMalformedSelectorNeverBecomesOwnerInput(t *testing.T) {
-	for _, text := range []string{"Ответ #abc: да", "Отказ #0: причина", "Ответ #2 #3: текст", "Ответ без двоеточия", "Ответ #2", "Ответ 3: отказ"} {
+	for _, text := range []string{"Ответ #abc: да", "Отказ #0: причина", "Ответ #2 #3: текст", "Ответ без двоеточия", "Ответ #2", "Ответ 3: отказ", "Ответ 3: отказ потому что"} {
 		s := &contextualRouteStore{}
 		h := &humanIngress{store: s}
 		in := swarm.SlackSource{WorkspaceID: "W", ChannelID: "C", ThreadTS: "1.000001", MessageTS: "2.000001", FeatureID: swarm.NewID(), ActorID: "U", Text: text}
@@ -214,5 +217,48 @@ func TestHumanThreadStatusFollowsOwnerAfterDecisionAndClearsWhileWaiting(t *test
 	view.Feature.Stopped = true
 	if got := desiredThreadStatus(view, false); got != "" {
 		t.Fatalf("stopped feature status=%q", got)
+	}
+	view.Feature.Stopped = false
+	view.RecoveryBarrier = "slack_disconnected"
+	if got := desiredThreadStatus(view, true); got != "" {
+		t.Fatalf("disconnected decision falsely typing %q", got)
+	}
+	if got := desiredThreadStatus(view, false); got != "" {
+		t.Fatalf("disconnected owner falsely typing %q", got)
+	}
+}
+
+type disconnectStatusStore struct {
+	*swarm.Store
+	barrier string
+}
+
+func (s *disconnectStatusStore) History(_ context.Context, _ string) (swarm.History, error) {
+	return swarm.History{RecoveryBarrier: s.barrier}, nil
+}
+
+func (s *disconnectStatusStore) SetRecoveryBarrier(_ context.Context, _, reason string) error {
+	s.barrier = reason
+	return nil
+}
+
+func TestDisconnectedClearsStatusAfterBarrierAndDoesNotRefresh(t *testing.T) {
+	ctx := context.Background()
+	api := &threadStatusFixture{}
+	f := swarm.Feature{FeatureID: swarm.NewID(), ChannelID: "C123", ThreadTS: "1.000001", OwnerAgentID: "owner"}
+	store := &disconnectStatusStore{}
+	h := &humanIngress{bridge: &Bridge{API: api, Features: []swarm.Feature{f}}, store: store}
+	h.updateThreadStatus(ctx, f, "готовит ответ…")
+	if err := h.disconnected(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if store.barrier != "slack_disconnected" || len(api.calls) != 2 || api.calls[1] != "" {
+		t.Fatalf("disconnect did not clear after barrier: barrier=%q calls=%v", store.barrier, api.calls)
+	}
+	view := swarm.History{Feature: f, RecoveryBarrier: store.barrier, Turns: []swarm.OwnerTurn{{State: "running"}}, Agents: []swarm.AgentStatus{{AgentID: "owner", Status: "online"}}}
+	h.updateThreadStatus(ctx, f, desiredThreadStatus(view, false))
+	h.updateThreadStatus(ctx, f, "готовит ответ…") // stale pre-disconnect snapshot
+	if len(api.calls) != 2 {
+		t.Fatalf("status refreshed behind disconnect barrier: %v", api.calls)
 	}
 }

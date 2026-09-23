@@ -139,12 +139,13 @@ func (h *humanIngress) clearThreadStatuses(ctx context.Context) {
 	defer h.statusMu.Unlock()
 	callCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
 	defer cancel()
+	h.statusUpdates = map[string]threadStatusMark{}
 	for _, f := range h.bridge.Features {
 		if err := api.SetThreadStatus(callCtx, f.ChannelID, f.ThreadTS, ""); err != nil {
 			h.bridge.log("Slack typing status clear pending: %v", err)
+			h.statusUpdates[f.FeatureID] = threadStatusMark{value: "", at: time.Now(), failed: true}
 		}
 	}
-	h.statusUpdates = map[string]threadStatusMark{}
 }
 
 func (h *humanIngress) updateThreadStatus(ctx context.Context, f swarm.Feature, desired string) {
@@ -167,6 +168,15 @@ func (h *humanIngress) updateThreadStatus(ctx context.Context, f swarm.Feature, 
 	}
 	if desired == old.value && time.Since(old.at) < refreshAfter {
 		return
+	}
+	if desired != "" && h.store != nil {
+		view, err := h.store.History(ctx, f.FeatureID)
+		if err != nil || view.RecoveryBarrier != "" || view.Feature.Stopped {
+			desired = ""
+			if old.value == "" && !old.failed {
+				return
+			}
+		}
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
 	err := api.SetThreadStatus(callCtx, f.ChannelID, f.ThreadTS, desired)
@@ -225,7 +235,7 @@ func (h *humanIngress) syncQuestionMessages(ctx context.Context) error {
 }
 
 func desiredThreadStatus(view swarm.History, decisionPending bool) string {
-	if view.Feature.Stopped {
+	if view.Feature.Stopped || view.RecoveryBarrier != "" {
 		return ""
 	}
 	if decisionPending {
@@ -325,12 +335,14 @@ func (h *humanIngress) connected(ctx context.Context) error {
 
 func (h *humanIngress) disconnected(ctx context.Context) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	for _, f := range h.bridge.Features {
 		if err := h.store.SetRecoveryBarrier(ctx, f.FeatureID, "slack_disconnected"); err != nil {
+			h.mu.Unlock()
 			return err
 		}
 	}
+	h.mu.Unlock()
+	h.clearThreadStatuses(ctx)
 	return nil
 }
 
@@ -734,9 +746,18 @@ func parseContextualAnswer(text string) (kind string, selector int, body string,
 	}
 	if kind == "answer" {
 		words := strings.Fields(body)
-		if len(words) > 0 && (strings.EqualFold(words[0], "отказ") || strings.EqualFold(words[0], "deny")) {
+		if len(words) == 1 && (strings.EqualFold(words[0], "отказ") || strings.EqualFold(words[0], "отказ:") || strings.EqualFold(words[0], "отказ,")) {
+			return kind, -1, "", true
+		}
+		if len(words) == 3 && (strings.EqualFold(words[0], "отказ") || strings.EqualFold(words[0], "отказ,")) && strings.EqualFold(words[1], "потому") && strings.EqualFold(words[2], "что") {
+			return kind, -1, "", true
+		}
+		if len(words) >= 4 && (strings.EqualFold(words[0], "отказ") || strings.EqualFold(words[0], "отказ,")) && strings.EqualFold(words[1], "потому") && strings.EqualFold(words[2], "что") {
 			kind = "deny"
-			body = strings.TrimSpace(strings.TrimPrefix(body, words[0]))
+			body = strings.Join(words[1:], " ")
+		} else if len(words) >= 2 && (strings.EqualFold(words[0], "отказ:") || strings.EqualFold(words[0], "deny:")) {
+			kind = "deny"
+			body = strings.Join(words[1:], " ")
 		}
 	}
 	return kind, selector, body, true
