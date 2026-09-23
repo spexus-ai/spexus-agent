@@ -14,7 +14,7 @@ func TestFinalReviewWithoutReplyQueuesOneSummaryOnlyTurn(t *testing.T) {
 	f.post("orchestrator", b, 201)
 	f.finish(initial, "", []ActionReceipt{{MessageID: a.MessageID, Status: "stored"}, {MessageID: b.MessageID, Status: "stored"}}, 201)
 
-	reviewResult := func(dispatch Envelope) int64 {
+	reviewResult := func(dispatch Envelope) (int64, string, string) {
 		accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.s.profiles[dispatch.ToAgentID].Revision}, dispatch.MessageID)
 		accepted.ProtocolVersion = 2
 		f.post(dispatch.ToAgentID, accepted, 201)
@@ -29,14 +29,15 @@ func TestFinalReviewWithoutReplyQueuesOneSummaryOnlyTurn(t *testing.T) {
 		review := Envelope{ProtocolVersion: 2, MessageID: NewID(), Type: "task.review", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: dispatch.ToAgentID, OwnerTurnID: turnID, JobID: dispatch.JobID, AttemptID: dispatch.AttemptID, CausationID: cause(result.MessageID), SentAt: f.s.stamp(), Payload: mustJSON(ReviewPayload{ResultMessageID: result.MessageID, Verdict: "accepted", Reason: "Checked", Evidence: []Evidence{}})}
 		f.post("orchestrator", review, 201)
 		f.finish(turnID, "", []ActionReceipt{{MessageID: review.MessageID, Status: "stored"}}, 201)
-		return receipt.MailboxSeq
+		return receipt.MailboxSeq, turnID, review.MessageID
 	}
-	_ = reviewResult(a)
+	_, _, _ = reviewResult(a)
 	var queued int
 	if err := f.s.db.QueryRow(`SELECT count(*) FROM audit WHERE event='owner_summary_queued'`).Scan(&queued); err != nil || queued != 0 {
 		t.Fatalf("summary before both results: count=%d err=%v", queued, err)
 	}
-	lastSeq := reviewResult(b)
+	lastSeq, lastTurn, lastReview := reviewResult(b)
+	f.call("orchestrator", "POST", "/owner-turns/"+lastTurn+"/finish", OwnerFinishRequest{Outcome: "succeeded", Reply: "", Actions: []ActionReceipt{{MessageID: lastReview, Status: "stored"}}, Observation: json.RawMessage("null")}, 200)
 	if err := f.s.db.QueryRow(`SELECT count(*) FROM audit WHERE event='owner_summary_queued'`).Scan(&queued); err != nil || queued != 1 {
 		t.Fatalf("summary after final review: count=%d err=%v", queued, err)
 	}
