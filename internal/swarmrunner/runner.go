@@ -495,10 +495,23 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 	if !cancelled && runErr == nil {
 		ownerResult, messages, outputErr = r.ownerActions(d, turn, raw)
 		var reviewErr *reviewPreflightError
-		if errors.As(outputErr, &reviewErr) && ctx.Err() == nil {
+		summaryMissing := false
+		if outputErr == nil && d.Type == "task.result" && len(messages) == 0 && strings.TrimSpace(ownerResult.Reply) == "" {
+			job, jobErr := r.job(ctx, d.JobID)
+			if jobErr != nil {
+				return jobErr
+			}
+			summaryMissing = reviewedTrigger(d, job)
+		}
+		if (errors.As(outputErr, &reviewErr) || summaryMissing) && ctx.Err() == nil {
 			// Nothing has entered the durable outbox yet. Give Pi one bounded
 			// correction in the same turn; a second mistake fails visibly.
-			correction := input + "\nYour preceding FINAL JSON was rejected before any actions were published: " + reviewErr.Error() + ". Return a complete corrected FINAL JSON. For a pending task.result, review only this event's job_id, attempt_id and message_id; do not repeat reviews of earlier attempts. If the trusted job shows this result was already accepted, return actions:[] and only summarize the recorded outcome."
+			correction := input + "\nYour preceding FINAL JSON was rejected before any actions were published: "
+			if summaryMissing {
+				correction += "The final reply was empty. This result was already accepted; return actions:[] and a concise, nonempty human-facing summary of the recorded results."
+			} else {
+				correction += reviewErr.Error() + ". Return a complete corrected FINAL JSON. For a pending task.result, review only this event's job_id, attempt_id and message_id; do not repeat reviews of earlier attempts. If the trusted job shows this result was already accepted, return actions:[] and only summarize the recorded outcome."
+			}
 			var corrected string
 			corrected, cancelled, runErr = r.run(ctx, d, correction)
 			if corrected != "" {
@@ -509,6 +522,9 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 			}
 			if !cancelled && runErr == nil {
 				ownerResult, messages, outputErr = r.ownerActions(d, turn, corrected)
+				if summaryMissing && outputErr == nil && strings.TrimSpace(ownerResult.Reply) == "" {
+					outputErr = errors.New("empty final summary")
+				}
 			}
 		}
 	}

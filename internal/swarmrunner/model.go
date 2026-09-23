@@ -629,7 +629,7 @@ All action data is validated before any action is published. Do not claim accept
 	}
 	if summaryOnly {
 		prompt += `
-This task.result was already accepted in the trusted job state. This turn exists only to summarize the recorded work after recovery. recent_accepted_results, if present, contains brief prior results from the same feature that the coordinator confirms are accepted. It is a bounded recent list, not necessarily complete history. Return actions:[] and a concise reply grounded in the supplied event/job and those recorded results; do not review, dispatch, cancel, request a human decision, or perform any other action. The runtime will reject every action for this turn. Do not imply that a new action was executed.`
+This task.result was already accepted in the trusted job state. This turn exists only to summarize the recorded work. recent_accepted_results, if present, contains brief prior results from the same feature that the coordinator confirms are accepted. It is a bounded recent list, not necessarily complete history. Return actions:[] and a concise nonempty reply grounded in the supplied event/job and those recorded results; do not review, dispatch, cancel, request a human decision, or perform any other action. The runtime will reject every action for this turn. Do not imply that a new action was executed.`
 	}
 	return prompt, e
 }

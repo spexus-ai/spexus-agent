@@ -272,6 +272,11 @@ func (s *Store) finishOwner(ctx context.Context, p Principal, id string, r Owner
 		if err = saveTurn(ctx, tx, t); err != nil {
 			return err
 		}
+		if r.Outcome == "succeeded" && r.Reply == "" {
+			if err = s.queueFinalSummary(ctx, tx, t, r.Actions); err != nil {
+				return err
+			}
+		}
 		out = OwnerFinishReceipt{id, t.State, t.ReplyStatus}
 		return s.audit(ctx, tx, p, Envelope{FeatureID: t.FeatureID, OwnerTurnID: id}, "owner_finished", r.Outcome)
 	})
@@ -279,6 +284,97 @@ func (s *Store) finishOwner(ctx context.Context, p Principal, id string, r Owner
 		s.reject(ctx, p, Envelope{OwnerTurnID: id}, err)
 	}
 	return out, duplicate, err
+}
+
+// An accepted final review can finish without a human-facing reply. Reuse its
+// immutable task.result as a summary-only trigger. The finished turn is unique,
+// so a repeated finish cannot enqueue a second summary or repeat any action.
+func (s *Store) queueFinalSummary(ctx context.Context, tx *sql.Tx, t turnRecord, actions []ActionReceipt) error {
+	if s.wireVersion() != 2 {
+		return nil
+	}
+	var row, size int64
+	var raw []byte
+	err := tx.QueryRowContext(ctx, `SELECT m.id,d.bytes,m.canonical FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row WHERE d.agent_id=? AND d.seq=? AND m.kind='task.result'`, t.AgentID, t.InputMailboxSeq).Scan(&row, &size, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var result Envelope
+	if err = json.Unmarshal(raw, &result); err != nil {
+		return err
+	}
+	if result.FeatureID != t.FeatureID {
+		return wireError(409, "foreign_result")
+	}
+	accepted := false
+	for _, action := range actions {
+		if action.Status != "stored" {
+			continue
+		}
+		var reviewRaw []byte
+		err = tx.QueryRowContext(ctx, `SELECT canonical FROM messages WHERE sender=? AND message_id=? AND turn_id=? AND kind='task.review' AND attempt_id=?`, t.AgentID, action.MessageID, t.TurnID, result.AttemptID).Scan(&reviewRaw)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		var review Envelope
+		if err = json.Unmarshal(reviewRaw, &review); err != nil {
+			return err
+		}
+		var payload ReviewPayload
+		if err = json.Unmarshal(review.Payload, &payload); err != nil {
+			return err
+		}
+		accepted = review.JobID == result.JobID && review.CausationID != nil && *review.CausationID == result.MessageID && payload.ResultMessageID == result.MessageID && payload.Verdict == "accepted"
+		if accepted {
+			break
+		}
+	}
+	if !accepted {
+		return nil
+	}
+	var total, unfinished, openQuestions int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(CASE WHEN a.state IN ('succeeded','failed') AND json_extract(a.data,'$.review')='accepted' THEN 0 ELSE 1 END),0) FROM jobs j JOIN attempts a ON a.id=j.current_attempt_id WHERE j.feature_id=?`, t.FeatureID).Scan(&total, &unfinished); err != nil {
+		return err
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM human_projections h JOIN dependencies d ON d.id=h.dependency_id WHERE d.feature_id=? AND h.state='open'`, t.FeatureID).Scan(&openQuestions); err != nil {
+		return err
+	}
+	if total == 0 || unfinished != 0 || openQuestions != 0 {
+		return nil
+	}
+	var f Feature
+	f, err = feature(ctx, tx, t.FeatureID)
+	if err != nil {
+		return err
+	}
+	if f.Stopped {
+		return nil
+	}
+	var count, bytes int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(bytes),0) FROM mailbox_delivery WHERE agent_id=? AND acked=0 AND superseded=0 AND pending_notification=0`, t.AgentID).Scan(&count, &bytes); err != nil {
+		return err
+	}
+	pending := 0
+	if count >= s.mailboxLimit || bytes+int(size) > s.mailboxBytes {
+		pending = 1
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO mailbox_counters(agent_id,seq) VALUES(?,1) ON CONFLICT(agent_id) DO UPDATE SET seq=seq+1`, t.AgentID); err != nil {
+		return err
+	}
+	var seq int64
+	if err = tx.QueryRowContext(ctx, `SELECT seq FROM mailbox_counters WHERE agent_id=?`, t.AgentID).Scan(&seq); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO mailbox_delivery(agent_id,seq,message_row,lane,pending_notification,bytes) VALUES(?,?,?,'normal',?,?)`, t.AgentID, seq, row, pending, size); err != nil {
+		return err
+	}
+	return s.audit(ctx, tx, Principal{AgentID: "coordinator"}, result, "owner_summary_queued", "final_review_without_reply")
 }
 func (s *Store) ClaimSlack(ctx context.Context) (*SlackDelivery, error) {
 	var out *SlackDelivery
