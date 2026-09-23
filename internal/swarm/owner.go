@@ -348,6 +348,36 @@ func (s *Store) cancelTurn(ctx context.Context, tx *sql.Tx, f Feature, t turnRec
 	_, _, err := s.applyMessage(ctx, tx, Principal{AgentID: "coordinator"}, e, true)
 	return err
 }
+
+// InterruptOwnerTurn cancels only the currently running owner turn. The
+// feature, worker attempts, dependencies, and queued inputs remain available
+// for the next turn. A repeated urgent Slack delivery is harmless because
+// cancelTurn does not enqueue a second control for an already cancelled turn.
+func (s *Store) InterruptOwnerTurn(ctx context.Context, id, actor, reason string) error {
+	if !safeText(reason, 4096) {
+		return wireError(400, "invalid_reason")
+	}
+	return s.transaction(ctx, func(tx *sql.Tx) error {
+		f, err := feature(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if !allowedActor(f, actor) {
+			return wireError(403, "untrusted_actor")
+		}
+		_, turns, err := active(ctx, tx)
+		if err != nil {
+			return err
+		}
+		for _, t := range turns {
+			if t.FeatureID == id {
+				return s.cancelTurn(ctx, tx, f, t, actor, reason)
+			}
+		}
+		return nil
+	})
+}
+
 func (s *Store) StopFeature(ctx context.Context, id, actor, reason string) error {
 	if !safeText(reason, 4096) {
 		return wireError(400, "invalid_reason")

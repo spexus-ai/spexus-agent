@@ -397,6 +397,40 @@ func TestInboxCommittedBeforeACKAndControlNotBlockedByACK(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+func TestOwnerTurnControlCancelsActivePiBeforeACK(t *testing.T) {
+	var r *Runner
+	var d swarm.Delivery
+	var cancelled atomic.Bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		switch {
+		case strings.Contains(q.URL.Path, "/mailbox"):
+			writeJSON(w, swarm.MailboxResponse{Messages: []swarm.Delivery{d}})
+		case strings.HasSuffix(q.URL.Path, "/acks"):
+			var count int
+			if e := r.journal.db.QueryRow(`SELECT count(*) FROM inbox WHERE seq=?`, d.MailboxSeq).Scan(&count); e != nil || count != 1 {
+				t.Error("owner control was ACKed before durable inbox commit")
+			}
+			if !cancelled.Load() {
+				t.Error("owner Pi was not interrupted before ACK")
+			}
+			writeJSON(w, swarm.AckResponse{Acked: []int64{d.MailboxSeq}})
+		default:
+			w.WriteHeader(404)
+		}
+	})
+	r, _ = runnerFixture(t, handler)
+	r.cfg.Role, r.cfg.AgentID = "owner", "owner"
+	turnID := swarm.NewID()
+	d = swarm.Delivery{Envelope: swarm.Envelope{ProtocolVersion: 1, MessageID: swarm.NewID(), Type: "turn.cancel", TenantID: tenant, ProjectID: project, FeatureID: feature, FromAgentID: "coordinator", ToAgentID: "owner", OwnerTurnID: turnID, SentAt: time.Now().UTC().Format(time.RFC3339Nano)}, MailboxSeq: 1}
+	d.Payload, _ = json.Marshal(swarm.CancelPayload{Reason: "urgent Slack message", RequestedBy: "human"})
+	r.active = swarm.Delivery{Envelope: swarm.Envelope{FeatureID: feature, OwnerTurnID: turnID}}
+	r.cancel = func() { cancelled.Store(true) }
+	if e := r.poll(context.Background(), "control"); e != nil {
+		t.Fatal(e)
+	}
+}
+
 func TestOwnerFinishCancellationBetweenReadAndCommit(t *testing.T) {
 	var r *Runner
 	turn := swarm.NewID()
