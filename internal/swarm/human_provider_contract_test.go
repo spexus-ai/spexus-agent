@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -62,7 +63,7 @@ func TestHumanActualProviderContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	t.Cleanup(func() { _ = s.Close() })
 	if err = s.HumanPreflight(ctx); err != nil {
 		t.Fatalf("provider preflight: %v", err)
 	}
@@ -141,8 +142,50 @@ func TestHumanActualProviderContract(t *testing.T) {
 	if err != nil || decisionOp.ID != decisionID || decisionOp.Kind != "decision" {
 		t.Fatalf("durable decision operation: id=%s err=%v", decisionOp.ID, err)
 	}
+	// The provider commits the decision while the response is lost. A service
+	// restart must recover the same operation and defer local application until
+	// Slack source catchup opens the barrier.
+	uncertainDecision := *client
+	uncertainDecision.Transport = &loseFirstDecisionResponse{base: client.Transport}
+	if err = s.syncHumanOperation(ctx, &uncertainDecision, decisionOp); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.db.QueryRowContext(ctx, "SELECT status FROM backend_sync_operations WHERE operation_id=?", decisionOp.ID).Scan(&status); err != nil || status != "retry" {
+		t.Fatalf("lost decision response did not retain retry: status=%s err=%v", status, err)
+	}
+	read(createOp.RequestID, "answered")
+	statePath := s.dbPath()
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(ctx, statePath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err = s.backendClient()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err = s.syncHumanOperation(ctx, client, decisionOp); err != nil {
 		t.Fatal(err)
+	}
+	var applications int
+	if err = s.db.QueryRowContext(ctx, "SELECT count(*) FROM decision_applications WHERE request_id=?", createOp.RequestID).Scan(&applications); err != nil || applications != 0 {
+		t.Fatalf("decision applied before source catchup: applications=%d err=%v", applications, err)
+	}
+	if err = s.SetRecoveryBarrier(ctx, featureID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ApplyPendingHuman(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var applicationStatus string
+	if err = s.db.QueryRowContext(ctx, "SELECT count(*),coalesce(max(status),'') FROM decision_applications WHERE request_id=?", createOp.RequestID).Scan(&applications, &applicationStatus); err != nil || applications != 1 || applicationStatus != "applied" {
+		t.Fatalf("decision did not apply exactly once: applications=%d status=%s err=%v", applications, applicationStatus, err)
+	}
+	var ownerInputs int
+	if err = s.db.QueryRowContext(ctx, "SELECT count(*) FROM messages WHERE kind='human.decision' AND feature_id=?", featureID).Scan(&ownerInputs); err != nil || ownerInputs != 1 {
+		t.Fatalf("decision delivered %d owner inputs after recovery: %v", ownerInputs, err)
 	}
 	var reason string
 	if err = s.db.QueryRowContext(ctx, "SELECT status,reason FROM backend_sync_operations WHERE operation_id=?", decisionOp.ID).Scan(&status, &reason); err != nil || status != "done" {
@@ -177,6 +220,22 @@ func TestHumanActualProviderContract(t *testing.T) {
 type loseFirstCreateResponse struct {
 	base http.RoundTripper
 	lost bool
+}
+
+type loseFirstDecisionResponse struct {
+	base http.RoundTripper
+	lost bool
+}
+
+func (t *loseFirstDecisionResponse) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(r)
+	if err != nil || t.lost || r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/decision") {
+		return resp, err
+	}
+	t.lost = true
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return nil, errors.New("simulated lost decision response after commit")
 }
 
 func (t *loseFirstCreateResponse) RoundTrip(r *http.Request) (*http.Response, error) {
