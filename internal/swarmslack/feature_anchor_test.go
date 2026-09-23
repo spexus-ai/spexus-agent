@@ -33,7 +33,7 @@ func TestFeatureAnchorStopAndContinueSync(t *testing.T) {
 			if r.URL.Query().Get("channel") != feature.ChannelID || r.URL.Query().Get("ts") != feature.ThreadTS {
 				t.Error("wrong feature anchor scope")
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "messages": []any{map[string]any{"ts": feature.ThreadTS, "blocks": blocks}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "messages": []any{map[string]any{"ts": feature.ThreadTS, "blocks": blocks}, map[string]string{"ts": "2.000001", "thread_ts": feature.ThreadTS}}})
 		case "/chat.update":
 			var body struct {
 				Channel string           `json:"channel"`

@@ -336,7 +336,7 @@ func (a *API) SyncFeatureAnchor(ctx context.Context, feature swarm.Feature, stop
 			} `json:"blocks"`
 		} `json:"messages"`
 	}
-	if err := json.NewDecoder(io.LimitReader(res.Body, 2*1024*1024)).Decode(&page); err != nil || !page.OK || len(page.Messages) != 1 || page.Messages[0].TS != feature.ThreadTS {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 2*1024*1024)).Decode(&page); err != nil || !page.OK || len(page.Messages) == 0 || page.Messages[0].TS != feature.ThreadTS {
 		return errors.New("Slack anchor read invalid")
 	}
 	marker := ""
