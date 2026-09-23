@@ -527,12 +527,25 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 			finish.Error = modelError("model_output_invalid")
 			finish.Reply = "Pi returned invalid structured output; no actions were published."
 		} else {
-			finish.Reply = ownerResult.Reply
+			finish.Reply = ownerPublicReply(ownerResult.Reply, messages)
 		}
 	}
 
 	return r.ownerFinish(ctx, d, turn, finish, messages)
 }
+
+// The question and temporary thread status already explain an in-flight
+// action. Keep only a standalone answer or a result review visible as a
+// persistent reply; action failures get their own notice during flush.
+func ownerPublicReply(reply string, messages []swarm.Envelope) string {
+	for _, message := range messages {
+		if message.Type != "task.review" {
+			return ""
+		}
+	}
+	return reply
+}
+
 func (r *Runner) ownerFinish(ctx context.Context, d swarm.Delivery, turn string, finish swarm.OwnerFinishRequest, messages []swarm.Envelope) error {
 	if e := r.journal.output(d.MailboxSeq, finish, messages, &finish, turn); e != nil {
 		return e

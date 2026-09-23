@@ -279,7 +279,7 @@ func TestRealRunnerProcessesTwoWorkersAndDurableSlack(t *testing.T) {
 				return false
 			}
 		}
-		return len(h.SlackOutbox) == 3
+		return len(h.SlackOutbox) == 2 // The dispatch turn is visible as temporary status, not a persistent reply.
 	})
 	for _, j := range h.Jobs {
 		a := j.Attempts[0]
@@ -355,7 +355,7 @@ func TestRealRunnerProcessesTwoWorkersAndDurableSlack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(after.Jobs) != 2 || len(after.Turns) != 3 || len(after.SlackOutbox) != 3 {
+	if len(after.Jobs) != 2 || len(after.Turns) != 3 || len(after.SlackOutbox) != 2 {
 		t.Fatal("duplicate/foreign input mutated business work")
 	}
 	// Slack accepted publication but its response was lost. Correlation lookup
@@ -373,7 +373,7 @@ func TestRealRunnerProcessesTwoWorkersAndDurableSlack(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(api.posts) != 3 {
+	if len(api.posts) != 2 {
 		t.Fatalf("Slack duplicate: %d posts", len(api.posts))
 	}
 	// Stop processes before inspecting their persistent journals.
