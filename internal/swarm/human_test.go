@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -24,7 +26,7 @@ func newHumanFixture(t *testing.T) *fixture {
 	if err := os.WriteFile(path, mustJSON(gatewayToken{Token: "test-access"}), 0600); err != nil {
 		t.Fatal(err)
 	}
-	f.cfg = Config{TenantID: tenant, ProjectID: project, WireVersion: 2, Human: &HumanConfig{BaseURL: "https://example.invalid", TokenFile: path, EpicID: NewID(), WorkspaceID: "workspace"}, Features: []Feature{f.feature}}
+	f.cfg = Config{TenantID: tenant, ProjectID: project, WireVersion: 2, Human: &HumanConfig{BaseURL: "https://example.invalid", TokenFile: path, EpicID: NewID(), WriterID: NewID(), WorkspaceID: "workspace"}, Features: []Feature{f.feature}}
 	for _, id := range []string{"orchestrator", "worker-a", "worker-b"} {
 		role := "worker"
 		if id == "orchestrator" {
@@ -120,6 +122,9 @@ func TestHumanGateAndSingleContinuation(t *testing.T) {
 	if len(f.history().SlackOutbox) != 1 || f.history().Dependencies[0].State != "human_waiting" {
 		t.Fatal("question was not queued after provider create")
 	}
+	if !strings.Contains(f.history().SlackOutbox[0].Text, "Compute result") {
+		t.Fatal("human question omitted blocked work")
+	}
 	answer := HumanAnswerInput{RequestID: d.RequestID, Kind: "answer", OptionID: "a", Text: "Approved", WorkspaceID: "workspace", ChannelID: f.feature.ChannelID, ThreadTS: f.feature.ThreadTS, MessageTS: "124.1", ActorID: "human", EventID: "evt"}
 	op, dup, err := f.s.RecordHumanAnswer(ctx, answer)
 	if err != nil || dup || op == "" {
@@ -185,6 +190,33 @@ func TestHumanGateAndSingleContinuation(t *testing.T) {
 }
 func ptrBlocker(b Blocker) *Blocker { return &b }
 
+// Test: the owner can resolve dependency identity without exposing it to a worker or stale instance.
+// Validates: SP-STD-022 §5 trusted identity for resume_task and P2 instance binding.
+func TestDependencyLookupOwnerScopeAndInstance(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	d := Dependency{ID: NewID(), FeatureID: f.feature.FeatureID, Kind: "job", JobID: NewID(), AttemptID: NewID(), SourceMessageID: NewID(), State: "owner_resolution", Blocker: humanBlocker(), CreatedAt: f.s.stamp(), UpdatedAt: f.s.stamp()}
+	if err := f.s.transaction(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, "INSERT INTO dependencies(id,feature_id,job_id,source_message_id,state,data) VALUES(?,?,?,?,?,?)", d.ID, d.FeatureID, d.JobID, d.SourceMessageID, d.State, mustJSON(d))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var got Dependency
+	if err := json.Unmarshal(f.call("orchestrator", "GET", "/dependencies/"+d.ID, nil, 200), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.JobID != d.JobID || got.AttemptID != d.AttemptID || got.State != d.State {
+		t.Fatal("owner did not receive trusted dependency identity")
+	}
+	f.call("worker-a", "GET", "/dependencies/"+d.ID, nil, 404)
+	f.call("orchestrator", "GET", "/dependencies/"+NewID(), nil, 404)
+	old := f.instances["orchestrator"]
+	f.instances["orchestrator"] = NewID()
+	f.call("orchestrator", "GET", "/dependencies/"+d.ID, nil, 409)
+	f.instances["orchestrator"] = old
+}
+
 // Test: a stopped feature tombstones the dependency even after !continue.
 // Validates: AC-449 and AC-465 (late/denied continuation never resumes).
 func TestHumanStopTombstone(t *testing.T) {
@@ -193,6 +225,11 @@ func TestHumanStopTombstone(t *testing.T) {
 	d := Dependency{ID: NewID(), FeatureID: f.feature.FeatureID, Kind: "owner_step", StepKey: "approval", OriginTurnID: NewID(), SourceMessageID: NewID(), State: "human_waiting", RequestID: NewID(), Blocker: humanBlocker(), CreatedAt: f.s.stamp(), UpdatedAt: f.s.stamp()}
 	err := f.s.transaction(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, "INSERT INTO dependencies(id,feature_id,job_id,source_message_id,state,data) VALUES(?,?,?,?,?,?)", d.ID, d.FeatureID, "", d.SourceMessageID, d.State, mustJSON(d))
+		if err != nil {
+			return err
+		}
+		q := SlackDelivery{ID: d.RequestID, FeatureID: d.FeatureID, ChannelID: f.feature.ChannelID, ThreadTS: f.feature.ThreadTS, Text: questionText(d), Status: "queued"}
+		_, err = tx.ExecContext(ctx, "INSERT INTO slack_outbox(id,feature_id,turn_id,status,data) VALUES(?,?,NULL,?,?)", q.ID, q.FeatureID, q.Status, mustJSON(q))
 		return err
 	})
 	if err != nil {
@@ -207,6 +244,98 @@ func TestHumanStopTombstone(t *testing.T) {
 	if f.history().Dependencies[0].State != "cancelled" {
 		t.Fatal("continue reopened cancelled dependency")
 	}
+	if f.history().SlackOutbox[0].Status != "suppressed" {
+		t.Fatal("stop left cancelled question queued")
+	}
+	if next, err := f.s.ClaimSlack(ctx); err != nil || next != nil {
+		t.Fatal("cancelled question was claimable")
+	}
+}
+
+// Test: a terminal answer needs both the request snapshot and current allowlist.
+// Validates: SP-STD-022 §8 responder intersection and safe allowlist rotation.
+func TestHumanAnswerSnapshotAndCurrentAllowlist(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		snapshot, current []string
+	}{
+		{"revoked_current", []string{"human"}, []string{"other"}},
+		{"outside_snapshot", []string{"other"}, []string{"human"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newHumanFixture(t)
+			ctx := context.Background()
+			d := Dependency{ID: NewID(), FeatureID: f.feature.FeatureID, Kind: "owner_step", StepKey: "approval", OriginTurnID: NewID(), SourceMessageID: NewID(), State: "human_waiting", RequestID: NewID(), Blocker: humanBlocker(), CreatedAt: f.s.stamp(), UpdatedAt: f.s.stamp()}
+			if err := f.s.transaction(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, "INSERT INTO dependencies(id,feature_id,job_id,source_message_id,state,data) VALUES(?,?,?,?,?,?)", d.ID, d.FeatureID, "", d.SourceMessageID, d.State, mustJSON(d))
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			updated := f.feature
+			updated.AllowedActorIDs = tc.current
+			if err := f.s.RegisterFeature(ctx, updated); err != nil {
+				t.Fatal(err)
+			}
+			v := humanBackendView{ID: d.RequestID, TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: d.FeatureID, AllowedResponders: tc.snapshot, State: "answered", Revision: 2}
+			v.Dependency.ID = d.ID
+			v.Terminal = &struct {
+				ID       string          `json:"id"`
+				Kind     string          `json:"kind"`
+				Response json.RawMessage `json:"response"`
+				Source   json.RawMessage `json:"source"`
+			}{ID: NewID(), Kind: "answer", Response: mustJSON(map[string]any{"kind": "answer", "option_id": "a", "text": ""}), Source: mustJSON(map[string]string{"actor_id": "human"})}
+			if err := f.s.acceptHumanEnvelope(ctx, d.RequestID, mustJSON(humanEnvelope{SchemaVersion: 1, Data: mustJSON(v)})); err != nil {
+				t.Fatal(err)
+			}
+			h := f.history()
+			if h.Dependencies[0].State != "cancelled" || h.HumanRequests[0].ApplicationStatus != "suppressed" {
+				t.Fatal("answer bypassed responder intersection")
+			}
+			for _, m := range h.Messages {
+				if m.Type == "human.decision" {
+					t.Fatal("suppressed answer created owner input")
+				}
+			}
+		})
+	}
+}
+
+// Test: a different gateway JWT is rejected before any backend mutation.
+// Validates: SP-STD-022 §8 writer pin across credential replacement.
+func TestGatewayWriterPinned(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	var pinned string
+	if err := f.s.db.QueryRowContext(ctx, "SELECT writer_id FROM human_gateway_writer WHERE id=1").Scan(&pinned); err != nil || pinned != f.cfg.Human.WriterID {
+		t.Fatal("writer not pinned in state")
+	}
+	requests := 0
+	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests++; w.WriteHeader(200) }))
+	defer provider.Close()
+	ca := filepath.Join(t.TempDir(), "provider.pem")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: provider.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.s.cfg.Human.BaseURL = provider.URL
+	f.s.cfg.Human.CAFile = ca
+	if err := writeGatewayToken(f.s.cfg.Human.TokenFile, gatewayToken{Token: testJWT(NewID())}); err != nil {
+		t.Fatal(err)
+	}
+	client, err := f.s.backendClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = f.s.backendRequest(ctx, client, http.MethodPut, "/api/v1/human-requests/"+NewID(), mustJSON(map[string]string{"probe": "x"}))
+	if !errors.Is(err, errGatewayAuth) || requests != 0 {
+		t.Fatal("swapped writer reached backend")
+	}
+	original := f.s.cfg.Human.WriterID
+	f.s.cfg.Human.WriterID = NewID()
+	if err := f.s.bootstrap(ctx); err == nil {
+		t.Fatal("state accepted changed gateway writer")
+	}
+	f.s.cfg.Human.WriterID = original
 }
 
 // Test: an unknown refresh response is durable and never blindly retried.
@@ -229,7 +358,7 @@ func TestGatewayRefreshUnknownFailsClosed(t *testing.T) {
 	}
 	f.s.cfg.Human.BaseURL = provider.URL
 	f.s.cfg.Human.CAFile = ca
-	if err := writeGatewayToken(f.s.cfg.Human.TokenFile, gatewayToken{Token: "expired", RefreshToken: "one-use"}); err != nil {
+	if err := writeGatewayToken(f.s.cfg.Human.TokenFile, gatewayToken{Token: testJWT(f.s.cfg.Human.WriterID), RefreshToken: "one-use"}); err != nil {
 		t.Fatal(err)
 	}
 	client, err := f.s.backendClient()
@@ -251,4 +380,7 @@ func TestGatewayRefreshUnknownFailsClosed(t *testing.T) {
 	if !errors.Is(err, errGatewayAuth) || refreshCalls != 1 {
 		t.Fatal("unknown refresh was retried")
 	}
+}
+func testJWT(writer string) string {
+	return "e30." + base64.RawURLEncoding.EncodeToString(mustJSON(map[string]string{"user_id": writer})) + ".signature"
 }

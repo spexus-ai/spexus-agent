@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -198,6 +199,24 @@ type gatewayToken struct {
 
 var errGatewayAuth = errors.New("gateway authentication blocked")
 
+func jwtWriter(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	b, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		UserID string `json:"user_id"`
+	}
+	if json.Unmarshal(b, &claims) != nil || !uuid(claims.UserID) {
+		return ""
+	}
+	return claims.UserID
+}
+
 func (s *Store) backendClient() (*http.Client, error) {
 	if s.cfg.Human == nil {
 		return nil, errors.New("human backend unconfigured")
@@ -309,6 +328,9 @@ func (s *Store) refreshGateway(ctx context.Context, c *http.Client, t gatewayTok
 	if err = json.NewDecoder(io.LimitReader(resp.Body, 128*1024)).Decode(&next); err != nil || next.Token == "" || next.RefreshToken == "" {
 		return fmt.Errorf("%w: refresh response unknown; reprovision same writer", errGatewayAuth)
 	}
+	if jwtWriter(next.Token) != s.cfg.Human.WriterID {
+		return fmt.Errorf("%w: refresh writer changed; reprovision same writer", errGatewayAuth)
+	}
 	return writeGatewayToken(path, gatewayToken{Token: next.Token, RefreshToken: next.RefreshToken})
 }
 func (s *Store) backendRequest(ctx context.Context, c *http.Client, method, path string, payload []byte) (int, []byte, error) {
@@ -320,6 +342,9 @@ func (s *Store) backendRequest(ctx context.Context, c *http.Client, method, path
 		return 0, nil, fmt.Errorf("%w: refresh outcome unknown; reprovision same writer", errGatewayAuth)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
+		if jwtWriter(t.Token) != s.cfg.Human.WriterID {
+			return 0, nil, fmt.Errorf("%w: credential writer mismatch", errGatewayAuth)
+		}
 		req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(s.cfg.Human.BaseURL, "/")+path, bytes.NewReader(payload))
 		if err != nil {
 			return 0, nil, err
@@ -363,6 +388,16 @@ func (s *Store) HumanPreflight(ctx context.Context) error {
 	c, err := s.backendClient()
 	if err != nil {
 		return err
+	}
+	identityStatus, identityBody, identityErr := s.backendRequest(ctx, c, http.MethodGet, "/api/v1/users/me", nil)
+	if identityErr != nil {
+		return identityErr
+	}
+	var identity struct {
+		ID string `json:"id"`
+	}
+	if identityStatus != 200 || json.Unmarshal(identityBody, &identity) != nil || identity.ID != s.cfg.Human.WriterID {
+		return errors.New("human gateway writer identity mismatch")
 	}
 	q := url.Values{"epic_id": {s.cfg.Human.EpicID}, "limit": {"1"}}
 	status, b, err := s.backendRequest(ctx, c, http.MethodGet, "/api/v1/human-requests?"+q.Encode(), nil)
@@ -604,7 +639,7 @@ func (s *Store) applyHumanTerminal(ctx context.Context, tx *sql.Tx, d Dependency
 		return err
 	}
 	if v.Terminal.Kind == "answer" || v.Terminal.Kind == "deny" {
-		if !allowedActor(f, src.ActorID) {
+		if !allowedActor(f, src.ActorID) || !containsResponder(v.AllowedResponders, src.ActorID) {
 			status = "suppressed"
 			reason = "actor_revoked"
 		}

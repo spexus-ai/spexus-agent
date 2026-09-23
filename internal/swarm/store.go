@@ -75,6 +75,7 @@ CREATE INDEX IF NOT EXISTS backend_sync_due ON backend_sync_operations(status,ne
 CREATE TABLE IF NOT EXISTS decision_applications (request_id TEXT NOT NULL,revision INTEGER NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',mailbox_seq INTEGER,PRIMARY KEY(request_id,revision));
 CREATE TABLE IF NOT EXISTS source_ingress (workspace_id TEXT NOT NULL,channel_id TEXT NOT NULL,message_ts TEXT NOT NULL,feature_id TEXT NOT NULL,payload BLOB NOT NULL,receipt BLOB NOT NULL,PRIMARY KEY(workspace_id,channel_id,message_ts));
 CREATE TABLE IF NOT EXISTS recovery_barriers (feature_id TEXT PRIMARY KEY REFERENCES features(id),reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS human_gateway_writer (id INTEGER PRIMARY KEY CHECK(id=1),writer_id TEXT NOT NULL);
 `
 
 func Open(ctx context.Context, path string, cfg Config) (*Store, error) {
@@ -175,6 +176,18 @@ func (s *Store) bootstrap(ctx context.Context) error {
 	// retained execution state or permit a mixed wire/schema stand.
 	if _, err = tx.ExecContext(ctx, humanSchema); err != nil {
 		return err
+	}
+	if target == 2 {
+		if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO human_gateway_writer(id,writer_id) VALUES(1,?)", s.cfg.Human.WriterID); err != nil {
+			return err
+		}
+		var writer string
+		if err = tx.QueryRowContext(ctx, "SELECT writer_id FROM human_gateway_writer WHERE id=1").Scan(&writer); err != nil {
+			return err
+		}
+		if writer != s.cfg.Human.WriterID {
+			return fmt.Errorf("immutable gateway writer changed")
+		}
 	}
 	if target == 2 {
 		if _, err = tx.ExecContext(ctx, "UPDATE backend_sync_operations SET status='retry' WHERE status='inflight'"); err != nil {
@@ -287,6 +300,13 @@ func (s *Store) registerFeature(ctx context.Context, tx *sql.Tx, f Feature) erro
 	if !uuid(f.FeatureID) || f.TenantID != s.cfg.TenantID || f.ProjectID != s.cfg.ProjectID || f.ChannelID == "" || f.ThreadTS == "" || len(f.AllowedActorIDs) == 0 {
 		return wireError(400, "invalid_feature")
 	}
+	seenActors := map[string]bool{}
+	for _, actor := range f.AllowedActorIDs {
+		if !safeText(actor, 128) || seenActors[actor] {
+			return wireError(400, "invalid_actor_allowlist")
+		}
+		seenActors[actor] = true
+	}
 	var role string
 	if err := tx.QueryRowContext(ctx, "SELECT role FROM agents WHERE agent_id=?", f.OwnerAgentID).Scan(&role); err != nil || role != "owner" {
 		return wireError(400, "invalid_owner")
@@ -297,10 +317,11 @@ func (s *Store) registerFeature(ctx context.Context, tx *sql.Tx, f Feature) erro
 		var old Feature
 		_ = json.Unmarshal(raw, &old)
 		f.Stopped = old.Stopped
-		if string(mustJSON(old)) != string(mustJSON(f)) {
+		if old.FeatureID != f.FeatureID || old.TenantID != f.TenantID || old.ProjectID != f.ProjectID || old.OwnerAgentID != f.OwnerAgentID || old.ChannelID != f.ChannelID || old.ThreadTS != f.ThreadTS {
 			return wireError(409, "feature_conflict")
 		}
-		return nil
+		_, err = tx.ExecContext(ctx, "UPDATE features SET data=? WHERE id=?", mustJSON(f), f.FeatureID)
+		return err
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err

@@ -15,6 +15,34 @@ type jobCursor struct {
 	Seq                                 int64
 }
 
+// DependencyForOwner resolves runtime-owned identity for a fresh owner action.
+// Workers and stale instances receive no dependency details.
+func (s *Store) DependencyForOwner(ctx context.Context, p Principal, id string) (Dependency, error) {
+	var out Dependency
+	if !uuid(id) {
+		return out, wireError(400, "invalid_dependency")
+	}
+	err := s.transaction(ctx, func(tx *sql.Tx) error {
+		if err := bound(ctx, tx, p); err != nil {
+			return err
+		}
+		d, err := dependency(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		f, err := feature(ctx, tx, d.FeatureID)
+		if err != nil {
+			return err
+		}
+		if f.OwnerAgentID != p.AgentID || f.TenantID != s.cfg.TenantID || f.ProjectID != s.cfg.ProjectID {
+			return wireError(404, "not_found")
+		}
+		out = d
+		return nil
+	})
+	return out, err
+}
+
 func (s *Store) job(ctx context.Context, p Principal, id string, limit int, cursor string) (JobView, error) {
 	var out JobView
 	err := s.transaction(ctx, func(tx *sql.Tx) error {

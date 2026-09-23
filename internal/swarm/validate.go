@@ -118,7 +118,7 @@ func validateConfig(c Config) error {
 	if c.WireVersion != 0 && c.WireVersion != 1 && c.WireVersion != 2 {
 		return fmt.Errorf("unsupported wire version")
 	}
-	if c.WireVersion == 2 && (c.Human == nil || !uuid(c.Human.EpicID) || c.Human.WorkspaceID == "" || c.Human.BaseURL == "" || c.Human.TokenFile == "") {
+	if c.WireVersion == 2 && (c.Human == nil || !uuid(c.Human.EpicID) || !uuid(c.Human.WriterID) || c.Human.WorkspaceID == "" || c.Human.BaseURL == "" || c.Human.TokenFile == "") {
 		return fmt.Errorf("wire version 2 requires human backend configuration")
 	}
 	profiles := map[string]bool{}

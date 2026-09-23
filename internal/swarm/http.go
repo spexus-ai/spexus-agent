@@ -137,6 +137,9 @@ func (s *Store) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			out, err = s.job(ctx, p, id, limit, r.URL.Query().Get("cursor"))
 		}
+	case strings.HasPrefix(path, "/dependencies/") && r.Method == http.MethodGet:
+		id := strings.TrimPrefix(path, "/dependencies/")
+		out, err = s.DependencyForOwner(ctx, p, id)
 	case path == "/owner-turns/start" && r.Method == http.MethodPost:
 		var v OwnerStartRequest
 		err = body(r, &v, "turn_id", "feature_id", "input_mailbox_seq")

@@ -40,6 +40,10 @@ func (s *Store) blocked(ctx context.Context, tx *sql.Tx, a attemptRecord, e Enve
 		return wireError(409, "dependency_already_open")
 	}
 	d := Dependency{ID: NewID(), FeatureID: a.FeatureID, Kind: "job", JobID: a.JobID, AttemptID: a.AttemptID, SourceMessageID: e.MessageID, State: "owner_resolution", Blocker: *p.Blocker, CreatedAt: s.stamp(), UpdatedAt: s.stamp()}
+	d.BlockedWork = "Goal: " + a.Dispatch.Goal + "\nScope: " + a.Dispatch.Scope
+	if len(d.BlockedWork) > 16*1024 {
+		d.BlockedWork = "Goal: " + a.Dispatch.Goal
+	}
 	if _, err := tx.ExecContext(ctx, "INSERT INTO dependencies(id,feature_id,job_id,source_message_id,state,data) VALUES(?,?,?,?,?,?)", d.ID, d.FeatureID, d.JobID, d.SourceMessageID, d.State, mustJSON(d)); err != nil {
 		return err
 	}
@@ -93,6 +97,11 @@ func (s *Store) humanRequest(ctx context.Context, tx *sql.Tx, e Envelope, p Huma
 	d.RequestID = NewID()
 	if d.Kind == "job" {
 		d.Blocker = p.Blocker
+		contextWithWork := p.Context + "\nBlocked work: " + d.BlockedWork
+		if len(contextWithWork) > 16*1024 {
+			return wireError(400, "context_too_large")
+		}
+		d.Blocker.Context = contextWithWork
 	}
 	d.UpdatedAt = s.stamp()
 	if err = saveDependency(ctx, tx, d); err != nil {
@@ -230,7 +239,8 @@ func (s *Store) canResume(ctx context.Context, tx *sql.Tx, e Envelope, p ResumeT
 			return d, wireError(409, "decision_not_applied")
 		}
 		var view struct {
-			Terminal struct {
+			AllowedResponders []string `json:"allowed_responders"`
+			Terminal          struct {
 				Source struct {
 					ActorID string `json:"actor_id"`
 				} `json:"source"`
@@ -239,7 +249,7 @@ func (s *Store) canResume(ctx context.Context, tx *sql.Tx, e Envelope, p ResumeT
 		if err = json.Unmarshal(proj.View, &view); err != nil {
 			return d, err
 		}
-		if !allowedActor(f, view.Terminal.Source.ActorID) {
+		if !allowedActor(f, view.Terminal.Source.ActorID) || !containsResponder(view.AllowedResponders, view.Terminal.Source.ActorID) {
 			return d, wireError(409, "actor_revoked")
 		}
 	}
@@ -252,6 +262,14 @@ func (s *Store) canResume(ctx context.Context, tx *sql.Tx, e Envelope, p ResumeT
 		return d, err
 	}
 	return d, nil
+}
+func containsResponder(ids []string, actor string) bool {
+	for _, id := range ids {
+		if id == actor {
+			return true
+		}
+	}
+	return false
 }
 func (s *Store) markResumed(ctx context.Context, tx *sql.Tx, d Dependency, e Envelope) error {
 	d.State = "continuation_scheduled"
@@ -290,6 +308,32 @@ func (s *Store) cancelDependencies(ctx context.Context, tx *sql.Tx, featureID, a
 			return err
 		}
 		if d.RequestID != "" {
+			var raw []byte
+			queryErr := tx.QueryRowContext(ctx, "SELECT data FROM slack_outbox WHERE id=?", d.RequestID).Scan(&raw)
+			if queryErr == nil {
+				var question SlackDelivery
+				if err = json.Unmarshal(raw, &question); err != nil {
+					return err
+				}
+				if question.Status == "queued" {
+					question.Status = "suppressed"
+					if _, err = tx.ExecContext(ctx, "UPDATE slack_outbox SET status=?,data=? WHERE id=?", question.Status, mustJSON(question), question.ID); err != nil {
+						return err
+					}
+				}
+				if question.Status == "sent" || question.Status == "sending" || question.Status == "delivery_unknown" {
+					f, featureErr := feature(ctx, tx, d.FeatureID)
+					if featureErr != nil {
+						return featureErr
+					}
+					notice := SlackDelivery{ID: NewID(), FeatureID: d.FeatureID, ChannelID: f.ChannelID, ThreadTS: f.ThreadTS, Text: "Запрос " + d.RequestID + " отменён. Ответы по нему больше не продолжат работу.", Status: "queued"}
+					if _, err = tx.ExecContext(ctx, "INSERT INTO slack_outbox(id,feature_id,turn_id,status,data) VALUES(?,?,NULL,?,?)", notice.ID, notice.FeatureID, notice.Status, mustJSON(notice)); err != nil {
+						return err
+					}
+				}
+			} else if !errors.Is(queryErr, sql.ErrNoRows) {
+				return queryErr
+			}
 			op := struct {
 				OperationID      string `json:"operation_id"`
 				ExpectedRevision int    `json:"expected_revision"`
@@ -314,9 +358,9 @@ func questionText(d Dependency) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Решение человека требуется для работы.\nЗапрос: %s\nПричина: %s\nКонтекст: %s\nВопрос: %s\nРекомендация: %s\nОжидает: ", d.RequestID, d.Blocker.Reason, d.Blocker.Context, d.Blocker.Question, d.Blocker.Recommendation)
 	if d.Kind == "job" {
-		fmt.Fprintf(&b, "job %s, attempt %s", d.JobID, d.AttemptID)
+		fmt.Fprintf(&b, "%s (job %s, attempt %s)", d.BlockedWork, d.JobID, d.AttemptID)
 	} else {
-		fmt.Fprintf(&b, "step %s", d.StepKey)
+		fmt.Fprintf(&b, "%s (step %s)", d.BlockedWork, d.StepKey)
 	}
 	for _, o := range d.Blocker.Options {
 		fmt.Fprintf(&b, "\n• %s — %s", o.ID, o.Label)

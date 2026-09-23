@@ -29,6 +29,7 @@ type HumanConfig struct {
 	CAFile      string `json:"ca_file"`
 	TokenFile   string `json:"token_file"`
 	EpicID      string `json:"epic_id"`
+	WriterID    string `json:"writer_id"`
 	WorkspaceID string `json:"workspace_id"`
 }
 type AgentConfig struct {
