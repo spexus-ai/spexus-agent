@@ -177,3 +177,137 @@ func TestHumanStrictOutputAndOwnerActions(t *testing.T) {
 		}
 	}
 }
+
+// Test: one owner final output resolves and resumes in order; duplicate inbox delivery never reruns Pi.
+// Validates: AC-437 and AC-465 (REQ-355 and REQ-392 - self-resolution has one continuation).
+func TestOwnerSelfResolutionAndResumeInOneTurn(t *testing.T) {
+	depID := swarm.NewID()
+	dep := swarm.Dependency{ID: depID, FeatureID: feature, Kind: "job", JobID: job, AttemptID: attempt, State: "owner_resolution"}
+	var modelTurns, resolveCount, resumeCount int
+	var continuation string
+	var r *Runner
+	handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		switch {
+		case q.URL.Path == swarm.APIPrefix+"/dependencies/"+depID && q.Method == http.MethodGet:
+			writeJSON(w, dep)
+		case q.URL.Path == swarm.APIPrefix+"/owner-turns/start" && q.Method == http.MethodPost:
+			writeJSON(w, swarm.OwnerStartReceipt{TurnID: swarm.NewID(), State: "running"})
+		case strings.HasPrefix(q.URL.Path, swarm.APIPrefix+"/owner-turns/") && q.Method == http.MethodGet:
+			writeJSON(w, swarm.OwnerTurn{State: "running"})
+		case strings.HasSuffix(q.URL.Path, "/finish") && q.Method == http.MethodPost:
+			var finish swarm.OwnerFinishRequest
+			if err := json.NewDecoder(q.Body).Decode(&finish); err != nil || len(finish.Actions) != 2 || finish.Outcome != "succeeded" {
+				t.Errorf("owner finish lost action receipts: %+v %v", finish, err)
+			}
+			writeJSON(w, swarm.OwnerFinishReceipt{State: "succeeded"})
+		case q.URL.Path == swarm.APIPrefix+"/messages" && q.Method == http.MethodPost:
+			var m swarm.Envelope
+			if err := json.NewDecoder(q.Body).Decode(&m); err != nil {
+				t.Fatal(err)
+			}
+			if err := swarm.ValidateEnvelope(m); err != nil {
+				t.Fatal(err)
+			}
+			switch m.Type {
+			case "dependency.resolve":
+				if dep.State != "owner_resolution" {
+					t.Error("resolve out of order")
+				}
+				resolveCount++
+				dep.State = "resolved"
+			case "task.resume":
+				if dep.State != "resolved" || m.JobID != job || m.AttemptID == attempt {
+					t.Error("resume not linked to resolved job with fresh attempt")
+				}
+				resumeCount++
+				continuation = m.AttemptID
+				dep.State = "continuation_scheduled"
+			default:
+				t.Errorf("unexpected action %s", m.Type)
+			}
+			writeJSON(w, swarm.Receipt{MessageID: m.MessageID, Receipt: "stored"})
+		default:
+			t.Errorf("unexpected request: %s %s", q.Method, q.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	r, _ = runnerFixture(t, handler)
+	r.cfg.WireVersion = 2
+	r.cfg.Role = "owner"
+	r.cfg.AgentID = "orchestrator"
+	r.targets = []targetProfile{{AgentID: "worker-a", Profile: r.profile.wire()}}
+	dispatch := swarm.DispatchPayload{Goal: "finish the task", Scope: "given recorded resolution", ExpectedResult: []string{"done"}, Context: swarm.TaskContext{Text: "original task, blocker and self-resolution", Refs: []swarm.ContextRef{}}, Profile: r.profile.wire()}
+	resolveData, _ := json.Marshal(swarm.ResolveDependencyPayload{DependencyID: depID, Resolution: "The documented rule permits this", Evidence: []swarm.Evidence{}})
+	resumeData, _ := json.Marshal(swarm.ResumeTaskPayload{DependencyID: depID, WorkerAgentID: "worker-a", Dispatch: dispatch})
+	output, _ := json.Marshal(ownerOutput{Actions: []action{{Kind: "resolve_dependency", Data: resolveData}, {Kind: "resume_task", Data: resumeData}}, Reply: "Continuing work"})
+	r.model = modelFunc(func(_ context.Context, _, _ string) (string, bool, error) {
+		modelTurns++
+		return string(output), false, nil
+	})
+	d := dispatchFixture(r)
+	d.Type = "agent.input"
+	d.FromAgentID, d.ToAgentID = "coordinator", "orchestrator"
+	d.JobID, d.AttemptID, d.OwnerTurnID = "", "", ""
+	d.ProtocolVersion = 2
+	d.Payload, _ = json.Marshal(swarm.InputPayload{Text: "resolve blocker", Source: swarm.Source{Kind: "test", EventID: swarm.NewID(), ActorID: "human"}})
+	storeInput(t, r, d)
+	if err := r.process(context.Background(), d); err != nil {
+		t.Fatal(err)
+	}
+	if modelTurns != 1 || resolveCount != 1 || resumeCount != 1 || !uuid.MatchString(continuation) {
+		t.Fatalf("self-resolution failed: model=%d resolve=%d resume=%d attempt=%s", modelTurns, resolveCount, resumeCount, continuation)
+	}
+	if err := r.journal.receive(d); err != nil {
+		t.Fatal(err)
+	}
+	if _, pending, err := r.journal.next(); err != nil || pending || modelTurns != 1 || resumeCount != 1 {
+		t.Fatalf("duplicate input restarted owner: pending=%v err=%v model=%d resume=%d", pending, err, modelTurns, resumeCount)
+	}
+}
+
+// Test: wire 2 uses schema 2, and both directions of retained-state reuse fail closed.
+// Validates: AC-463 (REQ-390 - no mixed runner journals during v2 rollout).
+func TestRunnerJournalWireVersionBarrier(t *testing.T) {
+	v2dir := t.TempDir()
+	v2, err := OpenJournal(v2dir, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored int
+	if err := v2.db.QueryRow(`SELECT version FROM schema_version`).Scan(&stored); err != nil || stored != 2 {
+		t.Fatalf("new v2 journal has schema %d: %v", stored, err)
+	}
+	_ = v2.Close()
+	if j, err := OpenJournal(v2dir, 1); err == nil {
+		_ = j.Close()
+		t.Fatal("v1 opened a v2 journal")
+	}
+	v2, err = OpenJournal(v2dir, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = v2.Close()
+
+	v1dir := t.TempDir()
+	v1, err := OpenJournal(v1dir, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := swarm.Delivery{Envelope: swarm.Envelope{Type: "task.dispatch", MessageID: swarm.NewID()}, MailboxSeq: 1}
+	if err := v1.receive(legacy); err != nil {
+		t.Fatal(err)
+	}
+	_ = v1.Close()
+	if j, err := OpenJournal(v1dir, 2); err == nil {
+		_ = j.Close()
+		t.Fatal("wire 2 silently reused retained v1 state")
+	}
+	v1, err = OpenJournal(v1dir, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v1.Close()
+	if next, found, err := v1.next(); err != nil || !found || next.MessageID != legacy.MessageID {
+		t.Fatalf("failed migration modified retained v1 inbox: found=%v err=%v next=%+v", found, err, next)
+	}
+}

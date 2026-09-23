@@ -142,6 +142,10 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 		return o, nil, errors.New("invalid owner output bounds")
 	}
 	result := make([]swarm.Envelope, 0, len(o.Actions))
+	// Actions are published in this order, but the whole output must validate
+	// before any publication. Track transitions planned earlier in this output
+	// so resolve_dependency and resume_task can be one owner turn.
+	planned := map[string]string{}
 	for _, a := range o.Actions {
 		var m swarm.Envelope
 		switch a.Kind {
@@ -212,9 +216,10 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 				if e != nil {
 					return o, nil, e
 				}
-				if dep.State != "owner_resolution" {
+				if state := plannedState(dep, planned); state != "owner_resolution" {
 					return o, nil, errors.New("dependency is not escalatable")
 				}
+				planned[x.DependencyID] = "human_pending"
 			}
 			m = r.envelope(d, "human.request", "coordinator", x, nil)
 			m.JobID, m.AttemptID = "", ""
@@ -230,9 +235,10 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 			if e != nil {
 				return o, nil, e
 			}
-			if dep.Kind != "job" || dep.State != "owner_resolution" {
+			if dep.Kind != "job" || plannedState(dep, planned) != "owner_resolution" {
 				return o, nil, errors.New("dependency is not self-resolvable")
 			}
+			planned[x.DependencyID] = "resolved"
 			m = r.envelope(d, "dependency.resolve", "coordinator", x, nil)
 			m.JobID, m.AttemptID = "", ""
 		case "resume_task":
@@ -247,7 +253,7 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 			if e != nil {
 				return o, nil, e
 			}
-			if dep.Kind != "job" || dep.State != "resolved" || dep.JobID == "" || dep.AttemptID == "" || dep.DecisionID != x.DecisionID {
+			if dep.Kind != "job" || plannedState(dep, planned) != "resolved" || dep.JobID == "" || dep.AttemptID == "" || dep.DecisionID != x.DecisionID {
 				return o, nil, errors.New("dependency is not resumable")
 			}
 			if e := r.targetProfile(x.WorkerAgentID, x.Dispatch.Profile); e != nil {
@@ -261,6 +267,7 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 			}
 			m = r.envelope(d, "task.resume", x.WorkerAgentID, x, nil)
 			m.JobID, m.AttemptID = dep.JobID, swarm.NewID()
+			planned[x.DependencyID] = "continuation_scheduled"
 		case "complete_step":
 			if r.cfg.wireVersion() != 2 {
 				return o, nil, errors.New("step completion requires wire v2")
@@ -273,9 +280,10 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 			if e != nil {
 				return o, nil, e
 			}
-			if dep.Kind != "owner_step" || dep.State != "resolved" || dep.DecisionID != x.DecisionID {
+			if dep.Kind != "owner_step" || plannedState(dep, planned) != "resolved" || dep.DecisionID != x.DecisionID {
 				return o, nil, errors.New("step is not completable")
 			}
+			planned[x.DependencyID] = "step_completed"
 			m = r.envelope(d, "step.complete", "coordinator", x, nil)
 			m.JobID, m.AttemptID = "", ""
 		default:
@@ -288,6 +296,12 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 		result = append(result, m)
 	}
 	return o, result, nil
+}
+func plannedState(dep swarm.Dependency, planned map[string]string) string {
+	if state := planned[dep.ID]; state != "" {
+		return state
+	}
+	return dep.State
 }
 func (r *Runner) targetProfile(agent string, profile swarm.Profile) error {
 	for _, target := range r.targets {
@@ -410,7 +424,7 @@ Dispatch data: {"worker_agent_id":"from available_workers","goal":"...","scope":
 Wire v2 human requests: A worker's blocked result ends that attempt and frees its worker slot. Its job is gated by the dependency shown in the trusted event/job data. Choose either a justified self-resolution within existing policy (resolve_dependency) or request_human; permission, choice and external_action require a human. Do not poll while waiting; independent jobs may still be dispatched and reviewed. Never use ordinary dispatch to retry a blocked job, even after a human answer. A canonical human.decision event is the only human decision you may use; Slack text by itself is not a decision. The coordinator, not you, verifies the actor, source, revision, stop latch, and application status. A denied, cancelled or suppressed decision gives no continuation permission.
 New actions, each in the same {"kind":...,"data":{...}} format:
 - request_human for an existing blocked job: data {"dependency_id":"UUID from dependency.id","reason":"...","context":"...","question":"...","options":[{"id":"option-id","label":"..."}],"recommendation":"...","kind":"clarification|choice|permission|external_action|blocker"}. The question must explain the blocker, options, recommendation, and what work waits. For an owner-origin step instead of dependency_id use "step_key":"stable short ASCII key" and "blocked_work":"what waits" with the same blocker fields. Do not invent a dependency_id.
-- resolve_dependency: data {"dependency_id":"UUID from dependency.id","resolution":"reasoned resolution within existing policy","evidence":[]}. This is allowed only while dependency.state is owner_resolution and never for permission, choice or external_action.
+- resolve_dependency: data {"dependency_id":"UUID from dependency.id","resolution":"reasoned resolution within existing policy","evidence":[]}. This is allowed only while dependency.state is owner_resolution and never for permission, choice or external_action. If the blocked job should continue after this self-resolution, put resolve_dependency followed immediately by resume_task for the same dependency in this one FINAL actions array; no extra owner turn is generated for self-resolution.
 - resume_task: data {"dependency_id":"UUID from dependency.id","decision_id":"UUID from answered human.decision, or omit for a recorded self-resolution","worker_agent_id":"from available_workers","dispatch":{...}}. The dispatch object has the same fields/profile as an ordinary dispatch and must explicitly carry the original task, blocker, decision or resolution, and necessary context. Use this only after the trusted dependency is resolved and human.decision.application_status is applied for a human request. The runtime assigns the new attempt ID and creates a fresh worker Pi session; do not invent IDs.
 - complete_step: data {"dependency_id":"UUID from dependency.id","decision_id":"UUID from answered human.decision","summary":"what was completed"}. Only for resolved owner_step, never a blocked job.
 All action data is validated before any action is published. Do not claim acceptance or execution until a coordinator receipt exists. During human wait, your FINAL reply may explain that the question was requested and other independent work continues.

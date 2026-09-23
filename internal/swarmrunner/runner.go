@@ -53,7 +53,7 @@ func New(c Config) (*Runner, error) {
 		return nil, e
 	}
 	r.model = m
-	j, e := OpenJournal(c.StateDirectory)
+	j, e := OpenJournal(c.StateDirectory, c.wireVersion())
 	if e != nil {
 		return nil, e
 	}

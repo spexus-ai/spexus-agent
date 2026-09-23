@@ -49,10 +49,26 @@ type JournalHistory struct {
 	Pending int            `json:"pending_outbox"`
 }
 
-func OpenJournal(dir string) (*Journal, error) {
+func OpenJournal(dir string, version ...int) (*Journal, error) {
+	wireVersion := 1
+	if len(version) > 1 {
+		return nil, errors.New("exactly one wire version expected")
+	}
+	if len(version) == 1 {
+		wireVersion = version[0]
+	}
+	if wireVersion != 1 && wireVersion != 2 {
+		return nil, errors.New("unsupported runner journal schema")
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
+	dbPath := filepath.Join(dir, "runner.db")
+	_, existingErr := os.Stat(dbPath)
+	if existingErr != nil && !errors.Is(existingErr, os.ErrNotExist) {
+		return nil, existingErr
+	}
+	fresh := errors.Is(existingErr, os.ErrNotExist)
 	f, e := os.OpenFile(filepath.Join(dir, "runner.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if e != nil {
 		return nil, e
@@ -61,19 +77,22 @@ func OpenJournal(dir string) (*Journal, error) {
 		f.Close()
 		return nil, errors.New("runner instance already active")
 	}
-	db, e := sql.Open("sqlite3", "file:"+filepath.Join(dir, "runner.db")+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=5000")
+	db, e := sql.Open("sqlite3", "file:"+dbPath+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=5000")
 	if e != nil {
 		f.Close()
 		return nil, e
 	}
 	db.SetMaxOpenConns(1)
 	j := &Journal{db: db, lock: f}
-	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); INSERT INTO schema_version SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM schema_version); CREATE TABLE IF NOT EXISTS inbox(seq INTEGER PRIMARY KEY,body BLOB NOT NULL,type TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'received',turn_id TEXT NOT NULL DEFAULT '',launches INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',output BLOB,model_output TEXT); CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,seq INTEGER NOT NULL REFERENCES inbox(seq),kind TEXT NOT NULL,path TEXT NOT NULL,body BLOB NOT NULL,status TEXT NOT NULL DEFAULT 'pending',code TEXT NOT NULL DEFAULT '',receipt BLOB,UNIQUE(kind,path,body)); CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS instances(instance_id TEXT PRIMARY KEY);`)
-	var version int
+	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS inbox(seq INTEGER PRIMARY KEY,body BLOB NOT NULL,type TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'received',turn_id TEXT NOT NULL DEFAULT '',launches INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',output BLOB,model_output TEXT); CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,seq INTEGER NOT NULL REFERENCES inbox(seq),kind TEXT NOT NULL,path TEXT NOT NULL,body BLOB NOT NULL,status TEXT NOT NULL DEFAULT 'pending',code TEXT NOT NULL DEFAULT '',receipt BLOB,UNIQUE(kind,path,body)); CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS instances(instance_id TEXT PRIMARY KEY);`)
+	if e == nil && fresh {
+		_, e = db.Exec(`INSERT INTO schema_version(version) VALUES(?)`, wireVersion)
+	}
+	var storedVersion, rows int
 	if e == nil {
-		e = db.QueryRow(`SELECT version FROM schema_version`).Scan(&version)
-		if e == nil && version != 1 {
-			e = errors.New("runner schema mismatch")
+		e = db.QueryRow(`SELECT count(*),coalesce(max(version),0) FROM schema_version`).Scan(&rows, &storedVersion)
+		if e == nil && (rows != 1 || storedVersion != wireVersion) {
+			e = errors.New("runner schema mismatch: retained state requires an explicit offline migration")
 		}
 	}
 	if e != nil {
