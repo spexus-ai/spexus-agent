@@ -5,6 +5,9 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -203,5 +206,49 @@ func TestHumanStopTombstone(t *testing.T) {
 	}
 	if f.history().Dependencies[0].State != "cancelled" {
 		t.Fatal("continue reopened cancelled dependency")
+	}
+}
+
+// Test: an unknown refresh response is durable and never blindly retried.
+// Validates: SP-STD-022 §8 (revoke-before-response gateway credential safety).
+func TestGatewayRefreshUnknownFailsClosed(t *testing.T) {
+	f := newHumanFixture(t)
+	refreshCalls := 0
+	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth/refresh" {
+			refreshCalls++
+			w.WriteHeader(500)
+			return
+		}
+		w.WriteHeader(401)
+	}))
+	defer provider.Close()
+	ca := filepath.Join(t.TempDir(), "provider.pem")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: provider.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.s.cfg.Human.BaseURL = provider.URL
+	f.s.cfg.Human.CAFile = ca
+	if err := writeGatewayToken(f.s.cfg.Human.TokenFile, gatewayToken{Token: "expired", RefreshToken: "one-use"}); err != nil {
+		t.Fatal(err)
+	}
+	client, err := f.s.backendClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = f.s.backendRequest(context.Background(), client, http.MethodGet, "/api/v1/human-requests", nil)
+	if !errors.Is(err, errGatewayAuth) || refreshCalls != 1 {
+		t.Fatalf("unexpected refresh result: calls=%d err=%v", refreshCalls, err)
+	}
+	token, err := readGatewayToken(f.s.cfg.Human.TokenFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.RefreshState != "unknown" {
+		t.Fatal("refresh uncertainty was not persisted")
+	}
+	_, _, err = f.s.backendRequest(context.Background(), client, http.MethodGet, "/api/v1/human-requests", nil)
+	if !errors.Is(err, errGatewayAuth) || refreshCalls != 1 {
+		t.Fatal("unknown refresh was retried")
 	}
 }
