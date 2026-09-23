@@ -63,7 +63,7 @@ func (s *Store) startOwner(ctx context.Context, p Principal, r OwnerStartRequest
 		var urgentPending int
 		err = tx.QueryRowContext(ctx, `SELECT count(*) FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row
 				WHERE d.agent_id=? AND m.feature_id=? AND d.superseded=0 AND m.kind='agent.input'
-				AND substr(ltrim(json_extract(m.canonical,'$.payload.text')),1,1)='!'
+				AND substr(json_extract(m.canonical,'$.payload.text'),1,1)='!'
 				AND (?=0 OR d.seq<?)
 				AND NOT EXISTS (SELECT 1 FROM owner_turns t WHERE t.agent_id=d.agent_id AND t.input_seq=d.seq)`, p.AgentID, r.FeatureID, boolToInt(isUrgent), r.InputMailboxSeq).Scan(&urgentPending)
 		if err != nil {

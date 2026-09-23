@@ -564,7 +564,7 @@ func (s *Store) Ingest(ctx context.Context, featureID string, input InputPayload
 }
 
 func urgentInput(input InputPayload) bool {
-	return strings.HasPrefix(strings.TrimSpace(input.Text), "!")
+	return strings.HasPrefix(input.Text, "!")
 }
 
 // IngestUrgent retains the same immutable source and receipt as Ingest, but
@@ -593,7 +593,7 @@ func (s *Store) mailbox(ctx context.Context, p Principal, lane string, limit int
 				return err
 			}
 		}
-		rows, err := tx.QueryContext(ctx, "SELECT m.canonical,m.receipt,d.seq,d.pending_notification FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row LEFT JOIN recovery_barriers b ON b.feature_id=m.feature_id WHERE d.agent_id=? AND d.lane=? AND d.acked=0 AND d.superseded=0 AND (b.feature_id IS NULL OR m.kind IN ('task.result','task.cancel','turn.cancel')) ORDER BY CASE WHEN m.kind='agent.input' AND substr(ltrim(json_extract(m.canonical,'$.payload.text')),1,1)='!' THEN 0 ELSE 1 END,d.seq LIMIT ?", p.AgentID, lane, limit)
+		rows, err := tx.QueryContext(ctx, "SELECT m.canonical,m.receipt,d.seq,d.pending_notification FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row LEFT JOIN recovery_barriers b ON b.feature_id=m.feature_id WHERE d.agent_id=? AND d.lane=? AND d.acked=0 AND d.superseded=0 AND (b.feature_id IS NULL OR m.kind IN ('task.result','task.cancel','turn.cancel')) ORDER BY CASE WHEN m.kind='agent.input' AND substr(json_extract(m.canonical,'$.payload.text'),1,1)='!' THEN 0 ELSE 1 END,d.seq LIMIT ?", p.AgentID, lane, limit)
 		if err != nil {
 			return err
 		}
