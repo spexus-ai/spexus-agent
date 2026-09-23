@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS human_gateway_writer (id INTEGER PRIMARY KEY CHECK(id
 CREATE TABLE IF NOT EXISTS owner_redeliveries (failed_turn_id TEXT PRIMARY KEY REFERENCES owner_turns(id),feature_id TEXT NOT NULL REFERENCES features(id),original_seq INTEGER NOT NULL,result_message_id TEXT NOT NULL,review_message_id TEXT NOT NULL,new_seq INTEGER NOT NULL,actor TEXT NOT NULL,reason TEXT NOT NULL,at TEXT NOT NULL,UNIQUE(feature_id,new_seq));
 CREATE TABLE IF NOT EXISTS contextual_human_bindings (workspace_id TEXT NOT NULL,channel_id TEXT NOT NULL,message_ts TEXT NOT NULL,feature_id TEXT NOT NULL REFERENCES features(id),request_id TEXT NOT NULL REFERENCES human_projections(request_id),actor_id TEXT NOT NULL,kind TEXT NOT NULL,text_sha256 TEXT NOT NULL,bound_at TEXT NOT NULL,PRIMARY KEY(workspace_id,channel_id,message_ts));
 CREATE TABLE IF NOT EXISTS human_request_selectors (feature_id TEXT NOT NULL REFERENCES features(id),request_id TEXT NOT NULL UNIQUE REFERENCES human_projections(request_id),selector INTEGER NOT NULL CHECK(selector > 0),PRIMARY KEY(feature_id,selector));
+CREATE TABLE IF NOT EXISTS agent_activity (agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id),turn_id TEXT NOT NULL DEFAULT '',attempt_id TEXT NOT NULL DEFAULT '',phase TEXT NOT NULL);
 `
 
 func Open(ctx context.Context, path string, cfg Config) (*Store, error) {
@@ -468,7 +469,7 @@ func bound(ctx context.Context, tx *sql.Tx, p Principal) error {
 }
 func (s *Store) heartbeat(ctx context.Context, p Principal, r HeartbeatRequest) (HeartbeatResponse, error) {
 	var out HeartbeatResponse
-	if r.InstanceID != p.InstanceID || r.ActiveAttemptID != nil && !uuid(*r.ActiveAttemptID) || r.ActiveOwnerTurnID != nil && !uuid(*r.ActiveOwnerTurnID) {
+	if r.InstanceID != p.InstanceID || r.ActiveAttemptID != nil && !uuid(*r.ActiveAttemptID) || r.ActiveOwnerTurnID != nil && !uuid(*r.ActiveOwnerTurnID) || r.ActivityPhase != "" && r.ActivityPhase != "thinking" && r.ActivityPhase != "tool" && r.ActivityPhase != "responding" || r.ActivityPhase != "" && (r.ActiveOwnerTurnID == nil && r.ActiveAttemptID == nil || r.ActiveOwnerTurnID != nil && r.ActiveAttemptID != nil) {
 		return out, wireError(400, "invalid_heartbeat")
 	}
 	err := s.transaction(ctx, func(tx *sql.Tx) error {
@@ -479,20 +480,37 @@ func (s *Store) heartbeat(ctx context.Context, p Principal, r HeartbeatRequest) 
 		if instance != "" && instance != p.InstanceID {
 			return wireError(409, "instance_conflict")
 		}
+		activeAttempt := false
 		if r.ActiveAttemptID != nil {
 			a, err := attempt(ctx, tx, *r.ActiveAttemptID)
 			if err != nil || a.AssignedAgentID != p.AgentID {
 				return wireError(403, "foreign_attempt")
 			}
+			activeAttempt = a.State == "running" && role == "worker"
 		}
+		activeOwnerTurn := false
 		if r.ActiveOwnerTurnID != nil {
 			t, err := turn(ctx, tx, *r.ActiveOwnerTurnID)
 			if err != nil || t.AgentID != p.AgentID {
 				return wireError(403, "foreign_turn")
 			}
+			activeOwnerTurn = t.State == "running" && role == "owner"
 		}
 		now := s.stamp()
 		if _, err := tx.ExecContext(ctx, "UPDATE agents SET instance_id=?,heartbeat=? WHERE agent_id=?", p.InstanceID, now, p.AgentID); err != nil {
+			return err
+		}
+		if (activeOwnerTurn || activeAttempt) && r.ActivityPhase != "" {
+			turnID, attemptID := "", ""
+			if activeOwnerTurn {
+				turnID = *r.ActiveOwnerTurnID
+			} else {
+				attemptID = *r.ActiveAttemptID
+			}
+			if _, err := tx.ExecContext(ctx, "INSERT INTO agent_activity(agent_id,turn_id,attempt_id,phase) VALUES(?,?,?,?) ON CONFLICT(agent_id) DO UPDATE SET turn_id=excluded.turn_id,attempt_id=excluded.attempt_id,phase=excluded.phase", p.AgentID, turnID, attemptID, r.ActivityPhase); err != nil {
+				return err
+			}
+		} else if _, err := tx.ExecContext(ctx, "DELETE FROM agent_activity WHERE agent_id=?", p.AgentID); err != nil {
 			return err
 		}
 		if instance == "" {

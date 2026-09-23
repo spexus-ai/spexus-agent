@@ -191,6 +191,16 @@ type HumanDecisionPayload struct {
 	Source            json.RawMessage `json:"source,omitempty"`
 	ApplicationStatus string          `json:"application_status"`
 }
+
+// HumanRespondPayload is an owner's interpretation of a Slack message. The
+// timestamp is only a lookup key; the coordinator supplies trusted provenance.
+type HumanRespondPayload struct {
+	RequestID       string `json:"request_id"`
+	SourceMessageTS string `json:"source_message_ts"`
+	Kind            string `json:"kind"`
+	OptionID        string `json:"option_id,omitempty"`
+	Text            string `json:"text,omitempty"`
+}
 type ReviewPayload struct {
 	ResultMessageID string     `json:"result_message_id"`
 	Verdict         string     `json:"verdict"`
@@ -207,10 +217,25 @@ type Source struct {
 	ChannelID string `json:"channel_id"`
 	ThreadTS  string `json:"thread_ts"`
 	ActorID   string `json:"actor_id"`
+	MessageTS string `json:"message_ts,omitempty"`
 }
 type InputPayload struct {
-	Text   string `json:"text"`
-	Source Source `json:"source"`
+	Text               string               `json:"text"`
+	Source             Source               `json:"source"`
+	HumanAction        *HumanActionInput    `json:"human_action,omitempty"`
+	ActiveHumanRequest *HumanRequestContext `json:"active_human_request,omitempty"`
+}
+type HumanActionInput struct {
+	RequestID string `json:"request_id"`
+	OptionID  string `json:"option_id"`
+}
+type HumanRequestContext struct {
+	RequestID      string        `json:"request_id"`
+	Question       string        `json:"question"`
+	Options        []HumanOption `json:"options"`
+	Recommendation string        `json:"recommendation"`
+	BlockedWork    string        `json:"blocked_work"`
+	Kind           string        `json:"kind"`
 }
 type Receipt struct {
 	MessageID  string `json:"message_id"`
@@ -236,6 +261,7 @@ type HeartbeatRequest struct {
 	InstanceID        string  `json:"instance_id"`
 	ActiveAttemptID   *string `json:"active_attempt_id"`
 	ActiveOwnerTurnID *string `json:"active_owner_turn_id"`
+	ActivityPhase     string  `json:"activity_phase,omitempty"`
 }
 type HeartbeatResponse struct {
 	AgentID    string `json:"agent_id"`
@@ -332,10 +358,13 @@ type AuditEvent struct {
 	Code       string `json:"code"`
 }
 type AgentStatus struct {
-	AgentID       string  `json:"agent_id"`
-	InstanceID    string  `json:"instance_id"`
-	Status        string  `json:"status"`
-	LastHeartbeat *string `json:"last_heartbeat"`
+	AgentID         string  `json:"agent_id"`
+	InstanceID      string  `json:"instance_id"`
+	Status          string  `json:"status"`
+	LastHeartbeat   *string `json:"last_heartbeat"`
+	OwnerTurnID     string  `json:"owner_turn_id,omitempty"`
+	ActiveAttemptID string  `json:"active_attempt_id,omitempty"`
+	ActivityPhase   string  `json:"activity_phase,omitempty"`
 }
 type History struct {
 	Feature         Feature           `json:"feature"`

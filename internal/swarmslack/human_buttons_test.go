@@ -98,7 +98,7 @@ func TestHumanQuestionButtonsAndTerminalUpdate(t *testing.T) {
 	}
 }
 
-func TestFreeTextQuestionShowsShortReplyAndDenyWithoutUUID(t *testing.T) {
+func TestFreeTextQuestionInvitesNaturalReplyWithoutUUID(t *testing.T) {
 	var posted map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
@@ -115,7 +115,7 @@ func TestFreeTextQuestionShowsShortReplyAndDenyWithoutUUID(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := posted["text"].(string)
-	if strings.Contains(text, id) || strings.Contains(text, "!answer") || !strings.Contains(text, "Вопрос #2") || !strings.Contains(text, "Ответ #2: ваш текст") || !strings.Contains(text, "Отказ #2: причина") {
+	if strings.Contains(text, id) || strings.Contains(text, "!answer") || strings.Contains(text, "Вопрос #2") || strings.Contains(text, "Ответ #2:") || !strings.Contains(text, "Ответьте своими словами") {
 		t.Fatalf("free-text question is not human-readable: %q", text)
 	}
 	for _, raw := range posted["blocks"].([]any) {

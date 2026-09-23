@@ -277,7 +277,7 @@ func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, op
 	case "pending":
 		message += "\nОтвет получен. Проверяю запись в Spexus; решение пока не подтверждено."
 	case "attention":
-		message += "\nОтвет не удалось подтвердить в Spexus. Работа ждёт проверки; посмотрите !status."
+		message += "\nОтвет не удалось подтвердить в Spexus. Работа ждёт повторной проверки."
 	case "stopped":
 		message += "\nРабота остановлена. Ответы сейчас недоступны."
 	case "cancelled":
@@ -303,7 +303,7 @@ func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, op
 	return nil
 }
 
-func humanReadableQuestionText(message string, options []swarm.HumanOption, selector int, actionable bool) string {
+func humanReadableQuestionText(message string, options []swarm.HumanOption, _ int, actionable bool) string {
 	lines := strings.Split(message, "\n")
 	readable := make([]string, 0, len(lines))
 	for _, line := range lines {
@@ -314,20 +314,13 @@ func humanReadableQuestionText(message string, options []swarm.HumanOption, sele
 			if !actionable {
 				continue
 			}
-			number := ""
-			if selector > 0 {
-				number = fmt.Sprintf(" #%d", selector)
-			}
 			if len(options) == 0 {
-				line = "Напишите в этом треде: Ответ" + number + ": ваш текст. Для отказа: Отказ" + number + ": причина."
+				line = "Ответьте своими словами в этом треде. Можно также задать уточняющий вопрос или объяснить отказ."
 			} else {
-				line = "Выберите вариант кнопкой ниже. Для отказа напишите в этом треде: Отказ" + number + ": причина."
+				line = "Выберите вариант кнопкой или ответьте своими словами в этом треде."
 			}
 		}
 		readable = append(readable, line)
-	}
-	if selector > 0 {
-		return fmt.Sprintf("Вопрос #%d\n%s", selector, strings.Join(readable, "\n"))
 	}
 	return strings.Join(readable, "\n")
 }

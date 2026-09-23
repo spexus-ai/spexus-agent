@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,15 +15,17 @@ import (
 )
 
 type Runner struct {
-	cfg     Config
-	profile profile
-	targets []targetProfile
-	client  *Client
-	journal *Journal
-	model   Model
-	mu      sync.Mutex
-	active  swarm.Delivery
-	cancel  context.CancelFunc
+	cfg           Config
+	profile       profile
+	targets       []targetProfile
+	client        *Client
+	journal       *Journal
+	model         Model
+	mu            sync.Mutex
+	active        swarm.Delivery
+	cancel        context.CancelFunc
+	activityPhase string
+	activityCh    chan struct{}
 }
 
 func New(c Config) (*Runner, error) {
@@ -40,7 +43,7 @@ func New(c Config) (*Runner, error) {
 	if e = os.MkdirAll(c.Workspace, 0700); e != nil {
 		return nil, e
 	}
-	r := &Runner{cfg: c, profile: p, client: client, targets: []targetProfile{}}
+	r := &Runner{cfg: c, profile: p, client: client, targets: []targetProfile{}, activityCh: make(chan struct{}, 1)}
 	for _, target := range c.Targets {
 		p, e := loadProfile(target.ProfileFile)
 		if e != nil {
@@ -91,9 +94,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	background(r.control)
 	background(func(ctx context.Context) error {
+		tick := time.NewTicker(10 * time.Second)
+		defer tick.Stop()
 		for {
-			if e := sleep(ctx, 10*time.Second); e != nil {
-				return e
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-tick.C:
+			case <-r.activityCh:
 			}
 			if e := r.heartbeat(ctx); e != nil {
 				return e
@@ -104,6 +112,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	for ctx.Err() == nil {
 		if e := r.flush(ctx); e != nil {
 			return e
+		}
+		if r.cfg.Role == "owner" {
+			// Fetch newly queued urgent input before selecting an older local
+			// inbox entry. The coordinator also guards owner start if an urgent
+			// source races with this poll.
+			if e := r.pollWithWait(ctx, "normal", 0); e != nil && ctx.Err() == nil {
+				return e
+			}
 		}
 		d, ok, e := r.journal.next()
 		if e != nil {
@@ -129,20 +145,41 @@ func (r *Runner) Run(ctx context.Context) error {
 func (r *Runner) heartbeat(ctx context.Context) error {
 	r.mu.Lock()
 	active := r.active
+	phase := r.activityPhase
 	r.mu.Unlock()
 	q := swarm.HeartbeatRequest{InstanceID: r.cfg.InstanceID}
 	if r.cfg.Role == "worker" && active.AttemptID != "" {
 		q.ActiveAttemptID = ptr(active.AttemptID)
+		q.ActivityPhase = phase
 	}
 	if r.cfg.Role == "owner" && active.OwnerTurnID != "" {
 		q.ActiveOwnerTurnID = ptr(active.OwnerTurnID)
+		q.ActivityPhase = phase
 	}
 	var reply swarm.HeartbeatResponse
 	return r.client.call(ctx, "POST", "/agents/self/heartbeat", q, &reply)
 }
+
+func (r *Runner) reportActivity(phase string) {
+	r.mu.Lock()
+	if r.active.OwnerTurnID == "" && r.active.AttemptID == "" || r.activityPhase == phase {
+		r.mu.Unlock()
+		return
+	}
+	r.activityPhase = phase
+	r.mu.Unlock()
+	select {
+	case r.activityCh <- struct{}{}:
+	default:
+	}
+}
 func (r *Runner) poll(ctx context.Context, lane string) error {
+	return r.pollWithWait(ctx, lane, 20)
+}
+
+func (r *Runner) pollWithWait(ctx context.Context, lane string, waitSeconds int) error {
 	var response swarm.MailboxResponse
-	if e := r.client.call(ctx, "GET", "/mailbox?lane="+lane+"&limit=20&wait_seconds=20", nil, &response); e != nil {
+	if e := r.client.call(ctx, "GET", "/mailbox?lane="+lane+"&limit=20&wait_seconds="+strconv.Itoa(waitSeconds), nil, &response); e != nil {
 		return e
 	}
 	for _, d := range response.Messages {
@@ -256,8 +293,20 @@ func (r *Runner) run(ctx context.Context, d swarm.Delivery, input string) (strin
 	r.mu.Lock()
 	r.active = d
 	r.cancel = cancel
+	r.activityPhase = ""
 	r.mu.Unlock()
-	defer func() { cancel(); r.mu.Lock(); r.active = swarm.Delivery{}; r.cancel = nil; r.mu.Unlock() }()
+	defer func() {
+		cancel()
+		r.mu.Lock()
+		r.active = swarm.Delivery{}
+		r.cancel = nil
+		r.activityPhase = ""
+		r.mu.Unlock()
+		select {
+		case r.activityCh <- struct{}{}:
+		default:
+		}
+	}()
 	// A control may already be durable before the active process is registered.
 	control, e := r.journal.cancelFor(d)
 	if e != nil {
@@ -269,7 +318,13 @@ func (r *Runner) run(ctx context.Context, d swarm.Delivery, input string) (strin
 	if e = r.journal.launch(d.MailboxSeq); e != nil {
 		return "", false, e
 	}
-	output, cancelled, e := r.model.Run(runctx, r.cfg.session(d), input)
+	var output string
+	var cancelled bool
+	if m, ok := r.model.(ActivityModel); ok {
+		output, cancelled, e = m.RunWithActivity(runctx, r.cfg.session(d), input, r.reportActivity)
+	} else {
+		output, cancelled, e = r.model.Run(runctx, r.cfg.session(d), input)
+	}
 	return output, cancelled, e
 }
 func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
@@ -400,9 +455,12 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 	if e := r.flush(ctx); e != nil {
 		return e
 	}
-	if rejected, e := r.rejected(d.MailboxSeq); e != nil {
+	if rejected, code, e := r.startRejected(d.MailboxSeq); e != nil {
 		return e
 	} else if rejected {
+		if code == "urgent_input_pending" {
+			return r.journal.state(d.MailboxSeq, "received", code)
+		}
 		return r.journal.state(d.MailboxSeq, "interrupted", "owner_start_rejected")
 	}
 	var state swarm.OwnerTurn
@@ -457,7 +515,8 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 	if cancelled {
 		finish.Outcome = "cancelled"
 		finish.Error = modelError("cancelled")
-		finish.Reply = "Work stopped; delegated jobs retain their recorded state."
+		// An urgent human message also cancels this turn while the feature keeps
+		// running. The next owner turn will respond with the new context.
 	} else if runErr != nil {
 		finish.Outcome = "failed"
 		finish.Error = modelError("model_execution_failed")
@@ -487,6 +546,11 @@ func (r *Runner) rejected(seq int64) (bool, error) {
 	var n int
 	e := r.journal.db.QueryRow(`SELECT count(*) FROM outbox WHERE seq=? AND status='rejected'`, seq).Scan(&n)
 	return n > 0, e
+}
+func (r *Runner) startRejected(seq int64) (bool, string, error) {
+	var status, code string
+	e := r.journal.db.QueryRow(`SELECT status,code FROM outbox WHERE seq=? AND kind='start' ORDER BY id DESC LIMIT 1`, seq).Scan(&status, &code)
+	return status == "rejected", code, e
 }
 func (r *Runner) flush(ctx context.Context) error {
 	for {

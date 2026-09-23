@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -180,6 +181,15 @@ func TestPiHelperProcess(t *testing.T) {
 		history += r.Message
 		_ = os.WriteFile(file, []byte(history), 0600)
 		emit(map[string]any{"type": "response", "command": "prompt", "success": true})
+		if r.Message == "activity" {
+			emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "private reasoning must not leave Pi"}})
+			emit(map[string]any{"type": "tool_execution_start", "toolName": "read"})
+			emit(map[string]any{"type": "tool_execution_end", "toolName": "read"})
+			emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "public draft"}})
+			emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "stop", "content": []map[string]any{{"type": "text", "text": "final"}}}})
+			emit(map[string]any{"type": "agent_settled"})
+			continue
+		}
 		if r.Message == "two-messages" || r.Message == "no-final" {
 			emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "UNTRUSTED DRAFT"}})
 			if r.Message == "two-messages" {
@@ -215,6 +225,25 @@ func TestPiHelperProcess(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func TestActivityEventsDoNotLeakThinkingText(t *testing.T) {
+	a := helperAdapter(t)
+	events, err := prompt(t, a, "activity", "activity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kinds []harness.EventKind
+	for _, event := range events {
+		kinds = append(kinds, event.Kind)
+		if strings.Contains(event.Text, "private reasoning") {
+			t.Fatalf("thinking content escaped Pi: %+v", event)
+		}
+	}
+	want := []harness.EventKind{harness.EventSessionStarted, harness.EventAssistantThinking, harness.EventToolStarted, harness.EventToolFinished, harness.EventAssistantMessageChunk, harness.EventAssistantMessageFinal, harness.EventSessionDone}
+	if !reflect.DeepEqual(kinds, want) {
+		t.Fatalf("events=%v, want %v", kinds, want)
+	}
 }
 
 func TestFinalMessageIsNotDraftDeltaConcatenation(t *testing.T) {

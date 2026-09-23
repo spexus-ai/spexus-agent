@@ -70,6 +70,15 @@ func (s *Store) RecordHumanAnswer(ctx context.Context, in HumanAnswerInput) (str
 	var out string
 	duplicate := false
 	err := s.transaction(ctx, func(tx *sql.Tx) error {
+		var err error
+		out, duplicate, err = s.recordHumanAnswerTx(ctx, tx, in)
+		return err
+	})
+	return out, duplicate, err
+}
+
+func (s *Store) recordHumanAnswerTx(ctx context.Context, tx *sql.Tx, in HumanAnswerInput) (out string, duplicate bool, err error) {
+	err = func() error {
 		input, _ := canonical(mustJSON(in))
 		var old, receipt []byte
 		err := tx.QueryRowContext(ctx, "SELECT payload,receipt FROM source_ingress WHERE workspace_id=? AND channel_id=? AND message_ts=?", in.WorkspaceID, in.ChannelID, in.MessageTS).Scan(&old, &receipt)
@@ -121,6 +130,13 @@ func (s *Store) RecordHumanAnswer(ctx context.Context, in HumanAnswerInput) (str
 		}
 		if !allowed {
 			return wireError(403, "untrusted_answer")
+		}
+		var alreadyDeciding int
+		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM backend_sync_operations WHERE request_id=? AND kind='decision'", in.RequestID).Scan(&alreadyDeciding); err != nil {
+			return err
+		}
+		if alreadyDeciding != 0 {
+			return wireError(409, "decision_already_recorded")
 		}
 		if in.Kind == "answer" {
 			if len(v.Options) > 0 {
@@ -179,7 +195,7 @@ func (s *Store) RecordHumanAnswer(ctx context.Context, in HumanAnswerInput) (str
 		}
 		_, err = tx.ExecContext(ctx, "INSERT INTO source_ingress(workspace_id,channel_id,message_ts,feature_id,payload,receipt) VALUES(?,?,?,?,?,?)", in.WorkspaceID, in.ChannelID, in.MessageTS, d.FeatureID, input, mustJSON(out))
 		return err
-	})
+	}()
 	return out, duplicate, err
 }
 

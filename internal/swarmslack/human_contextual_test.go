@@ -2,150 +2,136 @@ package swarmslack
 
 import (
 	"context"
-	"encoding/json"
-	"strings"
 	"testing"
 
+	"github.com/spexus-ai/spexus-agent/internal/slack"
 	"github.com/spexus-ai/spexus-agent/internal/swarm"
 )
 
-type contextualRouteStore struct {
+type conversationRouteStore struct {
 	*swarm.Store
-	boundRequest  string
-	bindError     error
-	boundKind     string
-	boundText     string
-	boundSelector int
-	terminal      string
-	optionLabel   string
-	answers       []swarm.HumanAnswerInput
-	inputs        []swarm.InputPayload
-	notices       []string
-	settled       int
+	active     *swarm.HumanRequestContext
+	inputs     []swarm.InputPayload
+	urgent     []swarm.InputPayload
+	interrupts int
+	settled    int
+	order      []string
+	stopped    bool
+	committed  swarm.SlackSource
 }
 
-func (s *contextualRouteStore) BindContextualHumanAnswer(_ context.Context, _ swarm.SlackSource, kind string, selector int, text string) (string, error) {
-	s.boundKind, s.boundSelector, s.boundText = kind, selector, text
-	return s.boundRequest, s.bindError
+func (s *conversationRouteStore) CommitSlackSource(_ context.Context, in swarm.SlackSource) (bool, error) {
+	s.order = append(s.order, "commit")
+	s.committed = in
+	return false, nil
 }
-func (s *contextualRouteStore) History(_ context.Context, _ string) (swarm.History, error) {
-	if s.terminal != "" {
-		projection := swarm.HumanProjection{RequestID: s.boundRequest, BackendState: s.terminal}
-		view := swarm.History{HumanRequests: []swarm.HumanProjection{projection}}
-		if s.optionLabel != "" {
-			projection.View = json.RawMessage(`{"terminal":{"kind":"answer","response":{"option_id":"no"}}}`)
-			view.HumanRequests[0] = projection
-			view.Dependencies = []swarm.Dependency{{RequestID: s.boundRequest, Blocker: swarm.Blocker{Options: []swarm.HumanOption{{ID: "no", Label: s.optionLabel}}}}}
-		}
-		return view, nil
-	}
-	return swarm.History{}, nil
+func (s *conversationRouteStore) CommittedSlackSource(context.Context, string, string, string) (swarm.SlackSource, error) {
+	return s.committed, nil
+}
+func (s *conversationRouteStore) History(context.Context, string) (swarm.History, error) {
+	return swarm.History{Feature: swarm.Feature{Stopped: s.stopped}}, nil
 }
 
-func TestClosedSelectorShowsCanonicalChoiceNotRequestedDeny(t *testing.T) {
-	s := &contextualRouteStore{boundRequest: swarm.NewID(), terminal: "answered", optionLabel: "Нет"}
-	h := &humanIngress{store: s}
-	in := swarm.SlackSource{WorkspaceID: "W", ChannelID: "C", ThreadTS: "1.000001", MessageTS: "2.000001", FeatureID: swarm.NewID(), ActorID: "U", Text: "ответ 3: отказ потому что не хочу"}
-	if err := h.processOne(context.Background(), in, false); err != nil {
-		t.Fatal(err)
-	}
-	if len(s.answers) != 0 || len(s.notices) != 1 || s.settled != 1 || s.boundKind != "deny" || s.boundSelector != 3 || !strings.Contains(s.notices[0], "Вопрос #3 уже закрыт") || !strings.Contains(s.notices[0], "Выбран вариант: Нет") || strings.Contains(s.notices[0], "Отказ с причиной") {
-		t.Fatalf("closed request falsely accepted natural deny: %+v", s)
-	}
+func (s *conversationRouteStore) ActiveHumanRequest(context.Context, string) (*swarm.HumanRequestContext, error) {
+	return s.active, nil
 }
-func (s *contextualRouteStore) RecordHumanAnswer(_ context.Context, a swarm.HumanAnswerInput) (string, bool, error) {
-	s.answers = append(s.answers, a)
-	return swarm.NewID(), false, nil
-}
-func (s *contextualRouteStore) Ingest(_ context.Context, _ string, in swarm.InputPayload) (swarm.Receipt, bool, error) {
-	s.inputs = append(s.inputs, in)
+func (s *conversationRouteStore) Ingest(_ context.Context, _ string, input swarm.InputPayload) (swarm.Receipt, bool, error) {
+	s.inputs = append(s.inputs, input)
 	return swarm.Receipt{}, false, nil
 }
-func (s *contextualRouteStore) QueueSlackNotice(_ context.Context, _, _, text string) error {
-	s.notices = append(s.notices, text)
+func (s *conversationRouteStore) IngestUrgent(_ context.Context, _ string, input swarm.InputPayload) (swarm.Receipt, bool, error) {
+	s.urgent = append(s.urgent, input)
+	s.order = append(s.order, "ingest")
+	return swarm.Receipt{}, false, nil
+}
+func (s *conversationRouteStore) InterruptOwnerTurn(context.Context, string, string, string) error {
+	s.interrupts++
+	s.order = append(s.order, "interrupt")
 	return nil
 }
-func (s *contextualRouteStore) SettleSlackSource(_ context.Context, _ swarm.SlackSource) error {
+func (s *conversationRouteStore) SettleSlackSource(context.Context, swarm.SlackSource) error {
 	s.settled++
 	return nil
 }
 
-func TestContextualReplyRoutesOnlyExplicitPrefix(t *testing.T) {
-	requestID := swarm.NewID()
-	for _, tc := range []struct {
-		text     string
-		kind     string
-		selector int
-		body     string
-		decision bool
-	}{
-		{"Ответ: объясните подробно\nс примерами", "answer", 0, "объясните подробно\nс примерами", true},
-		{"Отказ: нет полномочий", "deny", 0, "нет полномочий", true},
-		{"Ответ #2: решение для второго", "answer", 2, "решение для второго", true},
-		{"Отказ #3: нет данных", "deny", 3, "нет данных", true},
-		{"ответ 2: я тебе ответил и я не знаю что такое P3.", "answer", 2, "я тебе ответил и я не знаю что такое P3.", true},
-		{"ответ 3: отказ потому что не хочу", "deny", 3, "потому что не хочу", true},
-		{"ответ 3: отказ, потому что не хочу", "deny", 3, "потому что не хочу", true},
-		{"ответ 3: отказ: не хочу", "deny", 3, "не хочу", true},
-		{"Ответ 2: отказ от старого варианта, выбираю новый", "answer", 2, "отказ от старого варианта, выбираю новый", true},
-		{"ответ #2 я тебе ответил что такое P3", "answer", 2, "я тебе ответил что такое P3", true},
-		{"ОТВЕТ\u00a0#2 : ОтКаЗ  потому что не хочу", "deny", 2, "потому что не хочу", true},
-		{"Рассмотрите следующий шаг", "", 0, "", false},
+func TestEveryHumanReplyReachesOwnerWithoutAnswerParser(t *testing.T) {
+	request := &swarm.HumanRequestContext{RequestID: swarm.NewID(), Question: "What should happen?", Kind: "clarification"}
+	for _, body := range []string{
+		"я не знаю, что такое P3",
+		"ответ 2: я тебе ответил и я не знаю что такое P3.",
+		"ответ #2 я тебе ответил что такое P3",
+		"Отказ #0: не хочу",
+		"Ответ #abc: да",
+		"поясните вопрос",
 	} {
-		s := &contextualRouteStore{boundRequest: requestID}
-		h := &humanIngress{store: s}
-		in := swarm.SlackSource{WorkspaceID: "W", ChannelID: "C", ThreadTS: "1.000001", MessageTS: "2.000001", FeatureID: swarm.NewID(), ActorID: "U", Text: tc.text}
-		if err := h.processOne(context.Background(), in, false); err != nil {
-			t.Fatal(err)
+		store := &conversationRouteStore{active: request}
+		h := &humanIngress{store: store}
+		source := swarm.SlackSource{WorkspaceID: "W", ChannelID: "C", ThreadTS: "1.000001", MessageTS: "2.000001", FeatureID: swarm.NewID(), ActorID: "U", Text: body, ActiveHumanRequest: request}
+		if err := h.processOne(context.Background(), source, false); err != nil {
+			t.Fatalf("%q: %v", body, err)
 		}
-		if s.settled != 1 {
-			t.Fatalf("%q settled=%d", tc.text, s.settled)
-		}
-		if tc.decision {
-			if len(s.inputs) != 0 || len(s.answers) != 1 || len(s.notices) != 0 || s.answers[0].RequestID != requestID || s.answers[0].Kind != tc.kind || s.answers[0].Text != tc.body || s.answers[0].ActorID != "U" || s.answers[0].MessageTS != in.MessageTS || s.boundKind != tc.kind || s.boundSelector != tc.selector || s.boundText != tc.body {
-				t.Fatalf("%q misrouted: %+v", tc.text, s)
-			}
-		} else if len(s.answers) != 0 || len(s.inputs) != 1 || s.inputs[0].Text != tc.text {
-			t.Fatalf("ordinary owner input intercepted: %+v", s)
+		if len(store.inputs) != 1 || store.inputs[0].Text != body || store.inputs[0].ActiveHumanRequest == nil || store.inputs[0].ActiveHumanRequest.RequestID != request.RequestID || store.inputs[0].Source.MessageTS != source.MessageTS || store.settled != 1 || store.interrupts != 0 {
+			t.Fatalf("%q not delivered as ordinary owner input: %+v", body, store)
 		}
 	}
 }
 
-func TestContextualReplayReadsCanonicalTerminalBeforeAnotherDecision(t *testing.T) {
-	s := &contextualRouteStore{boundRequest: swarm.NewID(), terminal: "denied"}
-	h := &humanIngress{store: s}
-	in := swarm.SlackSource{WorkspaceID: "W", ChannelID: "C", ThreadTS: "1.000001", MessageTS: "2.000001", FeatureID: swarm.NewID(), ActorID: "U", Text: "Отказ #2: нет полномочий"}
-	if err := h.processOne(context.Background(), in, false); err != nil {
+func TestButtonIsStructuredOwnerInputNotDirectDecision(t *testing.T) {
+	requestID := swarm.NewID()
+	store := &conversationRouteStore{active: &swarm.HumanRequestContext{RequestID: requestID}}
+	h := &humanIngress{store: store}
+	source := swarm.SlackSource{WorkspaceID: "W", ChannelID: "C", ThreadTS: "1.000001", MessageTS: "2.000001", FeatureID: swarm.NewID(), ActorID: "U", SourceKind: "block_action", RequestID: requestID, OptionID: "no", ActiveHumanRequest: store.active}
+	if err := h.processOne(context.Background(), source, false); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.answers) != 0 || len(s.notices) != 1 || s.settled != 1 || !strings.Contains(s.notices[0], "Вопрос #2 уже закрыт") || s.boundSelector != 2 {
-		t.Fatalf("terminal replay did not stay idempotent: %+v", s)
+	if len(store.inputs) != 1 || store.inputs[0].HumanAction == nil || store.inputs[0].HumanAction.RequestID != requestID || store.inputs[0].HumanAction.OptionID != "no" || store.inputs[0].Source.MessageTS != source.MessageTS || store.settled != 1 {
+		t.Fatalf("button was not delivered to owner: %+v", store)
 	}
 }
 
-func TestMalformedSelectorNeverBecomesOwnerInput(t *testing.T) {
-	for _, text := range []string{"Ответ #abc: да", "Отказ #0: причина", "Ответ #2 #3: текст", "Ответ без двоеточия", "Ответ #2", "Ответ 3: отказ", "Ответ 3: отказ потому что"} {
-		s := &contextualRouteStore{}
-		h := &humanIngress{store: s}
-		in := swarm.SlackSource{WorkspaceID: "W", ChannelID: "C", ThreadTS: "1.000001", MessageTS: "2.000001", FeatureID: swarm.NewID(), ActorID: "U", Text: text}
-		if err := h.processOne(context.Background(), in, false); err != nil {
-			t.Fatal(err)
+func TestBangMessageInterruptsAndReachesOwnerUnchanged(t *testing.T) {
+	for _, body := range []string{"!", "!status", "! ответьте срочно"} {
+		store := &conversationRouteStore{}
+		h := &humanIngress{store: store}
+		source := swarm.SlackSource{WorkspaceID: "W", ChannelID: "C", ThreadTS: "1.000001", MessageTS: "2.000001", FeatureID: swarm.NewID(), ActorID: "U", Text: body}
+		if err := h.processOne(context.Background(), source, false); err != nil {
+			t.Fatalf("%q: %v", body, err)
 		}
-		if len(s.inputs) != 0 || len(s.answers) != 0 || s.settled != 1 {
-			t.Fatalf("malformed selector escaped decision parser: %+v", s)
+		if len(store.urgent) != 1 || store.urgent[0].Text != body || store.interrupts != 1 || store.settled != 1 {
+			t.Fatalf("%q not urgent owner input: %+v", body, store)
 		}
 	}
 }
 
-func TestAmbiguousContextualReplyFailsClosedWithoutOwnerInput(t *testing.T) {
-	s := &contextualRouteStore{bindError: &swarm.APIError{Status: 409, Code: "ambiguous_human_request", Message: "ambiguous_human_request"}}
-	h := &humanIngress{store: s}
-	in := swarm.SlackSource{WorkspaceID: "W", ChannelID: "C", ThreadTS: "1.000001", MessageTS: "2.000001", FeatureID: swarm.NewID(), ActorID: "U", Text: "Отказ: нет полномочий"}
-	if err := h.processOne(context.Background(), in, false); err != nil {
+func TestRunningContinueQueuesFullTextBeforeInterruptAndSocketAck(t *testing.T) {
+	store := &conversationRouteStore{}
+	h := &humanIngress{store: store, workspace: "W"}
+	feature := swarm.Feature{FeatureID: swarm.NewID(), ChannelID: "C", ThreadTS: "1.000001", AllowedActorIDs: []string{"U"}}
+	event := slack.Event{WorkspaceID: "W", ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "2.000001", UserID: "U", Text: "!continue"}
+	if _, err := h.commit(context.Background(), feature, event); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.inputs) != 0 || len(s.answers) != 0 || s.settled != 1 || len(s.notices) != 1 || !strings.Contains(s.notices[0], "несколько вопросов") {
-		t.Fatalf("ambiguous reply did not fail closed: %+v", s)
+	if len(store.order) != 3 || store.order[0] != "commit" || store.order[1] != "ingest" || store.order[2] != "interrupt" || len(store.urgent) != 1 || store.urgent[0].Text != "!continue" {
+		t.Fatalf("running !continue did not interrupt before ACK: %+v", store)
+	}
+}
+
+func TestLeadingSpaceBeforeBangDoesNotStopOrInterrupt(t *testing.T) {
+	store := &conversationRouteStore{}
+	h := &humanIngress{store: store, workspace: "W"}
+	feature := swarm.Feature{FeatureID: swarm.NewID(), ChannelID: "C", ThreadTS: "1.000001", AllowedActorIDs: []string{"U"}}
+	event := slack.Event{WorkspaceID: "W", ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "2.000001", UserID: "U", Text: " !stop"}
+	if _, err := h.commit(context.Background(), feature, event); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.order) != 1 || store.order[0] != "commit" || store.interrupts != 0 {
+		t.Fatalf("leading space falsely triggered immediate command: %+v", store)
+	}
+	if err := h.processOne(context.Background(), store.committed, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.inputs) != 1 || store.inputs[0].Text != " !stop" || len(store.urgent) != 0 {
+		t.Fatalf("leading space was not ordinary owner input: %+v", store)
 	}
 }
 
@@ -197,14 +183,28 @@ func TestHumanThreadStatusFollowsOwnerAfterDecisionAndClearsWhileWaiting(t *test
 	if got := desiredThreadStatus(view, false); got != "" {
 		t.Fatalf("waiting human showed typing status %q", got)
 	}
-	view.Turns = []swarm.OwnerTurn{{State: "running"}}
+	view.Turns = []swarm.OwnerTurn{{TurnID: "current", State: "running"}}
 	if got := desiredThreadStatus(view, false); got != "готовит ответ…" {
 		t.Fatalf("running owner status=%q", got)
 	}
-	if got := desiredThreadStatus(view, true); got != "проверяет ответ…" {
-		t.Fatalf("decision priority status=%q", got)
+	view.Agents[0].OwnerTurnID = "current"
+	for _, phase := range []struct{ name, want string }{{"thinking", "оркестратор думает…"}, {"tool", "оркестратор использует инструмент…"}, {"responding", "оркестратор пишет ответ…"}} {
+		view.Agents[0].ActivityPhase = phase.name
+		if got := desiredThreadStatus(view, false); got != phase.want {
+			t.Fatalf("phase %q status=%q", phase.name, got)
+		}
+	}
+	view.Agents[0].OwnerTurnID = "stale"
+	if got := desiredThreadStatus(view, false); got != "готовит ответ…" {
+		t.Fatalf("stale phase status=%q", got)
+	}
+	if got := desiredThreadStatus(view, true); got != "готовит ответ…" {
+		t.Fatalf("active owner status behind decision sync=%q", got)
 	}
 	view.Turns[0].State = "succeeded"
+	if got := desiredThreadStatus(view, true); got != "проверяет ответ…" {
+		t.Fatalf("idle decision status=%q", got)
+	}
 	if got := desiredThreadStatus(view, false); got != "" {
 		t.Fatalf("finished owner status=%q", got)
 	}
@@ -225,6 +225,22 @@ func TestHumanThreadStatusFollowsOwnerAfterDecisionAndClearsWhileWaiting(t *test
 	}
 	if got := desiredThreadStatus(view, false); got != "" {
 		t.Fatalf("disconnected owner falsely typing %q", got)
+	}
+}
+
+func TestWorkerPiActivityAppearsInFeatureThread(t *testing.T) {
+	view := swarm.History{Feature: swarm.Feature{OwnerAgentID: "owner"}, Agents: []swarm.AgentStatus{{AgentID: "owner", Status: "online"}, {AgentID: "worker-a", Status: "online", ActiveAttemptID: "attempt-a", ActivityPhase: "tool"}}, Jobs: []swarm.JobView{{CurrentAttemptID: "attempt-a", Attempts: []swarm.Attempt{{AttemptID: "attempt-a", AssignedAgentID: "worker-a", State: "running"}}}}}
+	if got := desiredThreadStatus(view, false); got != "исполнитель использует инструмент…" {
+		t.Fatalf("worker tool status=%q", got)
+	}
+	view.Agents[1].ActiveAttemptID = "stale"
+	if got := desiredThreadStatus(view, false); got != "" {
+		t.Fatalf("stale worker activity status=%q", got)
+	}
+	view.Agents[1].ActiveAttemptID = "attempt-a"
+	view.Agents[1].Status = "unreachable"
+	if got := desiredThreadStatus(view, false); got != "" {
+		t.Fatalf("unreachable worker activity status=%q", got)
 	}
 }
 

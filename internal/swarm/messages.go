@@ -106,11 +106,11 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 	} else if err = tx.QueryRowContext(ctx, "SELECT role FROM agents WHERE agent_id=?", e.ToAgentID).Scan(&targetRole); err != nil {
 		return r, false, wireError(404, "recipient_unknown")
 	}
-	ownerAction := e.Type == "task.dispatch" || e.Type == "task.review" || e.Type == "task.cancel" || e.Type == "human.request" || e.Type == "dependency.resolve" || e.Type == "task.resume" || e.Type == "step.complete"
+	ownerAction := e.Type == "task.dispatch" || e.Type == "task.review" || e.Type == "task.cancel" || e.Type == "human.request" || e.Type == "human.respond" || e.Type == "dependency.resolve" || e.Type == "task.resume" || e.Type == "step.complete"
 	if !internal {
 		if ownerAction {
 			expected := "worker"
-			if e.Type == "human.request" || e.Type == "dependency.resolve" || e.Type == "step.complete" {
+			if e.Type == "human.request" || e.Type == "human.respond" || e.Type == "dependency.resolve" || e.Type == "step.complete" {
 				expected = "coordinator"
 			}
 			if e.FromAgentID != f.OwnerAgentID || targetRole != expected {
@@ -135,7 +135,7 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 		return r, found, err
 	}
 	var a attemptRecord
-	if e.Type != "task.dispatch" && e.Type != "task.resume" && e.Type != "human.request" && e.Type != "dependency.resolve" && e.Type != "step.complete" && e.Type != "agent.input" && e.Type != "turn.cancel" && e.Type != "human.decision" {
+	if e.Type != "task.dispatch" && e.Type != "task.resume" && e.Type != "human.request" && e.Type != "human.respond" && e.Type != "dependency.resolve" && e.Type != "step.complete" && e.Type != "agent.input" && e.Type != "turn.cancel" && e.Type != "human.decision" {
 		a, err = attempt(ctx, tx, e.AttemptID)
 		if err != nil {
 			return r, false, err
@@ -187,6 +187,12 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 		var p HumanRequestPayload
 		_ = json.Unmarshal(e.Payload, &p)
 		if err = s.humanRequest(ctx, tx, e, p); err != nil {
+			return r, false, err
+		}
+	case "human.respond":
+		var p HumanRespondPayload
+		_ = json.Unmarshal(e.Payload, &p)
+		if err = s.decideHumanTx(ctx, tx, e, p); err != nil {
 			return r, false, err
 		}
 	case "dependency.resolve":

@@ -11,33 +11,6 @@ import (
 	"time"
 )
 
-// Test: answer syntax keeps a full request ID and never infers a decision
-// from an ordinary message or an empty deny.
-// Validates: AC-464 (REQ-391 - explicit human decision with source).
-func TestParseHumanAnswer(t *testing.T) {
-	id := "123e4567-e89b-42d3-a456-426614174000"
-	for _, tc := range []struct {
-		text, kind, option, body string
-		valid                    bool
-	}{
-		{"!answer " + id + " a because it is smaller", "answer", "a", "because it is smaller", true},
-		{"!answer " + id + " text use the existing API", "answer", "", "use the existing API", true},
-		{"!answer " + id + " deny unsafe change", "deny", "", "unsafe change", true},
-		{"!answer " + id[:8] + " a", "", "", "", false},
-		{"!answer " + id + " deny", "", "", "", false},
-		{"approved", "", "", "", false},
-	} {
-		got, err := parseAnswer(tc.text)
-		if (err == nil) != tc.valid {
-			t.Errorf("%q: err=%v", tc.text, err)
-			continue
-		}
-		if tc.valid && (got.RequestID != id || got.Kind != tc.kind || got.OptionID != tc.option || got.Text != tc.body) {
-			t.Errorf("%q: %+v", tc.text, got)
-		}
-	}
-}
-
 // Test: paged replies retain their author and timestamp while rejecting an
 // incomplete cursor chain and respecting Slack's Retry-After signal.
 // Validates: AC-432 (REQ-350 - complete history before recovery opens).

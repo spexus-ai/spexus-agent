@@ -296,7 +296,7 @@ func validateEnvelope(e Envelope) error {
 	if !task && (e.JobID != "" || e.AttemptID != "") {
 		return wireError(400, "invalid_envelope")
 	}
-	action := e.Type == "task.dispatch" || e.Type == "task.review" || e.Type == "task.cancel" || e.Type == "human.request" || e.Type == "dependency.resolve" || e.Type == "task.resume" || e.Type == "step.complete"
+	action := e.Type == "task.dispatch" || e.Type == "task.review" || e.Type == "task.cancel" || e.Type == "human.request" || e.Type == "human.respond" || e.Type == "dependency.resolve" || e.Type == "task.resume" || e.Type == "step.complete"
 	if action && e.FromAgentID != "coordinator" || e.Type == "turn.cancel" {
 		if !uuid(e.OwnerTurnID) {
 			return wireError(400, "invalid_owner_turn")
@@ -375,6 +375,17 @@ func validateEnvelope(e Envelope) error {
 		if !uuid(p.RequestID) || !uuid(p.DependencyID) || !uuid(p.DecisionID) || p.Revision != 2 {
 			return wireError(400, "invalid_human_decision")
 		}
+	case "human.respond":
+		if e.ProtocolVersion != 2 {
+			return wireError(400, "unsupported_version")
+		}
+		var p HumanRespondPayload
+		if err := decode(e.Payload, &p); err != nil {
+			return err
+		}
+		if !uuid(p.RequestID) || !validSlackTS(p.SourceMessageTS) || (p.Kind != "answer" && p.Kind != "deny") || len(p.OptionID) > 64 || len(p.Text) > 16*1024 || (p.Kind == "deny" && (p.OptionID != "" || !safeText(p.Text, 16*1024))) {
+			return wireError(400, "invalid_human_response")
+		}
 	case "agent.input":
 		var p InputPayload
 		if err := decode(e.Payload, &p); err != nil {
@@ -384,6 +395,9 @@ func validateEnvelope(e Envelope) error {
 			return err
 		}
 		if !safeText(p.Text, 64*1024) || p.Source.Kind != "slack" && p.Source.Kind != "test" || !safeText(p.Source.EventID, 256) || p.Source.ActorID == "" {
+			return wireError(400, "invalid_input")
+		}
+		if p.Source.MessageTS != "" && !validSlackTS(p.Source.MessageTS) || p.HumanAction != nil && (!uuid(p.HumanAction.RequestID) || p.HumanAction.OptionID == "") || p.ActiveHumanRequest != nil && !uuid(p.ActiveHumanRequest.RequestID) {
 			return wireError(400, "invalid_input")
 		}
 	case "task.dispatch":

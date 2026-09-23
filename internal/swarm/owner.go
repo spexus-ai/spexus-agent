@@ -283,17 +283,57 @@ func (s *Store) finishOwner(ctx context.Context, p Principal, id string, r Owner
 func (s *Store) ClaimSlack(ctx context.Context) (*SlackDelivery, error) {
 	var out *SlackDelivery
 	err := s.transaction(ctx, func(tx *sql.Tx) error {
-		var b []byte
-		err := tx.QueryRowContext(ctx, "SELECT data FROM slack_outbox WHERE status='queued' ORDER BY rowid LIMIT 1").Scan(&b)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
+		rows, err := tx.QueryContext(ctx, "SELECT data FROM slack_outbox WHERE status='queued' ORDER BY rowid")
+		if err != nil {
+			return err
 		}
+		var queued []SlackDelivery
+		for rows.Next() {
+			var b []byte
+			if err = rows.Scan(&b); err != nil {
+				break
+			}
+			var d SlackDelivery
+			if err = json.Unmarshal(b, &d); err != nil {
+				break
+			}
+			queued = append(queued, d)
+		}
+		if err == nil {
+			err = rows.Err()
+		}
+		rows.Close()
 		if err != nil {
 			return err
 		}
 		var d SlackDelivery
-		if err = json.Unmarshal(b, &d); err != nil {
-			return err
+		found := false
+		for _, candidate := range queued {
+			if candidate.Question != nil {
+				var state string
+				if err = tx.QueryRowContext(ctx, "SELECT state FROM human_projections WHERE request_id=?", candidate.ID).Scan(&state); err != nil {
+					return err
+				}
+				if state != "open" {
+					candidate.Status = "failed"
+					if _, err = tx.ExecContext(ctx, "UPDATE slack_outbox SET status='failed',data=? WHERE id=? AND status='queued'", mustJSON(candidate), candidate.ID); err != nil {
+						return err
+					}
+					continue
+				}
+				var active int
+				if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM slack_outbox o JOIN human_projections p ON p.request_id=o.id WHERE o.feature_id=? AND o.id!=? AND o.status IN ('sent','sending','delivery_unknown') AND p.state='open'`, candidate.FeatureID, candidate.ID).Scan(&active); err != nil {
+					return err
+				}
+				if active != 0 {
+					continue
+				}
+			}
+			d, found = candidate, true
+			break
+		}
+		if !found {
+			return nil
 		}
 		d.Status = "sending"
 		if d.TurnID != "" {

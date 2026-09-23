@@ -247,7 +247,11 @@ func (s *promptStream) run(stdout io.ReadCloser, cleanup func()) {
 				runErr = fmt.Errorf("Pi %s: %s", r.Command, r.Error)
 			}
 		case "message_update":
-			if r.AssistantMessageEvent.Type == "text_delta" {
+			switch r.AssistantMessageEvent.Type {
+			case "thinking_delta":
+				// Thinking content is private. Report only that the model is active.
+				s.emit(harness.Event{Kind: harness.EventAssistantThinking})
+			case "text_delta":
 				s.emit(harness.Event{Kind: harness.EventAssistantMessageChunk, Text: r.AssistantMessageEvent.Delta})
 			}
 		case "message_end":

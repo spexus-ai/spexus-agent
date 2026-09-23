@@ -269,13 +269,13 @@ func history(ctx context.Context, db *sql.DB, id string, now time.Time) (History
 		return out, err
 	}
 	rows.Close()
-	rows, err = tx.QueryContext(ctx, "SELECT agent_id,instance_id,heartbeat FROM agents ORDER BY agent_id")
+	rows, err = tx.QueryContext(ctx, "SELECT agents.agent_id,agents.instance_id,agents.heartbeat,COALESCE(agent_activity.turn_id,''),COALESCE(agent_activity.attempt_id,''),COALESCE(agent_activity.phase,'') FROM agents LEFT JOIN agent_activity ON agent_activity.agent_id=agents.agent_id ORDER BY agents.agent_id")
 	if err != nil {
 		return out, err
 	}
 	for rows.Next() {
 		var a AgentStatus
-		if err = rows.Scan(&a.AgentID, &a.InstanceID, &a.LastHeartbeat); err != nil {
+		if err = rows.Scan(&a.AgentID, &a.InstanceID, &a.LastHeartbeat, &a.OwnerTurnID, &a.ActiveAttemptID, &a.ActivityPhase); err != nil {
 			rows.Close()
 			return out, err
 		}

@@ -15,19 +15,20 @@ import (
 // SlackSource is trusted transport metadata. EventID is an optional alias:
 // Socket Mode and conversations.replies identify the same source by message TS.
 type SlackSource struct {
-	WorkspaceID   string `json:"workspace_id"`
-	ChannelID     string `json:"channel_id"`
-	MessageTS     string `json:"message_ts"`
-	ThreadTS      string `json:"thread_ts"`
-	FeatureID     string `json:"feature_id"`
-	ActorID       string `json:"actor_id"`
-	Text          string `json:"text"`
-	EventID       string `json:"event_id,omitempty"`
-	SourceKind    string `json:"source_kind,omitempty"`
-	QuestionTS    string `json:"question_ts,omitempty"`
-	RequestID     string `json:"request_id,omitempty"`
-	OptionID      string `json:"option_id,omitempty"`
-	DuringCatchup bool   `json:"during_catchup,omitempty"`
+	WorkspaceID        string               `json:"workspace_id"`
+	ChannelID          string               `json:"channel_id"`
+	MessageTS          string               `json:"message_ts"`
+	ThreadTS           string               `json:"thread_ts"`
+	FeatureID          string               `json:"feature_id"`
+	ActorID            string               `json:"actor_id"`
+	Text               string               `json:"text"`
+	EventID            string               `json:"event_id,omitempty"`
+	SourceKind         string               `json:"source_kind,omitempty"`
+	QuestionTS         string               `json:"question_ts,omitempty"`
+	RequestID          string               `json:"request_id,omitempty"`
+	OptionID           string               `json:"option_id,omitempty"`
+	DuringCatchup      bool                 `json:"during_catchup,omitempty"`
+	ActiveHumanRequest *HumanRequestContext `json:"active_human_request,omitempty"`
 }
 
 func validSlackTS(ts string) bool {
@@ -88,6 +89,7 @@ func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, er
 		canonical := in
 		canonical.EventID = ""
 		canonical.DuringCatchup = false
+		canonical.ActiveHumanRequest = nil
 		payload := mustJSON(canonical)
 		var prior []byte
 		err = tx.QueryRowContext(ctx, "SELECT payload FROM slack_sources WHERE workspace_id=? AND channel_id=? AND message_ts=?", in.WorkspaceID, in.ChannelID, in.MessageTS).Scan(&prior)
@@ -97,6 +99,7 @@ func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, er
 				return wireError(409, "source_conflict")
 			}
 			stored.DuringCatchup = false
+			stored.ActiveHumanRequest = nil
 			if !bytes.Equal(mustJSON(stored), payload) {
 				return wireError(409, "source_conflict")
 			}
@@ -111,11 +114,35 @@ func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, er
 			return err
 		}
 		canonical.DuringCatchup = barrierCount != 0
+		var activeQuestion SlackDelivery
+		canonical.ActiveHumanRequest, activeQuestion, err = activeHumanRequestTx(ctx, tx, in.FeatureID)
+		if err != nil {
+			return err
+		}
+		if canonical.ActiveHumanRequest != nil && slackTSCompare(in.MessageTS, activeQuestion.SlackTS) <= 0 {
+			canonical.ActiveHumanRequest = nil
+		}
 		payload = mustJSON(canonical)
 		_, err = tx.ExecContext(ctx, "INSERT INTO slack_sources(workspace_id,channel_id,message_ts,feature_id,payload,status) VALUES(?,?,?,?,?,'pending')", in.WorkspaceID, in.ChannelID, in.MessageTS, in.FeatureID, payload)
 		return err
 	})
 	return duplicate, err
+}
+
+// CommittedSlackSource returns the source with the active-question snapshot
+// captured when it was first committed. Rebuilding that snapshot on redelivery
+// would make the same Slack message produce a different owner input.
+func (s *Store) CommittedSlackSource(ctx context.Context, workspace, channel, messageTS string) (SlackSource, error) {
+	var out SlackSource
+	if workspace == "" || channel == "" || !validSlackTS(messageTS) {
+		return out, wireError(400, "invalid_slack_source")
+	}
+	var raw []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT payload FROM slack_sources WHERE workspace_id=? AND channel_id=? AND message_ts=?`, workspace, channel, messageTS).Scan(&raw); err != nil {
+		return out, err
+	}
+	err := json.Unmarshal(raw, &out)
+	return out, err
 }
 
 func (s *Store) SlackSourceExists(ctx context.Context, workspace, channel, messageTS string) (bool, error) {
@@ -170,6 +197,63 @@ func (s *Store) PendingSlackSources(ctx context.Context, featureID string) ([]Sl
 	}
 	sort.Slice(out, func(i, j int) bool { return slackTSCompare(out[i].MessageTS, out[j].MessageTS) < 0 })
 	return out, nil
+}
+
+// DeferredStopSources returns committed !stop messages which have stopped the
+// feature but have not yet become owner input. They are delivered after an
+// explicit !continue, never while the feature remains stopped.
+func (s *Store) DeferredStopSources(ctx context.Context, featureID string) ([]SlackSource, error) {
+	if !uuid(featureID) {
+		return nil, wireError(400, "invalid_feature")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT ss.payload FROM slack_sources ss
+		WHERE ss.feature_id=? AND ss.status='done' AND json_extract(ss.payload,'$.text')='!stop'
+		AND NOT EXISTS (SELECT 1 FROM ingress i WHERE i.feature_id=ss.feature_id AND i.event_id='slack:'||ss.channel_id||':'||ss.message_ts)`, featureID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SlackSource
+	for rows.Next() {
+		var raw []byte
+		if err = rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var source SlackSource
+		if err = json.Unmarshal(raw, &source); err != nil {
+			return nil, err
+		}
+		out = append(out, source)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return slackTSCompare(out[i].MessageTS, out[j].MessageTS) < 0 })
+	return out, nil
+}
+
+// NewerStopSource reports whether a committed stop supersedes an older
+// continue. Socket stop application and continue validation are serialized by
+// the transport's stopMu, so a stale continue cannot reopen after a later stop.
+func (s *Store) NewerStopSource(ctx context.Context, featureID, messageTS string) (bool, error) {
+	if !uuid(featureID) || !validSlackTS(messageTS) {
+		return false, wireError(400, "invalid_slack_source")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT message_ts FROM slack_sources WHERE feature_id=? AND json_extract(payload,'$.text')='!stop'`, featureID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var stopTS string
+		if err = rows.Scan(&stopTS); err != nil {
+			return false, err
+		}
+		if slackTSCompare(stopTS, messageTS) > 0 {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) SettleSlackSource(ctx context.Context, in SlackSource) error {

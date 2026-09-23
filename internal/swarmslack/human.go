@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,14 +17,18 @@ import (
 type HumanStore interface {
 	Store
 	CommitSlackSource(context.Context, swarm.SlackSource) (bool, error)
+	CommittedSlackSource(context.Context, string, string, string) (swarm.SlackSource, error)
 	SlackSourceExists(context.Context, string, string, string) (bool, error)
 	PendingSlackSources(context.Context, string) ([]swarm.SlackSource, error)
+	DeferredStopSources(context.Context, string) ([]swarm.SlackSource, error)
+	NewerStopSource(context.Context, string, string) (bool, error)
 	SettleSlackSource(context.Context, swarm.SlackSource) error
 	SlackWatermark(context.Context, string) (string, error)
 	AdvanceSlackWatermark(context.Context, string, string) error
 	SetRecoveryBarrier(context.Context, string, string) error
-	RecordHumanAnswer(context.Context, swarm.HumanAnswerInput) (string, bool, error)
-	BindContextualHumanAnswer(context.Context, swarm.SlackSource, string, int, string) (string, error)
+	ActiveHumanRequest(context.Context, string) (*swarm.HumanRequestContext, error)
+	IngestUrgent(context.Context, string, swarm.InputPayload) (swarm.Receipt, bool, error)
+	InterruptOwnerTurn(context.Context, string, string, string) error
 	PublishedHumanQuestion(context.Context, string, string) (string, string, error)
 }
 
@@ -52,8 +54,6 @@ type threadStatusMark struct {
 	at     time.Time
 	failed bool
 }
-
-var requestIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // RunHuman is the wire-v2 transport. It does not use the legacy Events API,
 // whose ACK precedes consumer delivery.
@@ -238,25 +238,53 @@ func desiredThreadStatus(view swarm.History, decisionPending bool) string {
 	if view.Feature.Stopped || view.RecoveryBarrier != "" {
 		return ""
 	}
-	if decisionPending {
-		return "проверяет ответ…"
-	}
-	ownerOnline := false
+	var owner *swarm.AgentStatus
 	for _, agent := range view.Agents {
 		if agent.AgentID == view.Feature.OwnerAgentID && agent.Status == "online" {
-			ownerOnline = true
+			current := agent
+			owner = &current
 			break
 		}
 	}
-	if !ownerOnline {
-		return ""
-	}
-	for _, turn := range view.Turns {
-		if turn.State == "running" {
-			return "готовит ответ…"
+	if owner != nil {
+		for _, turn := range view.Turns {
+			if turn.State == "running" {
+				if owner.OwnerTurnID == turn.TurnID && turn.TurnID != "" {
+					return activityStatus(owner.ActivityPhase, "оркестратор")
+				}
+				return "готовит ответ…"
+			}
 		}
 	}
+	for _, job := range view.Jobs {
+		for _, attempt := range job.Attempts {
+			if attempt.State != "running" || attempt.AttemptID != job.CurrentAttemptID {
+				continue
+			}
+			for _, agent := range view.Agents {
+				if agent.AgentID == attempt.AssignedAgentID && agent.Status == "online" && agent.ActiveAttemptID == attempt.AttemptID {
+					return activityStatus(agent.ActivityPhase, "исполнитель")
+				}
+			}
+		}
+	}
+	if decisionPending {
+		return "проверяет ответ…"
+	}
 	return ""
+}
+
+func activityStatus(phase, actor string) string {
+	switch phase {
+	case "thinking":
+		return actor + " думает…"
+	case "tool":
+		return actor + " использует инструмент…"
+	case "responding":
+		return actor + " пишет ответ…"
+	default:
+		return actor + " работает…"
+	}
 }
 
 func humanQuestionState(view swarm.History, requestID string, projection swarm.HumanProjection) string {
@@ -456,7 +484,7 @@ func (h *humanIngress) commit(ctx context.Context, f swarm.Feature, event slack.
 	if !allowed(f, event.UserID) {
 		return false, nil
 	}
-	stop := strings.TrimSpace(event.Text) == "!stop"
+	stop := event.Text == "!stop"
 	if stop {
 		h.stopMu.Lock()
 		defer h.stopMu.Unlock()
@@ -477,6 +505,33 @@ func (h *humanIngress) commit(ctx context.Context, f swarm.Feature, event slack.
 			return duplicate, err
 		}
 		return duplicate, nil
+	}
+	urgent := strings.HasPrefix(in.Text, "!")
+	if urgent && in.Text == "!continue" {
+		view, err := h.store.History(ctx, in.FeatureID)
+		if err != nil {
+			return duplicate, err
+		}
+		urgent = !view.Feature.Stopped
+	}
+	if urgent {
+		in, err = h.store.CommittedSlackSource(ctx, in.WorkspaceID, in.ChannelID, in.MessageTS)
+		if err != nil {
+			return duplicate, err
+		}
+		input, err := h.ownerInput(ctx, in)
+		if err != nil {
+			return duplicate, err
+		}
+		if _, _, err = h.store.IngestUrgent(ctx, in.FeatureID, input); err != nil {
+			return duplicate, err
+		}
+		if err = h.store.InterruptOwnerTurn(ctx, in.FeatureID, in.ActorID, "urgent Slack message"); err != nil {
+			return duplicate, err
+		}
+		if in.Text == "!continue" {
+			return duplicate, h.store.SettleSlackSource(ctx, in)
+		}
 	}
 	// Normal commands are reduced from the local queue after the Socket ACK.
 	// No backend, model, history, or Slack publish call extends the ACK path.
@@ -531,9 +586,33 @@ func (h *humanIngress) processPending(ctx context.Context, f swarm.Feature, reco
 	if err != nil {
 		return err
 	}
+	view, err := h.store.History(ctx, f.FeatureID)
+	if err != nil {
+		return err
+	}
+	if view.Feature.Stopped {
+		// Keep ordinary human messages durable while stopped. A later explicit
+		// continue reopens the feature and then drains them; historical continue
+		// during catchup is acknowledged without replaying the old command.
+		for _, in := range pending {
+			if in.Text == "!continue" {
+				if err := h.processOne(ctx, in, recovering); err != nil {
+					return err
+				}
+			}
+		}
+		view, err = h.store.History(ctx, f.FeatureID)
+		if err != nil || view.Feature.Stopped {
+			return err
+		}
+		pending, err = h.store.PendingSlackSources(ctx, f.FeatureID)
+		if err != nil {
+			return err
+		}
+	}
 	sort.Slice(pending, func(i, j int) bool { return timestampAfter(pending[j].MessageTS, pending[i].MessageTS) })
 	for _, in := range pending {
-		if strings.TrimSpace(in.Text) == "!stop" {
+		if in.Text == "!stop" {
 			continue
 		}
 		if err := h.processOne(ctx, in, recovering); err != nil {
@@ -551,7 +630,7 @@ func (h *humanIngress) processStops(ctx context.Context, featureID string) error
 		return err
 	}
 	for _, in := range pending {
-		if strings.TrimSpace(in.Text) == "!stop" {
+		if in.Text == "!stop" {
 			if err := h.processStop(ctx, in); err != nil {
 				return err
 			}
@@ -561,240 +640,81 @@ func (h *humanIngress) processStops(ctx context.Context, featureID string) error
 }
 
 func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, recovering bool) error {
-	text := strings.TrimSpace(in.Text)
-	contextKind, contextSelector, contextText, contextual := parseContextualAnswer(text)
-	switch {
-	case in.SourceKind == "block_action":
-		answer := swarm.HumanAnswerInput{RequestID: in.RequestID, Kind: "answer", OptionID: in.OptionID, WorkspaceID: in.WorkspaceID, ChannelID: in.ChannelID, ThreadTS: in.ThreadTS, MessageTS: in.MessageTS, ActorID: in.ActorID}
-		if _, _, err := h.store.RecordHumanAnswer(ctx, answer); err != nil {
-			var api *swarm.APIError
-			if errors.As(err, &api) && api.Code == "request_not_waiting" {
-				return err
-			}
-			if !errors.As(err, &api) || api.Status >= 500 {
-				return err
-			}
-			return h.rejection(ctx, in, err)
-		}
-		// The original question is updated from the durable decision operation.
-		// A provisional thread reply would falsely imply backend acceptance.
-	case text == "!continue":
+	if in.Text == "!continue" {
 		if recovering || in.DuringCatchup {
 			if err := h.notice(ctx, in, "После сверки истории отправьте новую команду !continue, если хотите продолжить работу."); err != nil {
 				return err
 			}
-		} else {
-			if err := h.store.ContinueFeature(ctx, in.FeatureID, in.ActorID); err != nil {
-				return h.rejection(ctx, in, err)
-			}
-			if err := h.notice(ctx, in, "Работа открыта для новых команд. Отменённые зависимости не возобновляются."); err != nil {
-				return err
-			}
-		}
-	case text == "!status":
-		view, err := h.store.History(ctx, in.FeatureID)
-		if err != nil {
-			return err
-		}
-		if err := h.notice(ctx, in, humanStatus(view)); err != nil {
-			return err
-		}
-	case strings.HasPrefix(text, "!answer"):
-		answer, err := parseAnswer(text)
-		if err != nil {
-			return h.rejection(ctx, in, err)
-		}
-		answer.WorkspaceID, answer.ChannelID, answer.ThreadTS = in.WorkspaceID, in.ChannelID, in.ThreadTS
-		answer.MessageTS, answer.ActorID = in.MessageTS, in.ActorID
-		answer.EventID = "" // Socket and history share the same canonical source.
-		if _, _, err := h.store.RecordHumanAnswer(ctx, answer); err != nil {
-			var api *swarm.APIError
-			if errors.As(err, &api) && api.Code == "request_not_waiting" {
-				view, viewErr := h.store.History(ctx, in.FeatureID)
-				if viewErr != nil {
-					return viewErr
-				}
-				for _, d := range view.Dependencies {
-					if d.RequestID == answer.RequestID && d.State == "human_pending" {
-						return err // Create/readback is still pending; retain the source.
-					}
-				}
-			}
-			if !errors.As(err, &api) || api.Status >= 500 {
-				return err
-			}
-			return h.rejection(ctx, in, err)
-		}
-		// The original question shows pending until canonical backend readback.
-	case contextual:
-		if contextSelector < 0 || contextText == "" {
-			return h.contextualRejection(ctx, in, "Укажите номер и текст: «Ответ 2: текст» или «Отказ 2: причина». Если открыт один вопрос, номер можно опустить.")
-		}
-		requestID, err := h.store.BindContextualHumanAnswer(ctx, in, contextKind, contextSelector, contextText)
-		if err != nil {
-			var api *swarm.APIError
-			if !errors.As(err, &api) || api.Status >= 500 {
-				return err
-			}
-			return h.contextualRejection(ctx, in, contextualErrorText(api.Code))
-		}
-		view, err := h.store.History(ctx, in.FeatureID)
-		if err != nil {
-			return err
-		}
-		for _, projection := range view.HumanRequests {
-			if projection.RequestID != requestID || projection.BackendState == "open" {
-				continue
-			}
-			var options []swarm.HumanOption
-			for _, dependency := range view.Dependencies {
-				if dependency.RequestID == requestID {
-					options = dependency.Blocker.Options
-					break
-				}
-			}
-			summary := canonicalDecisionSummary(projection, options)
-			if summary == "" {
-				summary = "Состояние: " + projection.BackendState + "."
-			}
-			for _, question := range view.SlackOutbox {
-				if question.ID == requestID {
-					contextSelector = question.ShortSelector
-					break
-				}
-			}
-			if err := h.notice(ctx, in, fmt.Sprintf("Вопрос #%d уже закрыт в Spexus. %s", contextSelector, summary)); err != nil {
-				return err
-			}
 			return h.store.SettleSlackSource(ctx, in)
 		}
-		answer := swarm.HumanAnswerInput{RequestID: requestID, Kind: contextKind, Text: contextText, WorkspaceID: in.WorkspaceID, ChannelID: in.ChannelID, ThreadTS: in.ThreadTS, MessageTS: in.MessageTS, ActorID: in.ActorID}
-		if _, _, err := h.store.RecordHumanAnswer(ctx, answer); err != nil {
-			var api *swarm.APIError
-			if errors.As(err, &api) && api.Code == "request_not_waiting" {
-				return err
-			}
-			if !errors.As(err, &api) || api.Status >= 500 {
-				return err
-			}
-			return h.contextualRejection(ctx, in, contextualErrorText(api.Code))
-		}
-		// The original question shows pending until canonical backend readback.
-	default:
-		_, _, err := h.store.Ingest(ctx, in.FeatureID, swarm.InputPayload{Text: in.Text, Source: swarm.Source{Kind: "slack", EventID: "slack:" + in.ChannelID + ":" + in.MessageTS, ChannelID: in.ChannelID, ThreadTS: in.ThreadTS, ActorID: in.ActorID}})
+		h.stopMu.Lock()
+		newerStop, err := h.store.NewerStopSource(ctx, in.FeatureID, in.MessageTS)
 		if err != nil {
-			var api *swarm.APIError
-			if !errors.As(err, &api) || api.Status >= 500 {
+			h.stopMu.Unlock()
+			return err
+		}
+		if newerStop {
+			h.stopMu.Unlock()
+			return h.store.SettleSlackSource(ctx, in)
+		}
+		view, err := h.store.History(ctx, in.FeatureID)
+		if err != nil {
+			h.stopMu.Unlock()
+			return err
+		}
+		if view.Feature.Stopped {
+			if err := h.store.ContinueFeature(ctx, in.FeatureID, in.ActorID); err != nil {
+				h.stopMu.Unlock()
+				return h.rejection(ctx, in, err)
+			}
+		}
+		h.stopMu.Unlock()
+		stops, err := h.store.DeferredStopSources(ctx, in.FeatureID)
+		if err != nil {
+			return err
+		}
+		for _, stop := range stops {
+			if timestampAfter(stop.MessageTS, in.MessageTS) {
+				continue
+			}
+			stopInput, err := h.ownerInput(ctx, stop)
+			if err != nil {
 				return err
 			}
-			return h.rejection(ctx, in, err)
-		}
-	}
-	return h.store.SettleSlackSource(ctx, in)
-}
-
-// Only an explicit, short prefix can consume a normal Slack message as a
-// human decision; all other thread messages remain owner input.
-func parseContextualAnswer(text string) (kind string, selector int, body string, recognized bool) {
-	text = strings.TrimSpace(text)
-	prefix, rest, hasColon := strings.Cut(text, ":")
-	fields := strings.Fields(strings.ToLower(strings.TrimSpace(prefix)))
-	if len(fields) == 0 {
-		return "", 0, "", false
-	}
-	switch fields[0] {
-	case "ответ", "answer":
-		kind = "answer"
-	case "отказ", "deny":
-		kind = "deny"
-	default:
-		return "", 0, "", false
-	}
-	if !hasColon {
-		if len(fields) < 3 {
-			return kind, -1, "", true
-		}
-		// Without a colon a selector is mandatory. This prevents an ordinary
-		// owner turn from silently consuming a malformed human answer.
-		selector = contextualSelector(fields[1])
-		if selector < 0 {
-			return kind, -1, "", true
-		}
-		body = strings.Join(strings.Fields(text)[2:], " ")
-	} else {
-		if len(fields) == 1 {
-			body = strings.TrimSpace(rest)
-		} else if len(fields) == 2 {
-			selector = contextualSelector(fields[1])
-			body = strings.TrimSpace(rest)
-		} else if len(fields) > 2 {
-			selector = contextualSelector(fields[1])
-			if selector >= 0 && contextualSelector(fields[2]) >= 0 && strings.HasPrefix(fields[2], "#") {
-				return kind, -1, "", true
-			}
-			if selector >= 0 {
-				body = strings.Join(strings.Fields(prefix)[2:], " ") + ":" + rest
-				body = strings.TrimSpace(body)
+			if _, _, err = h.store.IngestUrgent(ctx, stop.FeatureID, stopInput); err != nil {
+				return err
 			}
 		}
 	}
-	if selector < 0 {
-		return kind, -1, "", true
-	}
-	if words := strings.Fields(body); len(words) > 0 && strings.HasPrefix(words[0], "#") && contextualSelector(words[0]) > 0 {
-		return kind, -1, "", true
-	}
-	if kind == "answer" {
-		words := strings.Fields(body)
-		if len(words) == 1 && (strings.EqualFold(words[0], "отказ") || strings.EqualFold(words[0], "отказ:") || strings.EqualFold(words[0], "отказ,")) {
-			return kind, -1, "", true
-		}
-		if len(words) == 3 && (strings.EqualFold(words[0], "отказ") || strings.EqualFold(words[0], "отказ,")) && strings.EqualFold(words[1], "потому") && strings.EqualFold(words[2], "что") {
-			return kind, -1, "", true
-		}
-		if len(words) >= 4 && (strings.EqualFold(words[0], "отказ") || strings.EqualFold(words[0], "отказ,")) && strings.EqualFold(words[1], "потому") && strings.EqualFold(words[2], "что") {
-			kind = "deny"
-			body = strings.Join(words[1:], " ")
-		} else if len(words) >= 2 && (strings.EqualFold(words[0], "отказ:") || strings.EqualFold(words[0], "deny:")) {
-			kind = "deny"
-			body = strings.Join(words[1:], " ")
-		}
-	}
-	return kind, selector, body, true
-}
-
-func contextualSelector(token string) int {
-	number := strings.TrimPrefix(token, "#")
-	if number == "" || strings.Trim(number, "0123456789") != "" {
-		return -1
-	}
-	selector, err := strconv.Atoi(number)
-	if err != nil || selector <= 0 || selector > 1000000 {
-		return -1
-	}
-	return selector
-}
-
-func contextualErrorText(code string) string {
-	switch code {
-	case "no_open_human_request", "request_closed", "request_not_waiting":
-		return "Сейчас нет опубликованного вопроса, который ждёт этот ответ. Проверьте состояние через !status."
-	case "ambiguous_human_request":
-		return "В треде ждут ответа несколько вопросов. Укажите номер нужного: «Ответ #2: текст» или «Отказ #2: причина»."
-	case "unknown_human_selector":
-		return "В этом треде нет открытого вопроса с таким номером. Проверьте номер над вопросом."
-	case "option_button_required", "invalid_option":
-		return "Для этого вопроса выберите вариант кнопкой под ним. Отказ можно написать как «Отказ 2: причина», указав номер нужного вопроса."
-	default:
-		return "Ответ не принят: " + code + ". Проверьте состояние через !status."
-	}
-}
-
-func (h *humanIngress) contextualRejection(ctx context.Context, in swarm.SlackSource, text string) error {
-	if err := h.notice(ctx, in, text); err != nil {
+	input, err := h.ownerInput(ctx, in)
+	if err != nil {
 		return err
 	}
+	if strings.HasPrefix(in.Text, "!") {
+		_, _, err = h.store.IngestUrgent(ctx, in.FeatureID, input)
+		if err == nil {
+			err = h.store.InterruptOwnerTurn(ctx, in.FeatureID, in.ActorID, "urgent Slack message")
+		}
+	} else {
+		_, _, err = h.store.Ingest(ctx, in.FeatureID, input)
+	}
+	if err != nil {
+		var api *swarm.APIError
+		if !errors.As(err, &api) || api.Status >= 500 {
+			return err
+		}
+		return h.rejection(ctx, in, err)
+	}
 	return h.store.SettleSlackSource(ctx, in)
+}
+
+func (h *humanIngress) ownerInput(ctx context.Context, in swarm.SlackSource) (swarm.InputPayload, error) {
+	input := swarm.InputPayload{Text: in.Text, Source: swarm.Source{Kind: "slack", EventID: "slack:" + in.ChannelID + ":" + in.MessageTS, ChannelID: in.ChannelID, ThreadTS: in.ThreadTS, ActorID: in.ActorID, MessageTS: in.MessageTS}, ActiveHumanRequest: in.ActiveHumanRequest}
+	if in.SourceKind == "block_action" {
+		input.HumanAction = &swarm.HumanActionInput{RequestID: in.RequestID, OptionID: in.OptionID}
+		input.Text = "Выбран вариант кнопкой в Slack."
+	}
+	return input, nil
 }
 
 func (h *humanIngress) rejection(ctx context.Context, in swarm.SlackSource, reason error) error {
@@ -803,9 +723,9 @@ func (h *humanIngress) rejection(ctx context.Context, in swarm.SlackSource, reas
 	if errors.As(reason, &api) {
 		code = api.Code
 	}
-	message := "Запрос не принят: " + code + ". Проверьте полный UUID и используйте !status."
+	message := "Сообщение пока не обработано: " + code + ". Попробуйте ещё раз или сообщите о проблеме в этом треде."
 	if in.SourceKind == "block_action" {
-		message = "Выбор не принят: " + code + ". Состояние запроса можно проверить командой !status."
+		message = "Выбор пока не обработан: " + code + ". Попробуйте ещё раз или сообщите о проблеме в этом треде."
 	}
 	if err := h.notice(ctx, in, message); err != nil {
 		return err
@@ -822,73 +742,4 @@ func (h *humanIngress) notice(ctx context.Context, in swarm.SlackSource, text st
 		return nil
 	}
 	return err
-}
-
-func parseAnswer(text string) (swarm.HumanAnswerInput, error) {
-	fields := strings.Fields(text)
-	if len(fields) < 3 || fields[0] != "!answer" || !requestIDPattern.MatchString(fields[1]) {
-		return swarm.HumanAnswerInput{}, errors.New("invalid answer syntax")
-	}
-	in := swarm.HumanAnswerInput{RequestID: strings.ToLower(fields[1]), Kind: "answer"}
-	switch fields[2] {
-	case "text":
-		if len(fields) < 4 {
-			return in, errors.New("answer text required")
-		}
-		in.Text = strings.Join(fields[3:], " ")
-	case "deny":
-		if len(fields) < 4 {
-			return in, errors.New("deny reason required")
-		}
-		in.Kind = "deny"
-		in.Text = strings.Join(fields[3:], " ")
-	default:
-		if fields[2] == "" || len(fields[2]) > 64 {
-			return in, errors.New("invalid option ID")
-		}
-		for _, r := range fields[2] {
-			if r > 127 || r <= 32 {
-				return in, errors.New("invalid option ID")
-			}
-		}
-		in.OptionID = fields[2]
-		if len(fields) > 3 {
-			in.Text = strings.Join(fields[3:], " ")
-		}
-	}
-	if len(in.Text) > 16*1024 {
-		return in, errors.New("answer too long")
-	}
-	return in, nil
-}
-
-func humanStatus(v swarm.History) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Фича %s · владелец %s · остановлена=%t", v.Feature.FeatureID, v.Feature.OwnerAgentID, v.Feature.Stopped)
-	if v.RecoveryBarrier != "" {
-		fmt.Fprintf(&b, "\nСверка Slack: %s; новые запуски ожидают завершения.", v.RecoveryBarrier)
-	}
-	for _, d := range v.Dependencies {
-		fmt.Fprintf(&b, "\nЗависимость %s · %s · запрос %s · job %s · attempt %s", d.ID, d.State, d.RequestID, d.JobID, d.AttemptID)
-	}
-	for _, p := range v.HumanRequests {
-		fmt.Fprintf(&b, "\nРешение %s · backend %s rev%d · применение %s", p.RequestID, p.BackendState, p.Revision, p.ApplicationStatus)
-	}
-	for _, s := range v.HumanSync {
-		if s.Status != "done" {
-			fmt.Fprintf(&b, "\nСинхронизация %s · %s · %s", s.RequestID, s.Kind, s.Status)
-		}
-	}
-	if b.Len() <= 16*1024 {
-		return b.String()
-	}
-	var truncated strings.Builder
-	for _, r := range b.String() {
-		if truncated.Len()+len(string(r))+len("\n… список сокращён") > 16*1024 {
-			break
-		}
-		truncated.WriteRune(r)
-	}
-	truncated.WriteString("\n… список сокращён")
-	return truncated.String()
 }
