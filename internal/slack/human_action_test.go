@@ -23,6 +23,7 @@ func TestHumanBlockActionEnvelope(t *testing.T) {
 	}{
 		{"valid", func(map[string]any) {}, true},
 		{"thread omitted", func(m map[string]any) { m["message"] = map[string]string{"ts": "9.000001"} }, true},
+		{"optional channel and message omitted", func(m map[string]any) { delete(m, "channel"); delete(m, "message") }, true},
 		{"foreign channel", func(m map[string]any) { m["channel"] = map[string]string{"id": "OTHER"} }, false},
 		{"foreign workspace", func(m map[string]any) { m["user"] = map[string]string{"id": "U", "team_id": "OTHER"} }, false},
 		{"wrong question", func(m map[string]any) { m["message"] = map[string]string{"ts": "8.000001", "thread_ts": "1.000001"} }, false},
@@ -43,7 +44,7 @@ func TestHumanBlockActionEnvelope(t *testing.T) {
 			got, ok, err := eventFromSocketModeEnvelope(socketModeEnvelope{EnvelopeID: "delivery", Type: "interactive", Payload: b})
 			if tc.valid {
 				wantThread := "1.000001"
-				if tc.name == "thread omitted" {
+				if tc.name == "thread omitted" || tc.name == "optional channel and message omitted" {
 					wantThread = ""
 				}
 				if !ok || err != nil || got.WorkspaceID != "T" || got.ChannelID != "C" || got.ThreadTS != wantThread || got.Timestamp != "10.000001" || got.HumanAction == nil || got.HumanAction.OptionID != "short" {

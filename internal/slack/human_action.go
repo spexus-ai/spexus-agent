@@ -46,7 +46,7 @@ func humanActionFromSocketModeEnvelope(envelope socketModeEnvelope) (Event, bool
 		return Event{}, false, nil
 	}
 	a := p.Actions[0]
-	if a.Type != "button" || p.Team.ID == "" || p.User.ID == "" || p.Container.Type != "message" || p.Container.ChannelID == "" || p.Container.MessageTS == "" || p.Message.TS != p.Container.MessageTS || p.Channel.ID != p.Container.ChannelID || p.User.TeamID != "" && p.User.TeamID != p.Team.ID || a.ActionTS == "" {
+	if a.Type != "button" || p.Team.ID == "" || p.User.ID == "" || p.Container.Type != "message" || p.Container.ChannelID == "" || p.Container.MessageTS == "" || p.Message.TS != "" && p.Message.TS != p.Container.MessageTS || p.Channel.ID != "" && p.Channel.ID != p.Container.ChannelID || p.User.TeamID != "" && p.User.TeamID != p.Team.ID || a.ActionTS == "" {
 		return Event{}, false, errors.New("invalid human action provenance")
 	}
 	var value struct {
