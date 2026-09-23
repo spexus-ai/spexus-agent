@@ -586,7 +586,7 @@ func (r *Runner) flush(ctx context.Context) error {
 					if a.Status == "rejected" {
 						request.Outcome = "failed"
 						request.Error = modelError("action_rejected")
-						request.Reply = "One or more delegated actions were rejected. Stored actions retain their recorded state."
+						request.Reply = "Не удалось завершить действие. Уже сохранённые результаты не потеряны; вопрос остаётся открытым, если решение ещё не записано."
 						break
 					}
 				}

@@ -125,6 +125,27 @@ func TestFreeTextQuestionInvitesNaturalReplyWithoutUUID(t *testing.T) {
 	}
 }
 
+func TestHumanQuestionShowsCompactContextWithoutInternalIdentifiers(t *testing.T) {
+	id := "123e4567-e89b-42d3-a456-426614174000"
+	message := "Решение человека требуется для работы.\nЗапрос: " + id +
+		"\nПричина: " + strings.Repeat("Нужны данные. ", 30) +
+		"\nКонтекст: " + strings.Repeat("Исполнитель ждёт. ", 30) +
+		"\nBlocked work: internal detail\nВопрос: Какой формат выбрать?\nРекомендация: Короткий текст.\nОжидает: подготовка результата (job " + id + ", attempt " + id + ")\n• short — Коротко\nВыберите вариант кнопкой ниже."
+	got := humanReadableQuestionText(message, []swarm.HumanOption{{ID: "short", Label: "Коротко"}}, 0, true)
+	if !strings.HasPrefix(got, "Нужен ваш ответ: Какой формат выбрать?") ||
+		!strings.Contains(got, "Почему спрашиваю:") || !strings.Contains(got, "Контекст:") ||
+		!strings.Contains(got, "Рекомендация:") || !strings.Contains(got, "Ждёт ответа:") ||
+		!strings.Contains(got, "Выберите кнопку или ответьте своими словами") ||
+		strings.Contains(got, id) || strings.Contains(got, "Blocked work:") ||
+		strings.Contains(got, "!answer") || len([]rune(got)) > 1100 {
+		t.Fatalf("question not compact and actionable: %q", got)
+	}
+	closed := humanReadableQuestionText(message, []swarm.HumanOption{{ID: "short", Label: "Коротко"}}, 0, false)
+	if strings.Contains(closed, "Выберите кнопку") || strings.Contains(closed, "Ответьте своими словами") {
+		t.Fatalf("closed question still invites an answer: %q", closed)
+	}
+}
+
 func TestHumanQuestionPendingAndAttentionAreInPlaceWithoutFalseSuccess(t *testing.T) {
 	var posts []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

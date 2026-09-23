@@ -390,6 +390,22 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 			if e := requiredKeys(a.Data, "request_id", "source_message_ts", "kind"); e != nil {
 				return o, nil, e
 			}
+			if d.Type == "agent.input" {
+				var input swarm.InputPayload
+				if e := json.Unmarshal(d.Payload, &input); e != nil {
+					return o, nil, e
+				}
+				if input.HumanAction != nil && x.SourceMessageTS == input.Source.MessageTS {
+					if x.RequestID != input.HumanAction.RequestID || x.Kind != "answer" {
+						return o, nil, &reviewPreflightError{reason: "a Slack button can answer only its own active question"}
+					}
+					// A button carries exactly one trusted option and no free text.
+					// Pi interprets whether to decide, but cannot add a second
+					// response or substitute an option to the human click.
+					x.OptionID = input.HumanAction.OptionID
+					x.Text = ""
+				}
+			}
 			m = r.envelope(d, "human.respond", "coordinator", x, ptr(d.MessageID))
 			m.JobID, m.AttemptID = "", ""
 		case "resolve_dependency":

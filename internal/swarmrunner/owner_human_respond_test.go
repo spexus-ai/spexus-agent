@@ -53,3 +53,29 @@ func TestOwnerHumanResponseReferencesTrustedSlackSource(t *testing.T) {
 		}
 	}
 }
+
+func TestOwnerHumanButtonDecisionUsesOnlyTrustedOption(t *testing.T) {
+	r, _ := runnerFixture(t, http.NotFoundHandler())
+	r.cfg.WireVersion = 2
+	r.cfg.Role = "owner"
+	r.cfg.AgentID = "orchestrator"
+	d := dispatchFixture(r)
+	d.ProtocolVersion, d.Type = 2, "agent.input"
+	d.ToAgentID, d.FromAgentID = "orchestrator", "coordinator"
+	d.JobID, d.AttemptID, d.OwnerTurnID = "", "", ""
+	requestID, sourceTS := swarm.NewID(), "1790199062.456042"
+	d.Payload, _ = json.Marshal(swarm.InputPayload{Text: "Выбран вариант кнопкой в Slack.", Source: swarm.Source{Kind: "slack", MessageTS: sourceTS}, HumanAction: &swarm.HumanActionInput{RequestID: requestID, OptionID: "detailed"}})
+	data, _ := json.Marshal(swarm.HumanRespondPayload{RequestID: requestID, SourceMessageTS: sourceTS, Kind: "answer", OptionID: "short", Text: "Модель добавила свой текст"})
+	output, _ := json.Marshal(ownerOutput{Actions: []action{{Kind: "decide_human", Data: data}}, Reply: ""})
+	_, messages, err := r.ownerActions(d, swarm.NewID(), string(output))
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("button decision: %v %+v", err, messages)
+	}
+	var got swarm.HumanRespondPayload
+	if err := json.Unmarshal(messages[0].Payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.OptionID != "detailed" || got.Text != "" {
+		t.Fatalf("button decision was not constrained by trusted click: %+v", got)
+	}
+}

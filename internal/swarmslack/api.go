@@ -305,6 +305,47 @@ func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, op
 
 func humanReadableQuestionText(message string, options []swarm.HumanOption, _ int, actionable bool) string {
 	lines := strings.Split(message, "\n")
+	if len(lines) > 0 && lines[0] == "Решение человека требуется для работы." {
+		fields := map[string]string{}
+		for _, line := range lines[1:] {
+			for _, label := range []string{"Причина: ", "Контекст: ", "Вопрос: ", "Рекомендация: ", "Ожидает: "} {
+				if strings.HasPrefix(line, label) {
+					fields[label] = strings.TrimSpace(strings.TrimPrefix(line, label))
+				}
+			}
+		}
+		if fields["Вопрос: "] != "" {
+			waiting := fields["Ожидает: "]
+			if before, _, ok := strings.Cut(waiting, " (job "); ok {
+				waiting = before
+			}
+			if before, _, ok := strings.Cut(waiting, " (step "); ok {
+				waiting = before
+			}
+			readable := []string{"Нужен ваш ответ: " + compactHumanField(fields["Вопрос: "], 320)}
+			for _, item := range []struct {
+				label, value string
+				limit        int
+			}{
+				{"Почему спрашиваю: ", fields["Причина: "], 160},
+				{"Контекст: ", fields["Контекст: "], 180},
+				{"Рекомендация: ", fields["Рекомендация: "], 180},
+				{"Ждёт ответа: ", waiting, 180},
+			} {
+				if item.value != "" {
+					readable = append(readable, item.label+compactHumanField(item.value, item.limit))
+				}
+			}
+			if actionable {
+				if len(options) > 0 {
+					readable = append(readable, "Выберите кнопку или ответьте своими словами в этом треде.")
+				} else {
+					readable = append(readable, "Ответьте своими словами в этом треде; можно уточнить вопрос или объяснить отказ.")
+				}
+			}
+			return strings.Join(readable, "\n")
+		}
+	}
 	readable := make([]string, 0, len(lines))
 	for _, line := range lines {
 		if strings.HasPrefix(line, "Запрос: ") {
@@ -323,6 +364,15 @@ func humanReadableQuestionText(message string, options []swarm.HumanOption, _ in
 		readable = append(readable, line)
 	}
 	return strings.Join(readable, "\n")
+}
+
+func compactHumanField(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) > limit {
+		return strings.TrimSpace(string(runes[:limit-1])) + "…"
+	}
+	return value
 }
 
 func humanQuestionBlocks(message, requestID string, options []swarm.HumanOption, closed bool) []map[string]any {
