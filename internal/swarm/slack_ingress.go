@@ -15,14 +15,15 @@ import (
 // SlackSource is trusted transport metadata. EventID is an optional alias:
 // Socket Mode and conversations.replies identify the same source by message TS.
 type SlackSource struct {
-	WorkspaceID string `json:"workspace_id"`
-	ChannelID   string `json:"channel_id"`
-	MessageTS   string `json:"message_ts"`
-	ThreadTS    string `json:"thread_ts"`
-	FeatureID   string `json:"feature_id"`
-	ActorID     string `json:"actor_id"`
-	Text        string `json:"text"`
-	EventID     string `json:"event_id,omitempty"`
+	WorkspaceID   string `json:"workspace_id"`
+	ChannelID     string `json:"channel_id"`
+	MessageTS     string `json:"message_ts"`
+	ThreadTS      string `json:"thread_ts"`
+	FeatureID     string `json:"feature_id"`
+	ActorID       string `json:"actor_id"`
+	Text          string `json:"text"`
+	EventID       string `json:"event_id,omitempty"`
+	DuringCatchup bool   `json:"during_catchup,omitempty"`
 }
 
 func validSlackTS(ts string) bool {
@@ -69,11 +70,17 @@ func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, er
 		// The event ID is a delivery alias, not part of immutable source content.
 		canonical := in
 		canonical.EventID = ""
+		canonical.DuringCatchup = false
 		payload := mustJSON(canonical)
 		var prior []byte
 		err = tx.QueryRowContext(ctx, "SELECT payload FROM slack_sources WHERE workspace_id=? AND channel_id=? AND message_ts=?", in.WorkspaceID, in.ChannelID, in.MessageTS).Scan(&prior)
 		if err == nil {
-			if !bytes.Equal(prior, payload) {
+			var stored SlackSource
+			if json.Unmarshal(prior, &stored) != nil {
+				return wireError(409, "source_conflict")
+			}
+			stored.DuringCatchup = false
+			if !bytes.Equal(mustJSON(stored), payload) {
 				return wireError(409, "source_conflict")
 			}
 			duplicate = true
@@ -82,10 +89,25 @@ func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, er
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
+		var barrierCount int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM recovery_barriers WHERE feature_id=?", in.FeatureID).Scan(&barrierCount); err != nil {
+			return err
+		}
+		canonical.DuringCatchup = barrierCount != 0
+		payload = mustJSON(canonical)
 		_, err = tx.ExecContext(ctx, "INSERT INTO slack_sources(workspace_id,channel_id,message_ts,feature_id,payload,status) VALUES(?,?,?,?,?,'pending')", in.WorkspaceID, in.ChannelID, in.MessageTS, in.FeatureID, payload)
 		return err
 	})
 	return duplicate, err
+}
+
+func (s *Store) SlackSourceExists(ctx context.Context, workspace, channel, messageTS string) (bool, error) {
+	if workspace == "" || channel == "" || !validSlackTS(messageTS) {
+		return false, wireError(400, "invalid_slack_source")
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, "SELECT count(*) FROM slack_sources WHERE workspace_id=? AND channel_id=? AND message_ts=?", workspace, channel, messageTS).Scan(&n)
+	return n != 0, err
 }
 
 func (s *Store) PendingSlackSources(ctx context.Context, featureID string) ([]SlackSource, error) {

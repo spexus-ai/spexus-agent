@@ -80,6 +80,9 @@ func (c *SocketModeClient) consumeDurable(ctx context.Context, socketURL string,
 			return fmt.Errorf("normalize Slack envelope: %w", err)
 		}
 		if ok {
+			if event.WorkspaceID == "" {
+				return fmt.Errorf("Slack Socket Mode event missing workspace")
+			}
 			if err := handle(connCtx, event); err != nil {
 				return fmt.Errorf("commit Slack envelope: %w", err)
 			}

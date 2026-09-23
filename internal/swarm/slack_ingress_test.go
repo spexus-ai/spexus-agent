@@ -2,6 +2,9 @@ package swarm
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +37,31 @@ func TestSlackSourceDedupAndConflict(t *testing.T) {
 	pending, err = f.s.PendingSlackSources(ctx, f.feature.FeatureID)
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("settled source pending=%+v err=%v", pending, err)
+	}
+}
+
+// Test: a valid but oversized request is rejected before backend create, so
+// Slack cannot truncate the decision options or answer syntax.
+// Validates: AC-464 (REQ-391 - complete human question and response options).
+func TestHumanQuestionMustFitSlackPublication(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	p := HumanRequestPayload{StepKey: "approval", BlockedWork: strings.Repeat("w", 7900), Blocker: Blocker{Reason: strings.Repeat("r", 4000), Context: strings.Repeat("c", 8000), Question: strings.Repeat("q", 4000), Recommendation: strings.Repeat("m", 4000), Kind: "choice", Options: []HumanOption{}}}
+	for i := 0; i < 8; i++ {
+		p.Options = append(p.Options, HumanOption{ID: string(rune('a' + i)), Label: strings.Repeat("L", 1000)})
+	}
+	if err := validateBlocker(p.Blocker); err != nil {
+		t.Fatalf("fixture invalid: %v", err)
+	}
+	e := Envelope{FeatureID: f.feature.FeatureID, OwnerTurnID: NewID(), MessageID: NewID()}
+	err := f.s.transaction(ctx, func(tx *sql.Tx) error { return f.s.humanRequest(ctx, tx, e, p) })
+	var api *APIError
+	if !errors.As(err, &api) || api.Code != "slack_question_too_large" {
+		t.Fatalf("oversized question accepted: %v", err)
+	}
+	var n int
+	if err := f.s.db.QueryRowContext(ctx, "SELECT count(*) FROM backend_sync_operations").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("canonical create queued for truncated question: %d %v", n, err)
 	}
 }
 

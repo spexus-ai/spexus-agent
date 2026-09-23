@@ -44,12 +44,13 @@ type MessageUpdater interface {
 }
 
 type Event struct {
-	ID        string
-	ChannelID string
-	ThreadTS  string
-	Timestamp string
-	UserID    string
-	Text      string
+	ID          string
+	WorkspaceID string
+	ChannelID   string
+	ThreadTS    string
+	Timestamp   string
+	UserID      string
+	Text        string
 }
 
 const (

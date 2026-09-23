@@ -37,12 +37,8 @@ func (f *durableFixture) Send(ctx context.Context, event slack.Event) error {
 	return handle(ctx, event)
 }
 
-// Test: a missed stop from paged Slack history wins over a later historical
-// continue. Socket redelivery of that source cannot apply stop twice.
-// Validates: AC-432/465 (REQ-350/392 - reconnect catchup and stop priority).
-func TestHumanCatchupMissedStopAndDuplicateSocket(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func newHumanTransportStore(t *testing.T) (*swarm.Store, swarm.Feature) {
+	t.Helper()
 	owner := swarm.NewID()
 	profile := swarm.TextProfile{ID: "owner", Model: "fixture/test", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}}
 	profileBytes, _ := json.Marshal(profile)
@@ -52,19 +48,34 @@ func TestHumanCatchupMissedStopAndDuplicateSocket(t *testing.T) {
 	}
 	f := swarm.Feature{FeatureID: swarm.NewID(), TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, OwnerAgentID: owner, ChannelID: "C", ThreadTS: "1.000001", AllowedActorIDs: []string{"U"}}
 	cfg.Features = []swarm.Feature{f}
-	store, err := swarm.Open(ctx, filepath.Join(t.TempDir(), "swarm.db"), cfg)
+	store, err := swarm.Open(context.Background(), filepath.Join(t.TempDir(), "swarm.db"), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	t.Cleanup(func() { _ = store.Close() })
+	return store, f
+}
+
+// Test: a missed stop from paged Slack history wins over a later historical
+// continue. Socket redelivery of that source cannot apply stop twice.
+// Validates: AC-432/465 (REQ-350/392 - reconnect catchup and stop priority).
+func TestHumanCatchupMissedStopAndDuplicateSocket(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, f := newHumanTransportStore(t)
+	var err error
 	pages := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth.test" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "team_id": "W"})
+			return
+		}
 		if r.URL.Path == "/conversations.replies" {
 			pages++
 			if r.URL.Query().Get("cursor") == "" {
 				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "has_more": true, "messages": []any{map[string]string{"ts": "9999999999.000001", "thread_ts": f.ThreadTS, "user": "U", "text": "!stop"}}, "response_metadata": map[string]string{"next_cursor": "page-2"}})
 			} else {
-				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "messages": []any{map[string]string{"ts": "9999999999.000002", "thread_ts": f.ThreadTS, "user": "U", "text": "!continue"}}})
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "messages": []any{map[string]string{"ts": "9999999999.000002", "thread_ts": f.ThreadTS, "user": "U", "text": "!continue"}, map[string]any{"ts": "9999999999.000003", "thread_ts": f.ThreadTS, "user": "U", "text": "!answer 123e4567-e89b-42d3-a456-426614174000 text changed", "edited": map[string]string{"user": "U", "ts": "9999999999.000004"}}}})
 			}
 			return
 		}
@@ -73,7 +84,7 @@ func TestHumanCatchupMissedStopAndDuplicateSocket(t *testing.T) {
 	defer server.Close()
 	api := NewAPI("token")
 	api.BaseURL, api.Client = server.URL+"/", server.Client()
-	bridge := &Bridge{Store: store, Features: cfg.Features, API: api}
+	bridge := &Bridge{Store: store, Features: []swarm.Feature{f}, API: api}
 	source := &durableFixture{}
 	done := make(chan error, 1)
 	go func() { done <- bridge.RunHuman(ctx, source, "W") }()
@@ -92,6 +103,9 @@ func TestHumanCatchupMissedStopAndDuplicateSocket(t *testing.T) {
 	if pages != 2 {
 		t.Fatalf("history pages=%d", pages)
 	}
+	if found, err := store.SlackSourceExists(ctx, "W", "C", "9999999999.000003"); err != nil || found {
+		t.Fatalf("edited unseen answer became source: found=%t err=%v", found, err)
+	}
 	stops := 0
 	for _, a := range history.Audit {
 		if a.Event == "feature_stopped" {
@@ -101,7 +115,7 @@ func TestHumanCatchupMissedStopAndDuplicateSocket(t *testing.T) {
 	if stops != 1 {
 		t.Fatalf("stop applied %d times", stops)
 	}
-	if err = source.Send(ctx, slack.Event{ID: "socket-copy", ChannelID: "C", ThreadTS: f.ThreadTS, Timestamp: "9999999999.000001", UserID: "U", Text: "!stop"}); err != nil {
+	if err = source.Send(ctx, slack.Event{ID: "socket-copy", WorkspaceID: "W", ChannelID: "C", ThreadTS: f.ThreadTS, Timestamp: "9999999999.000001", UserID: "U", Text: "!stop"}); err != nil {
 		t.Fatal(err)
 	}
 	history, err = store.History(ctx, f.FeatureID)
@@ -117,6 +131,12 @@ func TestHumanCatchupMissedStopAndDuplicateSocket(t *testing.T) {
 	if newStops != stops || !history.Feature.Stopped {
 		t.Fatalf("duplicate stop changed state: %d to %d", stops, newStops)
 	}
+	if err := source.Send(ctx, slack.Event{ID: "foreign-workspace", WorkspaceID: "OTHER", ChannelID: "C", ThreadTS: f.ThreadTS, Timestamp: "9999999999.000005", UserID: "U", Text: "!answer 123e4567-e89b-42d3-a456-426614174000 text approved"}); err == nil {
+		t.Fatal("foreign workspace was accepted")
+	}
+	if found, err := store.SlackSourceExists(ctx, "W", "C", "9999999999.000005"); err != nil || found {
+		t.Fatalf("foreign workspace committed a source: found=%t err=%v", found, err)
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -125,5 +145,85 @@ func TestHumanCatchupMissedStopAndDuplicateSocket(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("bridge did not stop")
+	}
+}
+
+type stoppedCommitStore struct {
+	*swarm.Store
+	committed chan struct{}
+	release   chan struct{}
+}
+
+func (s *stoppedCommitStore) CommitSlackSource(ctx context.Context, source swarm.SlackSource) (bool, error) {
+	duplicate, err := s.Store.CommitSlackSource(ctx, source)
+	if err == nil && source.Text == "!stop" {
+		close(s.committed)
+		<-s.release
+	}
+	return duplicate, err
+}
+
+type emptyHistory struct{}
+
+func (emptyHistory) VerifyWorkspace(context.Context, string) error { return nil }
+func (emptyHistory) ScanThread(context.Context, string, string, string, func(string, string, string, string, bool) error) (string, error) {
+	return "", nil
+}
+
+// Test: a Socket !stop already committed to SQLite cannot wait behind the
+// final history drain while catchup opens the execution barrier.
+// Validates: AC-432/465 (REQ-350/392 - stop-before-resume race).
+func TestHumanCatchupDoesNotOpenOverCommittedStop(t *testing.T) {
+	ctx := context.Background()
+	store, f := newHumanTransportStore(t)
+	if _, err := store.SlackWatermark(ctx, f.FeatureID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRecoveryBarrier(ctx, f.FeatureID, "slack_catchup"); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &stoppedCommitStore{Store: store, committed: make(chan struct{}), release: make(chan struct{})}
+	h := &humanIngress{bridge: &Bridge{Features: []swarm.Feature{f}}, store: wrapped, history: emptyHistory{}, workspace: "W"}
+	stopDone := make(chan error, 1)
+	go func() {
+		_, err := h.commit(ctx, f, slack.Event{ID: "stop-socket", WorkspaceID: "W", ChannelID: "C", ThreadTS: f.ThreadTS, Timestamp: "9999999999.000010", UserID: "U", Text: "!stop"})
+		stopDone <- err
+	}()
+	select {
+	case <-wrapped.committed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop not committed")
+	}
+	catchupDone := make(chan error, 1)
+	go func() { catchupDone <- h.scanAll(ctx) }()
+	select {
+	case err := <-catchupDone:
+		t.Fatalf("catchup opened over pending stop: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	view, err := store.History(ctx, f.FeatureID)
+	if err != nil || view.RecoveryBarrier == "" {
+		t.Fatalf("barrier opened before stop latch: %+v %v", view, err)
+	}
+	close(wrapped.release)
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not settle")
+	}
+	select {
+	case err := <-catchupDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("catchup did not settle")
+	}
+	view, err = store.History(ctx, f.FeatureID)
+	if err != nil || !view.Feature.Stopped || view.RecoveryBarrier != "" {
+		t.Fatalf("catchup settled without stop latch: %+v %v", view, err)
 	}
 }

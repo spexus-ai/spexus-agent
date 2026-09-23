@@ -28,7 +28,7 @@ func TestDurableSocketACKAfterConsumerCommit(t *testing.T) {
 					return
 				}
 				defer conn.Close()
-				_ = conn.WriteJSON(map[string]any{"envelope_id": "env-1", "type": "events_api", "payload": map[string]any{"event_id": "evt-1", "type": "event_callback", "event": map[string]string{"type": "message", "channel": "C", "thread_ts": "123.000001", "ts": "123.000002", "user": "U", "text": "!stop"}}})
+				_ = conn.WriteJSON(map[string]any{"envelope_id": "env-1", "type": "events_api", "payload": map[string]any{"event_id": "evt-1", "type": "event_callback", "team_id": "W", "event": map[string]string{"type": "message", "channel": "C", "thread_ts": "123.000001", "ts": "123.000002", "user": "U", "text": "!stop"}}})
 				var message map[string]string
 				err = conn.ReadJSON(&message)
 				ack <- err == nil && message["envelope_id"] == "env-1"
@@ -40,7 +40,7 @@ func TestDurableSocketACKAfterConsumerCommit(t *testing.T) {
 			done := make(chan error, 1)
 			go func() {
 				done <- client.consumeDurable(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil, func(_ context.Context, e Event) error {
-					if e.ID != "evt-1" {
+					if e.ID != "evt-1" || e.WorkspaceID != "W" {
 						t.Errorf("wrong event: %+v", e)
 					}
 					close(received)

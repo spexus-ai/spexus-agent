@@ -21,9 +21,38 @@ type RateLimitError struct{ After time.Duration }
 
 func (e *RateLimitError) Error() string { return "slack thread history rate limited" }
 
+// VerifyWorkspace binds the bot token used for history to the configured
+// workspace. History messages do not carry a team ID themselves.
+func (a *API) VerifyWorkspace(ctx context.Context, configured string) error {
+	if configured == "" {
+		return errors.New("Slack workspace is required")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.BaseURL+"auth.test", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.Token)
+	res, err := a.Client.Do(req)
+	if err != nil {
+		return errors.New("Slack bot workspace verification unavailable")
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("Slack bot workspace verification HTTP %d", res.StatusCode)
+	}
+	var identity struct {
+		OK     bool   `json:"ok"`
+		TeamID string `json:"team_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 16*1024)).Decode(&identity); err != nil || !identity.OK || identity.TeamID != configured {
+		return errors.New("Slack bot workspace does not match configured workspace")
+	}
+	return nil
+}
+
 // ScanThread reads every page and passes only original human messages to the
 // caller. A partial scan is never evidence that history has been caught up.
-func (a *API) ScanThread(ctx context.Context, channel, thread, oldest string, consume func(string, string, string, string) error) (string, error) {
+func (a *API) ScanThread(ctx context.Context, channel, thread, oldest string, consume func(string, string, string, string, bool) error) (string, error) {
 	if channel == "" || !validTimestamp(thread) || !validTimestamp(oldest) {
 		return "", errors.New("invalid Slack history scope")
 	}
@@ -62,13 +91,14 @@ func (a *API) ScanThread(ctx context.Context, channel, thread, oldest string, co
 			HasMore  bool   `json:"has_more"`
 			Error    string `json:"error"`
 			Messages []struct {
-				TS       string `json:"ts"`
-				ThreadTS string `json:"thread_ts"`
-				User     string `json:"user"`
-				Text     string `json:"text"`
-				BotID    string `json:"bot_id"`
-				AppID    string `json:"app_id"`
-				Subtype  string `json:"subtype"`
+				TS       string          `json:"ts"`
+				ThreadTS string          `json:"thread_ts"`
+				User     string          `json:"user"`
+				Text     string          `json:"text"`
+				BotID    string          `json:"bot_id"`
+				AppID    string          `json:"app_id"`
+				Subtype  string          `json:"subtype"`
+				Edited   json.RawMessage `json:"edited"`
 			} `json:"messages"`
 			Metadata struct {
 				Cursor string `json:"next_cursor"`
@@ -90,7 +120,8 @@ func (a *API) ScanThread(ctx context.Context, channel, thread, oldest string, co
 			if message.ThreadTS != "" && message.ThreadTS != thread {
 				return "", errors.New("slack history thread mismatch")
 			}
-			if err := consume(message.TS, message.User, message.Text, thread); err != nil {
+			edited := len(message.Edited) > 0 && string(message.Edited) != "null"
+			if err := consume(message.TS, message.User, message.Text, thread, edited); err != nil {
 				return "", err
 			}
 		}

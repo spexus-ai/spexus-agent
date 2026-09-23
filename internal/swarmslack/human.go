@@ -17,6 +17,7 @@ import (
 type HumanStore interface {
 	Store
 	CommitSlackSource(context.Context, swarm.SlackSource) (bool, error)
+	SlackSourceExists(context.Context, string, string, string) (bool, error)
 	PendingSlackSources(context.Context, string) ([]swarm.SlackSource, error)
 	SettleSlackSource(context.Context, swarm.SlackSource) error
 	SlackWatermark(context.Context, string) (string, error)
@@ -26,7 +27,8 @@ type HumanStore interface {
 }
 
 type ThreadHistoryAPI interface {
-	ScanThread(context.Context, string, string, string, func(string, string, string, string) error) (string, error)
+	ScanThread(context.Context, string, string, string, func(string, string, string, string, bool) error) (string, error)
+	VerifyWorkspace(context.Context, string) error
 }
 
 type humanIngress struct {
@@ -35,6 +37,7 @@ type humanIngress struct {
 	history   ThreadHistoryAPI
 	workspace string
 	mu        sync.Mutex
+	stopMu    sync.Mutex
 }
 
 var requestIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
@@ -49,6 +52,9 @@ func (b *Bridge) RunHuman(ctx context.Context, source slack.DurableEventSource, 
 	history, ok := b.API.(ThreadHistoryAPI)
 	if !ok {
 		return errors.New("Slack thread history is not configured")
+	}
+	if err := history.VerifyWorkspace(ctx, workspace); err != nil {
+		return err
 	}
 	h := &humanIngress{bridge: b, store: store, history: history, workspace: workspace}
 	for _, f := range b.Features {
@@ -146,11 +152,21 @@ func (h *humanIngress) scanAll(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		upper, err := h.history.ScanThread(ctx, f.ChannelID, f.ThreadTS, watermark, func(ts, actor, text, thread string) error {
+		upper, err := h.history.ScanThread(ctx, f.ChannelID, f.ThreadTS, watermark, func(ts, actor, text, thread string, edited bool) error {
 			if !timestampAfter(ts, watermark) {
 				return nil
 			}
-			_, err := h.commit(ctx, f, slack.Event{ChannelID: f.ChannelID, ThreadTS: thread, Timestamp: ts, UserID: actor, Text: text})
+			if edited {
+				exists, err := h.store.SlackSourceExists(ctx, h.workspace, f.ChannelID, ts)
+				if err != nil {
+					return err
+				}
+				if exists {
+					return fmt.Errorf("edited Slack source conflict at %s", ts)
+				}
+				return nil
+			}
+			_, err := h.commit(ctx, f, slack.Event{WorkspaceID: h.workspace, ChannelID: f.ChannelID, ThreadTS: thread, Timestamp: ts, UserID: actor, Text: text})
 			return err
 		})
 		if err != nil {
@@ -163,12 +179,20 @@ func (h *humanIngress) scanAll(ctx context.Context) error {
 		// While the barrier remains set, stops are already applied and all other
 		// sources run in timestamp order. Historical continue is never replayed.
 		err = h.processPending(ctx, f, true)
+		// A Socket !stop locks stopMu before its SQLite commit. The final stop
+		// drain and barrier release hold the same mutex, so a committed stop
+		// cannot be waiting for its latch when work becomes eligible again.
+		h.stopMu.Lock()
+		if err == nil {
+			err = h.processStops(ctx, f.FeatureID)
+		}
 		if err == nil && upper != "" && timestampAfter(upper, watermark) {
 			err = h.store.AdvanceSlackWatermark(ctx, f.FeatureID, upper)
 		}
 		if err == nil && ctx.Err() == nil {
 			err = h.store.SetRecoveryBarrier(ctx, f.FeatureID, "")
 		}
+		h.stopMu.Unlock()
 		h.mu.Unlock()
 		if err != nil {
 			return err
@@ -189,18 +213,24 @@ func (h *humanIngress) handle(ctx context.Context, event slack.Event) error {
 }
 
 func (h *humanIngress) commit(ctx context.Context, f swarm.Feature, event slack.Event) (bool, error) {
+	if event.WorkspaceID == "" || event.WorkspaceID != h.workspace {
+		return false, errors.New("Slack event workspace mismatch")
+	}
 	if !allowed(f, event.UserID) {
 		return false, nil
+	}
+	stop := strings.TrimSpace(event.Text) == "!stop"
+	if stop {
+		h.stopMu.Lock()
+		defer h.stopMu.Unlock()
 	}
 	in := swarm.SlackSource{WorkspaceID: h.workspace, ChannelID: event.ChannelID, MessageTS: event.Timestamp, ThreadTS: event.ThreadTimestamp(), FeatureID: f.FeatureID, ActorID: event.UserID, Text: event.Text, EventID: event.ID}
 	duplicate, err := h.store.CommitSlackSource(ctx, in)
 	if err != nil {
 		return false, err
 	}
-	if strings.TrimSpace(in.Text) == "!stop" {
-		h.mu.Lock()
+	if stop {
 		err = h.processStop(ctx, in)
-		h.mu.Unlock()
 		if err != nil {
 			// A committed stop with no applied latch must block new starts.
 			_ = h.store.SetRecoveryBarrier(ctx, f.FeatureID, "slack_stop_pending")
@@ -251,18 +281,17 @@ func (h *humanIngress) processPending(ctx context.Context, f swarm.Feature, reco
 			return nil
 		}
 	}
+	h.stopMu.Lock()
+	err := h.processStops(ctx, f.FeatureID)
+	h.stopMu.Unlock()
+	if err != nil {
+		return err
+	}
 	pending, err := h.store.PendingSlackSources(ctx, f.FeatureID)
 	if err != nil {
 		return err
 	}
 	sort.Slice(pending, func(i, j int) bool { return timestampAfter(pending[j].MessageTS, pending[i].MessageTS) })
-	for _, in := range pending {
-		if strings.TrimSpace(in.Text) == "!stop" {
-			if err := h.processStop(ctx, in); err != nil {
-				return err
-			}
-		}
-	}
 	for _, in := range pending {
 		if strings.TrimSpace(in.Text) == "!stop" {
 			continue
@@ -274,11 +303,28 @@ func (h *humanIngress) processPending(ctx context.Context, f swarm.Feature, reco
 	return nil
 }
 
+// processStops runs while stopMu is held. Other commands never clear a stop
+// during catchup; the caller drains it again immediately before release.
+func (h *humanIngress) processStops(ctx context.Context, featureID string) error {
+	pending, err := h.store.PendingSlackSources(ctx, featureID)
+	if err != nil {
+		return err
+	}
+	for _, in := range pending {
+		if strings.TrimSpace(in.Text) == "!stop" {
+			if err := h.processStop(ctx, in); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, recovering bool) error {
 	text := strings.TrimSpace(in.Text)
 	switch {
 	case text == "!continue":
-		if recovering {
+		if recovering || in.DuringCatchup {
 			if err := h.notice(ctx, in, "После сверки истории отправьте новую команду !continue, если хотите продолжить работу."); err != nil {
 				return err
 			}

@@ -103,6 +103,12 @@ func (s *Store) humanRequest(ctx context.Context, tx *sql.Tx, e Envelope, p Huma
 		}
 		d.Blocker.Context = contextWithWork
 	}
+	// Slack truncates long postMessage text. A human request must expose its
+	// full UUID, context, options, recommendation, blocked work and syntax in
+	// one complete question; reject oversized requests before canonical create.
+	if len(questionText(d)) > 35*1024 {
+		return wireError(400, "slack_question_too_large")
+	}
 	d.UpdatedAt = s.stamp()
 	if err = saveDependency(ctx, tx, d); err != nil {
 		return err

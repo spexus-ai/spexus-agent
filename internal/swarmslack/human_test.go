@@ -72,7 +72,10 @@ func TestScanThreadPaginationAndFailures(t *testing.T) {
 			a := NewAPI("test")
 			a.BaseURL, a.Client = server.URL+"/", server.Client()
 			var got []string
-			upper, err := a.ScanThread(context.Background(), "C", "1.000001", "1.000000", func(ts, user, text, thread string) error {
+			upper, err := a.ScanThread(context.Background(), "C", "1.000001", "1.000000", func(ts, user, text, thread string, edited bool) error {
+				if edited {
+					t.Error("unedited message marked edited")
+				}
 				got = append(got, strings.Join([]string{ts, user, text, thread}, "/"))
 				return nil
 			})
@@ -92,5 +95,25 @@ func TestScanThreadPaginationAndFailures(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Test: bot-token workspace identity must match the configured human scope.
+// Validates: AC-464 (REQ-391 - trusted Slack source provenance).
+func TestVerifySlackBotWorkspace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth.test" || r.Header.Get("Authorization") != "Bearer test" {
+			t.Error("wrong auth.test request")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "team_id": "T-real"})
+	}))
+	defer server.Close()
+	a := NewAPI("test")
+	a.BaseURL, a.Client = server.URL+"/", server.Client()
+	if err := a.VerifyWorkspace(context.Background(), "T-real"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.VerifyWorkspace(context.Background(), "T-other"); err == nil {
+		t.Fatal("bot token accepted for a different workspace")
 	}
 }
