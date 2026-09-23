@@ -371,9 +371,9 @@ func questionText(d Dependency) string {
 		fmt.Fprintf(&b, "\n• %s — %s", o.ID, o.Label)
 	}
 	if len(d.Blocker.Options) > 0 {
-		b.WriteString("\nВыберите вариант кнопкой ниже.")
+		b.WriteString("\nВыберите вариант кнопкой ниже. Для отказа напишите в этом треде: Отказ: причина.")
 	} else {
-		b.WriteString("\nОтветьте через доступное действие в сообщении.")
+		b.WriteString("\nНапишите в этом треде: Ответ: ваш текст. Для отказа: Отказ: причина.")
 	}
 	return b.String()
 }

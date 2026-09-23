@@ -216,7 +216,9 @@ func (a *API) Post(ctx context.Context, d swarm.SlackDelivery) (string, error) {
 	}
 	payload := map[string]any{"channel": d.ChannelID, "thread_ts": d.ThreadTS, "text": d.Text, "client_msg_id": d.ID, "metadata": map[string]any{"event_type": "spexus_swarm_reply", "event_payload": map[string]string{"delivery_id": d.ID, "turn_id": d.TurnID}}}
 	if d.Question != nil {
-		payload["blocks"] = humanQuestionBlocks(d.Text, d.ID, d.Question.Options, false)
+		message := humanReadableQuestionText(d.Text, d.Question.Options)
+		payload["text"] = message
+		payload["blocks"] = humanQuestionBlocks(message, d.ID, d.Question.Options, false)
 	}
 	err := a.call(ctx, "chat.postMessage", payload, &res)
 	if err != nil {
@@ -237,7 +239,7 @@ func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, op
 	if d.Status != "sent" || !validTimestamp(d.SlackTS) {
 		return errors.New("human question has no published Slack message")
 	}
-	message := humanReadableQuestionText(d.Text)
+	message := humanReadableQuestionText(d.Text, options)
 	switch state {
 	case "open":
 	case "stopped":
@@ -265,14 +267,23 @@ func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, op
 	return nil
 }
 
-func humanReadableQuestionText(message string) string {
+func humanReadableQuestionText(message string, options []swarm.HumanOption) string {
 	lines := strings.Split(message, "\n")
-	for i, line := range lines {
-		if strings.HasPrefix(line, "Ответ: !answer ") {
-			lines[i] = "Выберите вариант кнопкой ниже."
+	readable := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(line, "Запрос: ") {
+			continue // Correlation stays in the button value and durable history.
 		}
+		if strings.HasPrefix(line, "Ответ: !answer ") || strings.HasPrefix(line, "Выберите вариант кнопкой ниже.") || strings.HasPrefix(line, "Ответьте через доступное действие в сообщении.") || strings.HasPrefix(line, "Напишите в этом треде: Ответ:") {
+			if len(options) == 0 {
+				line = "Напишите в этом треде: Ответ: ваш текст. Для отказа: Отказ: причина."
+			} else {
+				line = "Выберите вариант кнопкой ниже. Для отказа напишите в этом треде: Отказ: причина."
+			}
+		}
+		readable = append(readable, line)
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(readable, "\n")
 }
 
 func humanQuestionBlocks(message, requestID string, options []swarm.HumanOption, closed bool) []map[string]any {

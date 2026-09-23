@@ -25,6 +25,7 @@ type HumanStore interface {
 	AdvanceSlackWatermark(context.Context, string, string) error
 	SetRecoveryBarrier(context.Context, string, string) error
 	RecordHumanAnswer(context.Context, swarm.HumanAnswerInput) (string, bool, error)
+	BindContextualHumanAnswer(context.Context, swarm.SlackSource, string, string) (string, error)
 	PublishedHumanQuestion(context.Context, string, string) (string, string, error)
 }
 
@@ -165,17 +166,31 @@ func (h *humanIngress) syncQuestionMessages(ctx context.Context) error {
 }
 
 func canonicalDecisionSummary(projection swarm.HumanProjection, options []swarm.HumanOption) string {
-	if projection.BackendState != "answered" {
+	if projection.BackendState != "answered" && projection.BackendState != "denied" {
 		return ""
 	}
 	var view struct {
 		Terminal *struct {
+			Kind     string `json:"kind"`
 			Response struct {
 				OptionID *string `json:"option_id"`
+				Text     string  `json:"text"`
 			} `json:"response"`
 		} `json:"terminal"`
 	}
-	if json.Unmarshal(projection.View, &view) != nil || view.Terminal == nil || view.Terminal.Response.OptionID == nil {
+	if json.Unmarshal(projection.View, &view) != nil || view.Terminal == nil {
+		return ""
+	}
+	if projection.BackendState == "denied" && view.Terminal.Kind == "deny" && strings.TrimSpace(view.Terminal.Response.Text) != "" {
+		return "Отказ с причиной записан."
+	}
+	if projection.BackendState != "answered" || view.Terminal.Kind != "answer" {
+		return ""
+	}
+	if view.Terminal.Response.OptionID == nil {
+		if strings.TrimSpace(view.Terminal.Response.Text) != "" {
+			return "Ответ свободным текстом записан."
+		}
 		return ""
 	}
 	for _, option := range options {
@@ -423,6 +438,7 @@ func (h *humanIngress) processStops(ctx context.Context, featureID string) error
 
 func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, recovering bool) error {
 	text := strings.TrimSpace(in.Text)
+	contextKind, contextText, contextual := parseContextualAnswer(text)
 	switch {
 	case in.SourceKind == "block_action":
 		answer := swarm.HumanAnswerInput{RequestID: in.RequestID, Kind: "answer", OptionID: in.OptionID, WorkspaceID: in.WorkspaceID, ChannelID: in.ChannelID, ThreadTS: in.ThreadTS, MessageTS: in.MessageTS, ActorID: in.ActorID}
@@ -489,6 +505,36 @@ func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, rec
 		if err := h.notice(ctx, in, "Ответ сохранён локально. Ожидаем подтверждение решения в Spexus; затем оркестратор продолжит связанную работу."); err != nil {
 			return err
 		}
+	case contextual:
+		if contextText == "" {
+			return h.contextualRejection(ctx, in, "Напишите текст после «Ответ:» или причину после «Отказ:».")
+		}
+		requestID, err := h.store.BindContextualHumanAnswer(ctx, in, contextKind, contextText)
+		if err != nil {
+			var api *swarm.APIError
+			if !errors.As(err, &api) || api.Status >= 500 {
+				return err
+			}
+			return h.contextualRejection(ctx, in, contextualErrorText(api.Code))
+		}
+		answer := swarm.HumanAnswerInput{RequestID: requestID, Kind: contextKind, Text: contextText, WorkspaceID: in.WorkspaceID, ChannelID: in.ChannelID, ThreadTS: in.ThreadTS, MessageTS: in.MessageTS, ActorID: in.ActorID}
+		if _, _, err := h.store.RecordHumanAnswer(ctx, answer); err != nil {
+			var api *swarm.APIError
+			if errors.As(err, &api) && api.Code == "request_not_waiting" {
+				return err
+			}
+			if !errors.As(err, &api) || api.Status >= 500 {
+				return err
+			}
+			return h.contextualRejection(ctx, in, contextualErrorText(api.Code))
+		}
+		notice := "Ответ принят. Сохраняю решение в Spexus; связанная работа продолжится после подтверждения."
+		if contextKind == "deny" {
+			notice = "Отказ принят. Сохраняю его в Spexus; зависимая работа не будет продолжена."
+		}
+		if err := h.notice(ctx, in, notice); err != nil {
+			return err
+		}
 	default:
 		_, _, err := h.store.Ingest(ctx, in.FeatureID, swarm.InputPayload{Text: in.Text, Source: swarm.Source{Kind: "slack", EventID: "slack:" + in.ChannelID + ":" + in.MessageTS, ChannelID: in.ChannelID, ThreadTS: in.ThreadTS, ActorID: in.ActorID}})
 		if err != nil {
@@ -498,6 +544,43 @@ func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, rec
 			}
 			return h.rejection(ctx, in, err)
 		}
+	}
+	return h.store.SettleSlackSource(ctx, in)
+}
+
+// Only an explicit, short prefix can consume a normal Slack message as a
+// human decision; all other thread messages remain owner input.
+func parseContextualAnswer(text string) (kind, body string, recognized bool) {
+	prefix, rest, ok := strings.Cut(strings.TrimSpace(text), ":")
+	if !ok {
+		return "", "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(prefix)) {
+	case "ответ", "answer":
+		return "answer", strings.TrimSpace(rest), true
+	case "отказ", "deny":
+		return "deny", strings.TrimSpace(rest), true
+	default:
+		return "", "", false
+	}
+}
+
+func contextualErrorText(code string) string {
+	switch code {
+	case "no_open_human_request", "request_closed", "request_not_waiting":
+		return "Сейчас нет опубликованного вопроса, который ждёт этот ответ. Проверьте состояние через !status."
+	case "ambiguous_human_request":
+		return "В треде ждут ответа несколько вопросов. Короткая реплика неоднозначна; используйте техническую команду с ID нужного вопроса из его деталей."
+	case "option_button_required", "invalid_option":
+		return "Для этого вопроса выберите вариант кнопкой под ним. Отказ можно написать как «Отказ: причина»."
+	default:
+		return "Ответ не принят: " + code + ". Проверьте состояние через !status."
+	}
+}
+
+func (h *humanIngress) contextualRejection(ctx context.Context, in swarm.SlackSource, text string) error {
+	if err := h.notice(ctx, in, text); err != nil {
+		return err
 	}
 	return h.store.SettleSlackSource(ctx, in)
 }

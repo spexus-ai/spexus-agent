@@ -49,6 +49,9 @@ func TestHumanQuestionButtonsAndTerminalUpdate(t *testing.T) {
 		t.Fatalf("calls=%d", len(posts))
 	}
 	for i, post := range posts {
+		if strings.Contains(post["text"].(string), requestID) {
+			t.Fatalf("question displayed technical request ID: %#v", post)
+		}
 		if i != 0 && (post["method"] != "/chat.update" || post["ts"] != d.SlackTS) {
 			t.Fatalf("update did not target original question: %#v", post)
 		}
@@ -92,12 +95,39 @@ func TestHumanQuestionButtonsAndTerminalUpdate(t *testing.T) {
 	}
 }
 
+func TestFreeTextQuestionShowsShortReplyAndDenyWithoutUUID(t *testing.T) {
+	var posted map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+			t.Error(err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": "9.000001"})
+	}))
+	defer server.Close()
+	a := NewAPI("test")
+	a.BaseURL, a.Client = server.URL+"/", server.Client()
+	id := "123e4567-e89b-42d3-a456-426614174000"
+	d := swarm.SlackDelivery{ID: id, ChannelID: "C", ThreadTS: "1.000001", Text: "Решение человека требуется.\nЗапрос: " + id + "\nВопрос: Что делать?\nОтвет: !answer " + id + " text <ответ>", Question: &swarm.HumanQuestion{Options: []swarm.HumanOption{}}}
+	if _, err := a.Post(context.Background(), d); err != nil {
+		t.Fatal(err)
+	}
+	text := posted["text"].(string)
+	if strings.Contains(text, id) || strings.Contains(text, "!answer") || !strings.Contains(text, "Ответ: ваш текст") || !strings.Contains(text, "Отказ: причина") {
+		t.Fatalf("free-text question is not human-readable: %q", text)
+	}
+	for _, raw := range posted["blocks"].([]any) {
+		if raw.(map[string]any)["type"] == "actions" {
+			t.Fatalf("free-text question unexpectedly offered option buttons: %#v", raw)
+		}
+	}
+}
+
 // Test: the visible choice is derived only from the canonical provider view,
 // never from the clicked button value before Spexus records its terminal.
 // Validates: AC-464 (REQ-391 - authoritative decision readback).
 func TestCanonicalDecisionSummary(t *testing.T) {
 	options := []swarm.HumanOption{{ID: "short", Label: "Коротко"}}
-	p := swarm.HumanProjection{BackendState: "answered", View: json.RawMessage(`{"terminal":{"response":{"kind":"answer","option_id":"short","text":""}}}`)}
+	p := swarm.HumanProjection{BackendState: "answered", View: json.RawMessage(`{"terminal":{"kind":"answer","response":{"kind":"answer","option_id":"short","text":""}}}`)}
 	if got := canonicalDecisionSummary(p, options); got != "Выбран вариант: Коротко." {
 		t.Fatalf("summary=%q", got)
 	}
@@ -106,8 +136,17 @@ func TestCanonicalDecisionSummary(t *testing.T) {
 		t.Fatalf("open request summary=%q", got)
 	}
 	p.BackendState = "answered"
-	p.View = json.RawMessage(`{"terminal":{"response":{"option_id":"forged"}}}`)
+	p.View = json.RawMessage(`{"terminal":{"kind":"answer","response":{"option_id":"forged"}}}`)
 	if got := canonicalDecisionSummary(p, options); got != "" {
 		t.Fatalf("unknown option summary=%q", got)
+	}
+	p.View = json.RawMessage(`{"terminal":{"kind":"answer","response":{"option_id":null,"text":"Подробный ответ"}}}`)
+	if got := canonicalDecisionSummary(p, nil); got != "Ответ свободным текстом записан." {
+		t.Fatalf("free-text summary=%q", got)
+	}
+	p.BackendState = "denied"
+	p.View = json.RawMessage(`{"terminal":{"kind":"deny","response":{"option_id":null,"text":"Нет полномочий"}}}`)
+	if got := canonicalDecisionSummary(p, nil); got != "Отказ с причиной записан." {
+		t.Fatalf("deny summary=%q", got)
 	}
 }

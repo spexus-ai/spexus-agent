@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS slack_catchup (feature_id TEXT PRIMARY KEY REFERENCES
 CREATE TABLE IF NOT EXISTS recovery_barriers (feature_id TEXT PRIMARY KEY REFERENCES features(id),reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS human_gateway_writer (id INTEGER PRIMARY KEY CHECK(id=1),writer_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS owner_redeliveries (failed_turn_id TEXT PRIMARY KEY REFERENCES owner_turns(id),feature_id TEXT NOT NULL REFERENCES features(id),original_seq INTEGER NOT NULL,result_message_id TEXT NOT NULL,review_message_id TEXT NOT NULL,new_seq INTEGER NOT NULL,actor TEXT NOT NULL,reason TEXT NOT NULL,at TEXT NOT NULL,UNIQUE(feature_id,new_seq));
+CREATE TABLE IF NOT EXISTS contextual_human_bindings (workspace_id TEXT NOT NULL,channel_id TEXT NOT NULL,message_ts TEXT NOT NULL,feature_id TEXT NOT NULL REFERENCES features(id),request_id TEXT NOT NULL REFERENCES human_projections(request_id),actor_id TEXT NOT NULL,kind TEXT NOT NULL,text_sha256 TEXT NOT NULL,bound_at TEXT NOT NULL,PRIMARY KEY(workspace_id,channel_id,message_ts));
 `
 
 func Open(ctx context.Context, path string, cfg Config) (*Store, error) {
