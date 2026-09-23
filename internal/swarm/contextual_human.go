@@ -46,17 +46,17 @@ func (s *Store) BindContextualHumanAnswer(ctx context.Context, in SlackSource, k
 		if f.Stopped || f.ChannelID != in.ChannelID || f.ThreadTS != in.ThreadTS || !allowedActor(f, in.ActorID) {
 			return wireError(403, "untrusted_contextual_answer")
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT p.request_id,p.data,o.data,d.data,s.selector FROM human_projections p JOIN dependencies d ON d.id=p.dependency_id JOIN slack_outbox o ON o.id=p.request_id JOIN human_request_selectors s ON s.request_id=p.request_id AND s.feature_id=d.feature_id WHERE d.feature_id=? AND d.state='human_waiting' AND p.state='open' AND o.feature_id=? AND o.status='sent'`, in.FeatureID, in.FeatureID)
+		rows, err := tx.QueryContext(ctx, `SELECT p.request_id,p.state,p.data,o.data,d.data,s.selector FROM human_projections p JOIN dependencies d ON d.id=p.dependency_id JOIN slack_outbox o ON o.id=p.request_id JOIN human_request_selectors s ON s.request_id=p.request_id AND s.feature_id=d.feature_id WHERE d.feature_id=? AND o.feature_id=? AND o.status='sent'`, in.FeatureID, in.FeatureID)
 		if err != nil {
 			return err
 		}
 		count := 0
 		var selected HumanProjection
 		for rows.Next() {
-			var id string
+			var id, projectionState string
 			var projectionRaw, questionRaw, dependencyRaw []byte
 			var questionSelector int
-			if err = rows.Scan(&id, &projectionRaw, &questionRaw, &dependencyRaw, &questionSelector); err != nil {
+			if err = rows.Scan(&id, &projectionState, &projectionRaw, &questionRaw, &dependencyRaw, &questionSelector); err != nil {
 				rows.Close()
 				return err
 			}
@@ -75,11 +75,14 @@ func (s *Store) BindContextualHumanAnswer(ctx context.Context, in SlackSource, k
 				rows.Close()
 				return err
 			}
-			if p.RequestID != id || d.RequestID != id || q.ID != id || q.ShortSelector != questionSelector || q.ChannelID != f.ChannelID || q.ThreadTS != f.ThreadTS || !validSlackTS(q.SlackTS) || slackTSCompare(in.MessageTS, q.SlackTS) <= 0 {
+			if p.RequestID != id || p.BackendState != projectionState || d.RequestID != id || q.ID != id || q.ShortSelector != questionSelector || q.ChannelID != f.ChannelID || q.ThreadTS != f.ThreadTS || !validSlackTS(q.SlackTS) || slackTSCompare(in.MessageTS, q.SlackTS) <= 0 {
 				continue
 			}
-			count++
-			if selector == 0 || selector == questionSelector {
+			open := p.BackendState == "open" && d.State == "human_waiting"
+			if open {
+				count++
+			}
+			if (selector == 0 && open) || (selector != 0 && selector == questionSelector && (open || p.BackendState == "answered" || p.BackendState == "denied" || p.BackendState == "cancelled")) {
 				selected = p
 			}
 		}
@@ -88,7 +91,7 @@ func (s *Store) BindContextualHumanAnswer(ctx context.Context, in SlackSource, k
 			return err
 		}
 		rows.Close()
-		if count == 0 {
+		if selector == 0 && count == 0 {
 			return wireError(409, "no_open_human_request")
 		}
 		if selector == 0 && count != 1 {
@@ -101,7 +104,10 @@ func (s *Store) BindContextualHumanAnswer(ctx context.Context, in SlackSource, k
 		if err = json.Unmarshal(selected.View, &view); err != nil {
 			return err
 		}
-		if view.ID != selected.RequestID || view.Slack.WorkspaceID != in.WorkspaceID || view.Slack.ChannelID != in.ChannelID || view.Slack.ThreadTS != in.ThreadTS {
+		if view.ID != selected.RequestID || view.State != selected.BackendState || view.Revision != selected.Revision || view.Slack.WorkspaceID != in.WorkspaceID || view.Slack.ChannelID != in.ChannelID || view.Slack.ThreadTS != in.ThreadTS {
+			return wireError(409, "request_source_mismatch")
+		}
+		if selected.BackendState != "open" && (view.Terminal == nil || !uuid(view.Terminal.ID)) {
 			return wireError(409, "request_source_mismatch")
 		}
 		actorAllowed := false
@@ -111,7 +117,7 @@ func (s *Store) BindContextualHumanAnswer(ctx context.Context, in SlackSource, k
 		if !actorAllowed {
 			return wireError(403, "untrusted_contextual_answer")
 		}
-		if kind == "answer" && len(view.Options) != 0 {
+		if kind == "answer" && len(view.Options) != 0 && selected.BackendState == "open" {
 			return wireError(409, "option_button_required")
 		}
 		requestID = selected.RequestID

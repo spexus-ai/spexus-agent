@@ -92,6 +92,9 @@ func TestHumanQuestionButtonsAndTerminalUpdate(t *testing.T) {
 		if i == 3 && !strings.Contains(post["text"].(string), "Выбран вариант: Коротко.") {
 			t.Fatal("canonical result not shown")
 		}
+		if i >= 2 && (strings.Contains(post["text"].(string), "Выберите вариант кнопкой") || strings.Contains(post["text"].(string), "Напишите в этом треде")) {
+			t.Fatalf("closed question still invites an answer: %#v", post)
+		}
 	}
 }
 
@@ -119,6 +122,38 @@ func TestFreeTextQuestionShowsShortReplyAndDenyWithoutUUID(t *testing.T) {
 		if raw.(map[string]any)["type"] == "actions" {
 			t.Fatalf("free-text question unexpectedly offered option buttons: %#v", raw)
 		}
+	}
+}
+
+func TestHumanQuestionPendingAndAttentionAreInPlaceWithoutFalseSuccess(t *testing.T) {
+	var posts []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		posts = append(posts, payload)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer server.Close()
+	a := NewAPI("test")
+	a.BaseURL, a.Client = server.URL+"/", server.Client()
+	d := swarm.SlackDelivery{ID: swarm.NewID(), ChannelID: "C", ThreadTS: "1.000001", SlackTS: "9.000001", Status: "sent", ShortSelector: 2, Text: "Вопрос: Как поступить?\nОтвет: !answer 00000000-0000-0000-0000-000000000000 text <ответ>", Question: &swarm.HumanQuestion{}}
+	for _, state := range []string{"pending", "attention"} {
+		if err := a.UpdateHumanQuestion(context.Background(), d, nil, state, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(posts) != 2 {
+		t.Fatalf("updates=%d", len(posts))
+	}
+	for _, post := range posts {
+		if post["ts"] != d.SlackTS || strings.Contains(post["text"].(string), "Решение записано") || strings.Contains(post["text"].(string), "Напишите в этом треде") {
+			t.Fatalf("false terminal or wrong message: %#v", post)
+		}
+	}
+	if !strings.Contains(posts[0]["text"].(string), "решение пока не подтверждено") || !strings.Contains(posts[1]["text"].(string), "не удалось подтвердить") {
+		t.Fatalf("pending/error stages unclear: %#v", posts)
 	}
 }
 

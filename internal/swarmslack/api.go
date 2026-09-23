@@ -248,7 +248,7 @@ func (a *API) Post(ctx context.Context, d swarm.SlackDelivery) (string, error) {
 	}
 	payload := map[string]any{"channel": d.ChannelID, "thread_ts": d.ThreadTS, "text": d.Text, "client_msg_id": d.ID, "metadata": map[string]any{"event_type": "spexus_swarm_reply", "event_payload": map[string]string{"delivery_id": d.ID, "turn_id": d.TurnID}}}
 	if d.Question != nil {
-		message := humanReadableQuestionText(d.Text, d.Question.Options, d.ShortSelector)
+		message := humanReadableQuestionText(d.Text, d.Question.Options, d.ShortSelector, true)
 		payload["text"] = message
 		payload["blocks"] = humanQuestionBlocks(message, d.ID, d.Question.Options, false)
 	}
@@ -271,9 +271,13 @@ func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, op
 	if d.Status != "sent" || !validTimestamp(d.SlackTS) {
 		return errors.New("human question has no published Slack message")
 	}
-	message := humanReadableQuestionText(d.Text, options, d.ShortSelector)
+	message := humanReadableQuestionText(d.Text, options, d.ShortSelector, state == "open")
 	switch state {
 	case "open":
+	case "pending":
+		message += "\nОтвет получен. Проверяю запись в Spexus; решение пока не подтверждено."
+	case "attention":
+		message += "\nОтвет не удалось подтвердить в Spexus. Работа ждёт проверки; посмотрите !status."
 	case "stopped":
 		message += "\nРабота остановлена. Ответы сейчас недоступны."
 	case "cancelled":
@@ -299,7 +303,7 @@ func (a *API) UpdateHumanQuestion(ctx context.Context, d swarm.SlackDelivery, op
 	return nil
 }
 
-func humanReadableQuestionText(message string, options []swarm.HumanOption, selector int) string {
+func humanReadableQuestionText(message string, options []swarm.HumanOption, selector int, actionable bool) string {
 	lines := strings.Split(message, "\n")
 	readable := make([]string, 0, len(lines))
 	for _, line := range lines {
@@ -307,6 +311,9 @@ func humanReadableQuestionText(message string, options []swarm.HumanOption, sele
 			continue // Correlation stays in the button value and durable history.
 		}
 		if strings.HasPrefix(line, "Ответ: !answer ") || strings.HasPrefix(line, "Выберите вариант кнопкой ниже.") || strings.HasPrefix(line, "Ответьте через доступное действие в сообщении.") || strings.HasPrefix(line, "Напишите в этом треде: Ответ:") {
+			if !actionable {
+				continue
+			}
 			number := ""
 			if selector > 0 {
 				number = fmt.Sprintf(" #%d", selector)

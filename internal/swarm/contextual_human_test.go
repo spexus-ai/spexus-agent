@@ -177,6 +177,56 @@ func TestHumanSelectorsDisambiguateAndNeverReuse(t *testing.T) {
 	}
 }
 
+func TestNewReplyToClosedSelectorBindsCanonicalRequestWithoutNewDecision(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	_ = publishedHumanRequest(t, f, nil, "sent")
+	closed := publishedHumanRequest(t, f, []HumanOption{{ID: "no", Label: "Нет"}}, "sent")
+	if err := f.s.transaction(ctx, func(tx *sql.Tx) error {
+		var raw []byte
+		if err := tx.QueryRowContext(ctx, `SELECT data FROM human_projections WHERE request_id=?`, closed).Scan(&raw); err != nil {
+			return err
+		}
+		var p HumanProjection
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		p.BackendState = "answered"
+		p.Revision = 2
+		var view humanBackendView
+		if err := json.Unmarshal(p.View, &view); err != nil {
+			return err
+		}
+		view.State = "answered"
+		view.Revision = 2
+		view.Terminal = &struct {
+			ID       string          `json:"id"`
+			Kind     string          `json:"kind"`
+			Response json.RawMessage `json:"response"`
+			Source   json.RawMessage `json:"source"`
+		}{ID: NewID(), Kind: "answer", Response: json.RawMessage(`{"option_id":"no"}`), Source: json.RawMessage(`{"actor_id":"human"}`)}
+		p.View = mustJSON(view)
+		if _, err := tx.ExecContext(ctx, `UPDATE human_projections SET state='answered',revision=2,data=? WHERE request_id=?`, mustJSON(p), closed); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	in := contextualSlackSource(f, "124.000006", "ответ 2: отказ потому что не хочу")
+	if _, err := f.s.CommitSlackSource(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.s.BindContextualHumanAnswer(ctx, in, "deny", 2, "потому что не хочу")
+	if err != nil || got != closed {
+		t.Fatalf("closed selector bound=%q err=%v", got, err)
+	}
+	var count int
+	if err := f.s.db.QueryRowContext(ctx, `SELECT count(*) FROM backend_sync_operations WHERE request_id=? AND kind='decision'`, closed).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("closed selector enqueued decision count=%d err=%v", count, err)
+	}
+}
+
 func TestSelectorBackfillAndBoundReplayAfterRevocation(t *testing.T) {
 	f := newHumanFixture(t)
 	ctx := context.Background()
@@ -218,9 +268,12 @@ func TestSelectorBackfillAndBoundReplayAfterRevocation(t *testing.T) {
 			t.Fatalf("backfill question %d: %+v err=%v", i, q, err)
 		}
 	}
-	in := contextualSlackSource(f, "124.000005", "Отказ #2: недостаточно данных")
+	in := contextualSlackSource(f, "124.000005", "Отказ 2: недостаточно данных")
 	if _, err := f.s.CommitSlackSource(ctx, in); err != nil {
 		t.Fatal(err)
+	}
+	if duplicate, err := f.s.CommitSlackSource(ctx, in); err != nil || !duplicate {
+		t.Fatalf("source redelivery duplicate=%t err=%v", duplicate, err)
 	}
 	if got, err := f.s.BindContextualHumanAnswer(ctx, in, "deny", 2, "недостаточно данных"); err != nil || got != second {
 		t.Fatalf("bind=%q err=%v", got, err)
