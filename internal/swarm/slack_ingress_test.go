@@ -129,6 +129,19 @@ func TestDetailsControlRequiresActiveQuestionAndDedupsAfterClose(t *testing.T) {
 	}
 }
 
+func TestStopDoesNotPublishTechnicalCancellationNotice(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	_ = publishedHumanRequest(t, f, nil, "sent")
+	if err := f.s.StopFeature(ctx, f.feature.FeatureID, "human", "Slack stop control"); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := f.s.db.QueryRowContext(ctx, "SELECT count(*) FROM slack_outbox WHERE feature_id=?", f.feature.FeatureID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("stop published a duplicate or technical notice: count=%d err=%v", count, err)
+	}
+}
+
 // Test: a valid but oversized request is rejected before backend create, so
 // Slack cannot truncate the decision options or answer syntax.
 // Validates: AC-464 (REQ-391 - complete human question and response options).

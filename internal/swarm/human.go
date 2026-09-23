@@ -326,16 +326,6 @@ func (s *Store) cancelDependencies(ctx context.Context, tx *sql.Tx, featureID, a
 						return err
 					}
 				}
-				if question.Status == "sent" || question.Status == "sending" || question.Status == "delivery_unknown" {
-					f, featureErr := feature(ctx, tx, d.FeatureID)
-					if featureErr != nil {
-						return featureErr
-					}
-					notice := SlackDelivery{ID: NewID(), FeatureID: d.FeatureID, ChannelID: f.ChannelID, ThreadTS: f.ThreadTS, Text: "Запрос " + d.RequestID + " отменён. Ответы по нему больше не продолжат работу.", Status: "queued"}
-					if _, err = tx.ExecContext(ctx, "INSERT INTO slack_outbox(id,feature_id,turn_id,status,data) VALUES(?,?,NULL,?,?)", notice.ID, notice.FeatureID, notice.Status, mustJSON(notice)); err != nil {
-						return err
-					}
-				}
 			} else if !errors.Is(queryErr, sql.ErrNoRows) {
 				return queryErr
 			}
