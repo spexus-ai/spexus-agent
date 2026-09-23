@@ -381,6 +381,47 @@ func TestGatewayRefreshUnknownFailsClosed(t *testing.T) {
 		t.Fatal("unknown refresh was retried")
 	}
 }
+
+func TestHumanRetryAfter(t *testing.T) {
+	f := newHumanFixture(t)
+	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "17")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer provider.Close()
+	ca := filepath.Join(t.TempDir(), "provider.pem")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: provider.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.s.cfg.Human.BaseURL = provider.URL
+	f.s.cfg.Human.CAFile = ca
+	if err := writeGatewayToken(f.s.cfg.Human.TokenFile, gatewayToken{Token: testJWT(f.s.cfg.Human.WriterID)}); err != nil {
+		t.Fatal(err)
+	}
+	client, err := f.s.backendClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := humanOperation{ID: NewID(), RequestID: NewID(), Kind: "create", Payload: []byte("{}")}
+	if _, err = f.s.db.Exec("INSERT INTO backend_sync_operations(operation_id,request_id,kind,status,payload) VALUES(?,?,?,?,?)", op.ID, op.RequestID, op.Kind, "inflight", op.Payload); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now()
+	if err = f.s.syncHumanOperation(context.Background(), client, op); err != nil {
+		t.Fatal(err)
+	}
+	var status, next string
+	if err = f.s.db.QueryRow("SELECT status,next_at FROM backend_sync_operations WHERE operation_id=?", op.ID).Scan(&status, &next); err != nil {
+		t.Fatal(err)
+	}
+	readyAt, err := time.Parse(time.RFC3339Nano, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "retry" || readyAt.Before(before.Add(17*time.Second)) {
+		t.Fatalf("Retry-After ignored: status=%s next=%s", status, next)
+	}
+}
 func testJWT(writer string) string {
 	return "e30." + base64.RawURLEncoding.EncodeToString(mustJSON(map[string]string{"user_id": writer})) + ".signature"
 }

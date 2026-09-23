@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -190,6 +191,7 @@ type humanOperation struct {
 	ID, RequestID, Kind, Status string
 	Attempts                    int
 	Payload                     []byte
+	RetryAfter                  time.Duration
 }
 type gatewayToken struct {
 	Token        string `json:"token"`
@@ -334,20 +336,40 @@ func (s *Store) refreshGateway(ctx context.Context, c *http.Client, t gatewayTok
 	return writeGatewayToken(path, gatewayToken{Token: next.Token, RefreshToken: next.RefreshToken})
 }
 func (s *Store) backendRequest(ctx context.Context, c *http.Client, method, path string, payload []byte) (int, []byte, error) {
+	status, body, _, err := s.backendRequestWithRetryAfter(ctx, c, method, path, payload)
+	return status, body, err
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds > 0 {
+		const maxSeconds = int64(1<<63-1) / int64(time.Second)
+		if seconds > maxSeconds {
+			return time.Duration(1<<63 - 1)
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
+}
+
+func (s *Store) backendRequestWithRetryAfter(ctx context.Context, c *http.Client, method, path string, payload []byte) (int, []byte, time.Duration, error) {
 	t, err := readGatewayToken(s.cfg.Human.TokenFile)
 	if err != nil {
-		return 0, nil, fmt.Errorf("%w: credential unavailable", errGatewayAuth)
+		return 0, nil, 0, fmt.Errorf("%w: credential unavailable", errGatewayAuth)
 	}
 	if t.RefreshState != "" {
-		return 0, nil, fmt.Errorf("%w: refresh outcome unknown; reprovision same writer", errGatewayAuth)
+		return 0, nil, 0, fmt.Errorf("%w: refresh outcome unknown; reprovision same writer", errGatewayAuth)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if jwtWriter(t.Token) != s.cfg.Human.WriterID {
-			return 0, nil, fmt.Errorf("%w: credential writer mismatch", errGatewayAuth)
+			return 0, nil, 0, fmt.Errorf("%w: credential writer mismatch", errGatewayAuth)
 		}
 		req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(s.cfg.Human.BaseURL, "/")+path, bytes.NewReader(payload))
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, 0, err
 		}
 		req.Header.Set("Authorization", "Bearer "+t.Token)
 		req.Header.Set("X-Tenant-ID", s.cfg.TenantID)
@@ -357,29 +379,30 @@ func (s *Store) backendRequest(ctx context.Context, c *http.Client, method, path
 		}
 		resp, err := c.Do(req)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, 0, err
 		}
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), s.now())
 		b, readErr := io.ReadAll(io.LimitReader(resp.Body, MaxEnvelopeBytes+1))
 		resp.Body.Close()
 		if readErr != nil {
-			return 0, nil, readErr
+			return 0, nil, 0, readErr
 		}
 		if len(b) > MaxEnvelopeBytes {
-			return 0, nil, errors.New("backend response too large")
+			return 0, nil, 0, errors.New("backend response too large")
 		}
 		if resp.StatusCode == 401 && attempt == 0 {
 			if err = s.refreshGateway(ctx, c, t); err != nil {
-				return 0, nil, err
+				return 0, nil, 0, err
 			}
 			t, err = readGatewayToken(s.cfg.Human.TokenFile)
 			if err != nil {
-				return 0, nil, err
+				return 0, nil, 0, err
 			}
 			continue
 		}
-		return resp.StatusCode, b, nil
+		return resp.StatusCode, b, retryAfter, nil
 	}
-	return 0, nil, errGatewayAuth
+	return 0, nil, 0, errGatewayAuth
 }
 func (s *Store) HumanPreflight(ctx context.Context) error {
 	if s.cfg.Human == nil {
@@ -448,6 +471,9 @@ func (s *Store) settleHumanOperation(ctx context.Context, op humanOperation, sta
 				delay = 30 * time.Second
 			}
 			delay += time.Duration(rand.Int63n(int64(time.Second)))
+			if op.RetryAfter > delay {
+				delay = op.RetryAfter
+			}
 			next = s.now().Add(delay).UTC().Format(time.RFC3339Nano)
 		}
 		_, err := tx.ExecContext(ctx, "UPDATE backend_sync_operations SET status=?,attempts=?,next_at=?,reason=? WHERE operation_id=?", status, attempts, next, reason, op.ID)
@@ -470,7 +496,8 @@ func (s *Store) syncHumanOperation(ctx context.Context, client *http.Client, op 
 	default:
 		return errors.New("unknown backend operation")
 	}
-	status, b, err := s.backendRequest(ctx, client, method, path, op.Payload)
+	status, b, retryAfter, err := s.backendRequestWithRetryAfter(ctx, client, method, path, op.Payload)
+	op.RetryAfter = retryAfter
 	if err != nil {
 		if errors.Is(err, errGatewayAuth) {
 			return s.settleHumanOperation(ctx, op, "blocked", "auth_blocked")
