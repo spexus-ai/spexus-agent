@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -131,19 +132,24 @@ func TestHumanActualProviderContract(t *testing.T) {
 	}
 	read(createOp.RequestID, "open")
 
-	decisionID := NewID()
-	decisionBody := mustJSON(map[string]any{
-		"operation_id": decisionID, "expected_revision": 1,
-		"decision":    map[string]any{"kind": "answer", "option_id": "a", "text": "Approved"},
-		"source":      map[string]any{"workspace_id": workspace, "channel_id": channel, "thread_ts": thread, "message_ts": "1790000001.000002", "actor_id": actor, "event_id": nil},
-		"received_at": s.stamp(),
-	})
-	decisionOp := humanOperation{ID: decisionID, RequestID: createOp.RequestID, Kind: "decision", Payload: decisionBody}
+	messageTS := fmt.Sprintf("%d.%06d", time.Now().Unix(), time.Now().Nanosecond()/1000)
+	decisionID, duplicate, err := s.RecordHumanAnswer(ctx, HumanAnswerInput{RequestID: createOp.RequestID, Kind: "answer", OptionID: "a", Text: "Approved", WorkspaceID: workspace, ChannelID: channel, ThreadTS: thread, MessageTS: messageTS, ActorID: actor, EventID: NewID()})
+	if err != nil || duplicate || decisionID == "" {
+		t.Fatalf("recorded answer: duplicate=%v err=%v", duplicate, err)
+	}
+	decisionOp, err := s.claimHumanOperation(ctx)
+	if err != nil || decisionOp.ID != decisionID || decisionOp.Kind != "decision" {
+		t.Fatalf("durable decision operation: id=%s err=%v", decisionOp.ID, err)
+	}
 	if err = s.syncHumanOperation(ctx, client, decisionOp); err != nil {
 		t.Fatal(err)
 	}
-	if code, _, err := s.backendRequest(ctx, client, http.MethodPost, "/api/v1/human-requests/"+createOp.RequestID+"/decision", decisionBody); err != nil || code != 200 {
-		t.Fatalf("exact decision replay: HTTP %d: %v", code, err)
+	var reason string
+	if err = s.db.QueryRowContext(ctx, "SELECT status,reason FROM backend_sync_operations WHERE operation_id=?", decisionOp.ID).Scan(&status, &reason); err != nil || status != "done" {
+		t.Fatalf("decision operation did not settle: status=%s reason=%s err=%v", status, reason, err)
+	}
+	if code, body, err := s.backendRequest(ctx, client, http.MethodPost, "/api/v1/human-requests/"+createOp.RequestID+"/decision", decisionOp.Payload); err != nil || code != 200 {
+		t.Fatalf("exact decision replay: HTTP %d body=%s err=%v", code, body, err)
 	}
 	read(createOp.RequestID, "answered")
 
@@ -152,12 +158,17 @@ func TestHumanActualProviderContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	read(cancelOp.RequestID, "open")
-	cancelID := NewID()
-	cancelBody := mustJSON(map[string]any{"operation_id": cancelID, "expected_revision": 1, "reason": "Fixture cancellation", "source": map[string]string{"kind": "runtime", "event_id": NewID(), "actor_id": "owner"}})
-	if code, _, err := s.backendRequest(ctx, client, http.MethodPost, "/api/v1/human-requests/"+cancelOp.RequestID+"/cancel", cancelBody); err != nil || code != 201 {
-		t.Fatalf("cancel: HTTP %d: %v", code, err)
+	if err = s.StopFeature(ctx, featureID, actor, "Fixture cancellation"); err != nil {
+		t.Fatal(err)
 	}
-	if code, _, err := s.backendRequest(ctx, client, http.MethodPost, "/api/v1/human-requests/"+cancelOp.RequestID+"/cancel", cancelBody); err != nil || code != 200 {
+	cancelOperation, err := s.claimHumanOperation(ctx)
+	if err != nil || cancelOperation.Kind != "cancel" || cancelOperation.RequestID != cancelOp.RequestID {
+		t.Fatalf("durable cancel operation: kind=%s err=%v", cancelOperation.Kind, err)
+	}
+	if err = s.syncHumanOperation(ctx, client, cancelOperation); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, err := s.backendRequest(ctx, client, http.MethodPost, "/api/v1/human-requests/"+cancelOp.RequestID+"/cancel", cancelOperation.Payload); err != nil || code != 200 {
 		t.Fatalf("exact cancel replay: HTTP %d: %v", code, err)
 	}
 	read(cancelOp.RequestID, "cancelled")
