@@ -18,6 +18,9 @@ import (
 type Model interface {
 	Run(context.Context, string, string) (string, bool, error)
 }
+type ActivityModel interface {
+	RunWithActivity(context.Context, string, string, func(string)) (string, bool, error)
+}
 type piModel struct {
 	adapter   harness.Adapter
 	workspace string
@@ -32,6 +35,9 @@ func newModel(c Config, p profile) (Model, error) {
 	return &piModel{a, c.Workspace}, nil
 }
 func (m *piModel) Run(ctx context.Context, key, input string) (string, bool, error) {
+	return m.RunWithActivity(ctx, key, input, nil)
+}
+func (m *piModel) RunWithActivity(ctx context.Context, key, input string, report func(string)) (string, bool, error) {
 	s, e := m.adapter.StartPrompt(ctx, harness.SessionRequest{ProjectPath: m.workspace, ChannelID: "swarm", ThreadTS: key, Prompt: input})
 	if e != nil {
 		return "", false, e
@@ -39,9 +45,25 @@ func (m *piModel) Run(ctx context.Context, key, input string) (string, bool, err
 	defer s.Close()
 	var final string
 	cancelled := false
+	lastPhase := ""
+	activity := func(phase string) {
+		if report != nil && phase != lastPhase {
+			lastPhase = phase
+			report(phase)
+		}
+	}
 	for event := range s.Events() {
 		switch event.Kind {
+		case harness.EventAssistantThinking:
+			activity("thinking")
+		case harness.EventToolStarted:
+			activity("tool")
+		case harness.EventToolFinished:
+			activity("thinking")
+		case harness.EventAssistantMessageChunk:
+			activity("responding")
 		case harness.EventAssistantMessageFinal:
+			activity("responding")
 			final = event.Text
 		case harness.EventSessionCancelled:
 			cancelled = true
@@ -357,6 +379,19 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 			}
 			m = r.envelope(d, "human.request", "coordinator", x, nil)
 			m.JobID, m.AttemptID = "", ""
+		case "decide_human":
+			if r.cfg.wireVersion() != 2 {
+				return o, nil, errors.New("human response requires wire v2")
+			}
+			var x swarm.HumanRespondPayload
+			if e := decode(a.Data, &x); e != nil {
+				return o, nil, e
+			}
+			if e := requiredKeys(a.Data, "request_id", "source_message_ts", "kind"); e != nil {
+				return o, nil, e
+			}
+			m = r.envelope(d, "human.respond", "coordinator", x, ptr(d.MessageID))
+			m.JobID, m.AttemptID = "", ""
 		case "resolve_dependency":
 			if r.cfg.wireVersion() != 2 {
 				return o, nil, errors.New("dependency resolution requires wire v2")
@@ -566,8 +601,10 @@ Dispatch data: {"worker_agent_id":"from available_workers","goal":"...","scope":
 	if r.cfg.wireVersion() == 2 {
 		prompt += `
 Wire v2 human requests: A worker's blocked result ends that attempt and frees its worker slot. Its job is gated by the dependency shown in the trusted event/job data. Choose either a justified self-resolution within existing policy (resolve_dependency) or request_human; permission, choice and external_action require a human. Do not poll while waiting; independent jobs may still be dispatched and reviewed. Never use ordinary dispatch to retry a blocked job, even after a human answer. A canonical human.decision event is the only human decision you may use; Slack text by itself is not a decision. The coordinator, not you, verifies the actor, source, revision, stop latch, and application status. A denied, cancelled or suppressed decision gives no continuation permission.
+Every authorized human message in the feature Slack thread arrives as agent.input. No answer prefix or question number is required. event.payload.source.message_ts identifies its trusted Slack source. event.payload.active_human_request, when present, is the one question displayed when that message arrived; event.payload.human_action, when present, is a button choice from that message. Consider all delivered messages in order. Decide whether each is a sufficient answer, a request for clarification, or unrelated work. If unclear, explain or ask one clarification while leaving the request open. Do not reinterpret a message as answering a question published after that message arrived. A leading ! is urgent input that takes priority and interrupts an active owner turn; follow it before buffered ordinary work, but do not assume it authorizes a human decision.
 New actions, each in the same {"kind":...,"data":{...}} format:
 - request_human for an existing blocked job: data {"dependency_id":"UUID from dependency.id","reason":"...","context":"...","question":"...","options":[{"id":"option-id","label":"..."}],"recommendation":"...","kind":"clarification|choice|permission|external_action|blocker"}. The question must explain the blocker, options, recommendation, and what work waits. For an owner-origin step instead of dependency_id use "step_key":"stable short ASCII key" and "blocked_work":"what waits" with the same blocker fields. Do not invent a dependency_id.
+- decide_human for a clear response to the displayed active question: data {"request_id":"UUID from event.payload.active_human_request.request_id","source_message_ts":"event.payload.source.message_ts","kind":"answer|deny","option_id":"option-id for a choice answer, otherwise omit","text":"free-text answer or denial reason"}. For a button, use only the option recorded in event.payload.human_action. Never invent a Slack source or actor. If the person says they do not understand the question, explain it and leave the request open rather than guessing a decision. This action only requests a canonical Spexus write; do not claim it succeeded until the runtime confirms it.
 - resolve_dependency: data {"dependency_id":"UUID from dependency.id","resolution":"reasoned resolution within existing policy","evidence":[]}. This is allowed only while dependency.state is owner_resolution and never for permission, choice or external_action. If the blocked job should continue after this self-resolution, put resolve_dependency followed immediately by resume_task for the same dependency in this one FINAL actions array; no extra owner turn is generated for self-resolution.
 - resume_task: data {"dependency_id":"UUID from dependency.id","decision_id":"UUID from answered human.decision, or omit for a recorded self-resolution","worker_agent_id":"from available_workers","dispatch":{...}}. The dispatch object has the same fields/profile as an ordinary dispatch and must explicitly carry the original task, blocker, decision or resolution, and necessary context. Use this only after the trusted dependency is resolved and human.decision.application_status is applied for a human request. The runtime assigns the new attempt ID and creates a fresh worker Pi session; do not invent IDs.
 - complete_step: data {"dependency_id":"UUID from dependency.id","decision_id":"UUID from answered human.decision","summary":"what was completed"}. Only for resolved owner_step, never a blocked job.

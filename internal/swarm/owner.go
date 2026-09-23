@@ -59,6 +59,19 @@ func (s *Store) startOwner(ctx context.Context, p Principal, r OwnerStartRequest
 		if e.FeatureID != r.FeatureID || superseded != 0 || e.Type != "agent.input" && e.Type != "task.result" && e.Type != "human.decision" {
 			return wireError(409, "invalid_trigger")
 		}
+		isUrgent := urgentEnvelope(e)
+		var urgentPending int
+		err = tx.QueryRowContext(ctx, `SELECT count(*) FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row
+				WHERE d.agent_id=? AND m.feature_id=? AND d.superseded=0 AND m.kind='agent.input'
+				AND substr(ltrim(json_extract(m.canonical,'$.payload.text')),1,1)='!'
+				AND (?=0 OR d.seq<?)
+				AND NOT EXISTS (SELECT 1 FROM owner_turns t WHERE t.agent_id=d.agent_id AND t.input_seq=d.seq)`, p.AgentID, r.FeatureID, boolToInt(isUrgent), r.InputMailboxSeq).Scan(&urgentPending)
+		if err != nil {
+			return err
+		}
+		if urgentPending != 0 {
+			return wireError(409, "urgent_input_pending")
+		}
 		var count int
 		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM owner_turns WHERE agent_id=? AND state='running'", p.AgentID).Scan(&count); err != nil {
 			return err
@@ -84,6 +97,19 @@ func (s *Store) startOwner(ctx context.Context, p Principal, r OwnerStartRequest
 	}
 	return out, duplicate, err
 }
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func urgentEnvelope(e Envelope) bool {
+	var input InputPayload
+	return e.Type == "agent.input" && json.Unmarshal(e.Payload, &input) == nil && urgentInput(input)
+}
+
 func (s *Store) ownerTurn(ctx context.Context, p Principal, id string) (OwnerTurn, error) {
 	var out OwnerTurn
 	err := s.transaction(ctx, func(tx *sql.Tx) error {

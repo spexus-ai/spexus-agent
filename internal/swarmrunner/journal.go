@@ -166,7 +166,8 @@ func (j *Journal) receive(d swarm.Delivery) error {
 }
 func (j *Journal) next() (swarm.Delivery, bool, error) {
 	var b []byte
-	e := j.db.QueryRow(`SELECT body FROM inbox WHERE state='received' AND type NOT IN ('task.cancel','turn.cancel') ORDER BY seq LIMIT 1`).Scan(&b)
+	e := j.db.QueryRow(`SELECT body FROM inbox WHERE state='received' AND type NOT IN ('task.cancel','turn.cancel')
+		ORDER BY CASE WHEN type='agent.input' AND substr(ltrim(json_extract(body,'$.payload.text')),1,1)='!' THEN 0 ELSE 1 END, seq LIMIT 1`).Scan(&b)
 	if e == sql.ErrNoRows {
 		return swarm.Delivery{}, false, nil
 	}

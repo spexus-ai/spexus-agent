@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -461,6 +462,14 @@ func (s *Store) enqueue(ctx context.Context, tx *sql.Tx, e Envelope) (Receipt, e
 	var r Receipt
 	lane := "normal"
 	special := e.Type == "task.result" || e.Type == "human.decision" || e.Type == "task.cancel" || e.Type == "turn.cancel"
+	urgent := false
+	if e.Type == "agent.input" {
+		var input InputPayload
+		if err := json.Unmarshal(e.Payload, &input); err != nil {
+			return r, err
+		}
+		urgent = urgentInput(input)
+	}
 	if e.Type == "task.cancel" || e.Type == "turn.cancel" {
 		lane = "control"
 	}
@@ -479,13 +488,20 @@ func (s *Store) enqueue(ctx context.Context, tx *sql.Tx, e Envelope) (Receipt, e
 	}
 	pending := 0
 	if count >= s.mailboxLimit || bytes+len(canon) > s.mailboxBytes {
-		if !special {
+		if urgent && count < s.mailboxLimit+s.mailboxReserve && bytes+len(canon) <= s.mailboxBytes+s.mailboxReserve*MaxEnvelopeBytes {
+			// An urgent owner input may use the reserved capacity, but must be
+			// immediately visible rather than a deferred notification.
+		} else if urgent {
 			return r, wireError(429, "mailbox_full")
-		}
-		// Reserved space permits terminal/control; beyond it notification remains durably queued
-		// with its final sequence, preserving normal-lane ordering without losing the outcome.
-		if count >= s.mailboxLimit+s.mailboxReserve || bytes+len(canon) > s.mailboxBytes+s.mailboxReserve*MaxEnvelopeBytes {
-			pending = 1
+		} else {
+			if !special {
+				return r, wireError(429, "mailbox_full")
+			}
+			// Reserved space permits terminal/control; beyond it notification remains durably queued
+			// with its final sequence, preserving normal-lane ordering without losing the outcome.
+			if count >= s.mailboxLimit+s.mailboxReserve || bytes+len(canon) > s.mailboxBytes+s.mailboxReserve*MaxEnvelopeBytes {
+				pending = 1
+			}
 		}
 	}
 	if _, err = tx.ExecContext(ctx, "INSERT INTO mailbox_counters(agent_id,seq) VALUES(?,1) ON CONFLICT(agent_id) DO UPDATE SET seq=seq+1", e.ToAgentID); err != nil {
@@ -546,6 +562,21 @@ func (s *Store) Ingest(ctx context.Context, featureID string, input InputPayload
 	})
 	return r, duplicate, err
 }
+
+func urgentInput(input InputPayload) bool {
+	return strings.HasPrefix(strings.TrimSpace(input.Text), "!")
+}
+
+// IngestUrgent retains the same immutable source and receipt as Ingest, but
+// rejects nonurgent content. The immutable input text determines mailbox
+// priority, so replay cannot silently change an event's priority.
+func (s *Store) IngestUrgent(ctx context.Context, featureID string, input InputPayload) (Receipt, bool, error) {
+	if !urgentInput(input) {
+		return Receipt{}, false, wireError(400, "not_urgent_input")
+	}
+	return s.Ingest(ctx, featureID, input)
+}
+
 func (s *Store) mailbox(ctx context.Context, p Principal, lane string, limit int) (MailboxResponse, error) {
 	out := MailboxResponse{Messages: []Delivery{}}
 	err := s.transaction(ctx, func(tx *sql.Tx) error {
@@ -562,7 +593,7 @@ func (s *Store) mailbox(ctx context.Context, p Principal, lane string, limit int
 				return err
 			}
 		}
-		rows, err := tx.QueryContext(ctx, "SELECT m.canonical,m.receipt,d.seq,d.pending_notification FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row LEFT JOIN recovery_barriers b ON b.feature_id=m.feature_id WHERE d.agent_id=? AND d.lane=? AND d.acked=0 AND d.superseded=0 AND (b.feature_id IS NULL OR m.kind IN ('task.result','task.cancel','turn.cancel')) ORDER BY d.seq LIMIT ?", p.AgentID, lane, limit)
+		rows, err := tx.QueryContext(ctx, "SELECT m.canonical,m.receipt,d.seq,d.pending_notification FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row LEFT JOIN recovery_barriers b ON b.feature_id=m.feature_id WHERE d.agent_id=? AND d.lane=? AND d.acked=0 AND d.superseded=0 AND (b.feature_id IS NULL OR m.kind IN ('task.result','task.cancel','turn.cancel')) ORDER BY CASE WHEN m.kind='agent.input' AND substr(ltrim(json_extract(m.canonical,'$.payload.text')),1,1)='!' THEN 0 ELSE 1 END,d.seq LIMIT ?", p.AgentID, lane, limit)
 		if err != nil {
 			return err
 		}

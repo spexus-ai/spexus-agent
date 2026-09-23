@@ -431,6 +431,48 @@ func TestOwnerTurnControlCancelsActivePiBeforeACK(t *testing.T) {
 	}
 }
 
+func TestUrgentInputWinsRunnerJournalAndDeferredOrdinaryIsRetained(t *testing.T) {
+	var startCalls atomic.Int32
+	r, _ := runnerFixture(t, http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if strings.HasSuffix(q.URL.Path, "/owner-turns/start") {
+			startCalls.Add(1)
+			httpError(w, 409, "urgent_input_pending")
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	r.cfg.Role, r.cfg.AgentID = "owner", "owner"
+	delivery := func(seq int64, text string) swarm.Delivery {
+		payload, _ := json.Marshal(swarm.InputPayload{Text: text, Source: swarm.Source{Kind: "slack", EventID: fmt.Sprintf("source-%d", seq), ChannelID: "C", ThreadTS: "1.1", ActorID: "U"}})
+		return swarm.Delivery{Envelope: swarm.Envelope{ProtocolVersion: 1, MessageID: swarm.NewID(), Type: "agent.input", TenantID: tenant, ProjectID: project, FeatureID: feature, FromAgentID: "coordinator", ToAgentID: "owner", SentAt: time.Now().UTC().Format(time.RFC3339Nano), Payload: payload}, MailboxSeq: seq}
+	}
+	ordinary := delivery(1, "buffered ordinary input")
+	urgent := delivery(2, "!urgent correction")
+	storeInput(t, r, ordinary)
+	storeInput(t, r, urgent)
+	first, ok, err := r.journal.next()
+	if err != nil || !ok || first.MailboxSeq != urgent.MailboxSeq {
+		t.Fatalf("runner did not prioritize urgent input: %+v, %t, %v", first, ok, err)
+	}
+	if err := r.journal.state(urgent.MailboxSeq, "applied", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.owner(context.Background(), ordinary); err != nil {
+		t.Fatal(err)
+	}
+	if startCalls.Load() != 1 {
+		t.Fatalf("ordinary input made %d start attempts", startCalls.Load())
+	}
+	var state string
+	if err := r.journal.db.QueryRow(`SELECT state FROM inbox WHERE seq=?`, ordinary.MailboxSeq).Scan(&state); err != nil || state != "received" {
+		t.Fatalf("deferred ordinary input was lost: %q, %v", state, err)
+	}
+	remaining, ok, err := r.journal.next()
+	if err != nil || !ok || remaining.MailboxSeq != ordinary.MailboxSeq {
+		t.Fatalf("deferred ordinary input not available for next turn: %+v, %t, %v", remaining, ok, err)
+	}
+}
+
 func TestOwnerFinishCancellationBetweenReadAndCommit(t *testing.T) {
 	var r *Runner
 	turn := swarm.NewID()
