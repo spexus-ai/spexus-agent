@@ -27,7 +27,7 @@ func (a *API) VerifyWorkspace(ctx context.Context, configured string) error {
 	if configured == "" {
 		return errors.New("Slack workspace is required")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.BaseURL+"auth.test", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.BaseURL+"auth.test", nil)
 	if err != nil {
 		return err
 	}

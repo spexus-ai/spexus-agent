@@ -67,6 +67,9 @@ func TestHumanCatchupMissedStopAndDuplicateSocket(t *testing.T) {
 	pages := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/auth.test" {
+			if r.Method != http.MethodPost {
+				t.Errorf("auth.test method=%s, want POST", r.Method)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "team_id": "W"})
 			return
 		}

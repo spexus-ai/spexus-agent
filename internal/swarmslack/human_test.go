@@ -102,7 +102,7 @@ func TestScanThreadPaginationAndFailures(t *testing.T) {
 // Validates: AC-464 (REQ-391 - trusted Slack source provenance).
 func TestVerifySlackBotWorkspace(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/auth.test" || r.Header.Get("Authorization") != "Bearer test" {
+		if r.Method != http.MethodPost || r.URL.Path != "/auth.test" || r.Header.Get("Authorization") != "Bearer test" {
 			t.Error("wrong auth.test request")
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "team_id": "T-real"})
