@@ -432,6 +432,28 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 		return e
 	}
 	var messages []swarm.Envelope
+	var ownerResult ownerOutput
+	var outputErr error
+	if !cancelled && runErr == nil {
+		ownerResult, messages, outputErr = r.ownerActions(d, turn, raw)
+		var reviewErr *reviewPreflightError
+		if errors.As(outputErr, &reviewErr) && ctx.Err() == nil {
+			// Nothing has entered the durable outbox yet. Give Pi one bounded
+			// correction in the same turn; a second mistake fails visibly.
+			correction := input + "\nYour preceding FINAL JSON was rejected before any actions were published: " + reviewErr.Error() + ". Return a complete corrected FINAL JSON. For a pending task.result, review only this event's job_id, attempt_id and message_id; do not repeat reviews of earlier attempts. If the trusted job shows this result was already accepted, return actions:[] and only summarize the recorded outcome."
+			var corrected string
+			corrected, cancelled, runErr = r.run(ctx, d, correction)
+			if corrected != "" {
+				raw = corrected
+				if e := r.journal.modelOutput(d.MailboxSeq, raw); e != nil {
+					return e
+				}
+			}
+			if !cancelled && runErr == nil {
+				ownerResult, messages, outputErr = r.ownerActions(d, turn, corrected)
+			}
+		}
+	}
 	if cancelled {
 		finish.Outcome = "cancelled"
 		finish.Error = modelError("cancelled")
@@ -441,14 +463,12 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 		finish.Error = modelError("model_execution_failed")
 		finish.Reply = "Pi model execution failed."
 	} else {
-		o, actions, e := r.ownerActions(d, turn, raw)
-		if e != nil {
+		if outputErr != nil {
 			finish.Outcome = "failed"
 			finish.Error = modelError("model_output_invalid")
 			finish.Reply = "Pi returned invalid structured output; no actions were published."
 		} else {
-			messages = actions
-			finish.Reply = o.Reply
+			finish.Reply = ownerResult.Reply
 		}
 	}
 

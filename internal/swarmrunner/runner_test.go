@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -450,17 +451,19 @@ func TestOwnerFinishCancellationBetweenReadAndCommit(t *testing.T) {
 
 func TestOwnerReviewEvidenceRequiresObjects(t *testing.T) {
 	var gets atomic.Int32
+	resultID := swarm.NewID()
 	r, _ := runnerFixture(t, http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		gets.Add(1)
 		if !strings.Contains(q.URL.Path, "/jobs/") {
 			t.Errorf("unexpected network action %s", q.URL.Path)
 		}
-		writeJSON(w, swarm.JobView{JobID: job, FeatureID: feature, CurrentAttemptID: attempt, Attempts: []swarm.Attempt{{AttemptID: attempt, AssignedAgentID: "worker-a", State: "succeeded"}}})
+		writeJSON(w, swarm.JobView{JobID: job, FeatureID: feature, CurrentAttemptID: attempt, Attempts: []swarm.Attempt{{AttemptID: attempt, AssignedAgentID: "worker-a", State: "succeeded", Review: "pending", ResultMessageID: resultID}}})
 	}))
 	r.cfg.Role = "owner"
 	r.cfg.AgentID = "owner"
 	d := dispatchFixture(r)
-	data := map[string]any{"job_id": job, "attempt_id": attempt, "result_message_id": swarm.NewID(), "verdict": "accepted", "reason": "17+25+38=80", "evidence": []string{"Сумма: 80", "ALPHA-619"}}
+	d.Type, d.MessageID = "task.result", resultID
+	data := map[string]any{"job_id": job, "attempt_id": attempt, "result_message_id": resultID, "verdict": "accepted", "reason": "17+25+38=80", "evidence": []string{"Сумма: 80", "ALPHA-619"}}
 	encode := func() string {
 		raw, _ := json.Marshal(data)
 		output, _ := json.Marshal(ownerOutput{Actions: []action{{Kind: "review", Data: raw}}, Reply: "Reviewed"})
@@ -480,5 +483,191 @@ func TestOwnerReviewEvidenceRequiresObjects(t *testing.T) {
 	h, _ := r.journal.History()
 	if h.Pending != 0 {
 		t.Fatal("validation had publish side effect")
+	}
+}
+
+// Test: an owner model may remember and re-review B while handling A's new
+// task.result. Preflight rejects the whole first output, then one correction
+// publishes only A. Cancellation or a second bad output publishes nothing.
+// Validates: AC-437/465 (REQ-355/392 - no partial action and durable output).
+func TestOwnerCorrectsStaleReviewBeforePublication(t *testing.T) {
+	for _, mode := range []string{"corrected", "invalid_again", "cancelled"} {
+		t.Run(mode, func(t *testing.T) {
+			resultA, jobB, attemptB, resultB := swarm.NewID(), swarm.NewID(), swarm.NewID(), swarm.NewID()
+			var published []swarm.Envelope
+			var finished swarm.OwnerFinishRequest
+			var launches int
+			var mu sync.Mutex
+			handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+				switch {
+				case q.Method == http.MethodPost && strings.HasSuffix(q.URL.Path, "/owner-turns/start"):
+					writeJSON(w, swarm.OwnerStartReceipt{TurnID: swarm.NewID(), State: "running"})
+				case q.Method == http.MethodGet && strings.Contains(q.URL.Path, "/owner-turns/"):
+					writeJSON(w, swarm.OwnerTurn{State: "running", FeatureID: feature})
+				case q.Method == http.MethodGet && strings.Contains(q.URL.Path, "/jobs/"):
+					if !strings.Contains(q.URL.Path, job) {
+						t.Errorf("stale B review reached job API: %s", q.URL.Path)
+					}
+					writeJSON(w, swarm.JobView{JobID: job, FeatureID: feature, CurrentAttemptID: attempt, Attempts: []swarm.Attempt{{AttemptID: attempt, AssignedAgentID: "worker-a", State: "succeeded", Review: "pending", ResultMessageID: resultA}}})
+				case q.Method == http.MethodPost && strings.HasSuffix(q.URL.Path, "/messages"):
+					var m swarm.Envelope
+					if err := json.NewDecoder(q.Body).Decode(&m); err != nil {
+						t.Error(err)
+					}
+					mu.Lock()
+					published = append(published, m)
+					mu.Unlock()
+					writeJSON(w, swarm.Receipt{MessageID: m.MessageID, Receipt: "stored"})
+				case q.Method == http.MethodPost && strings.HasSuffix(q.URL.Path, "/finish"):
+					if err := json.NewDecoder(q.Body).Decode(&finished); err != nil {
+						t.Error(err)
+					}
+					writeJSON(w, swarm.OwnerFinishReceipt{State: finished.Outcome, ReplyStatus: "queued"})
+				default:
+					t.Errorf("unexpected %s %s", q.Method, q.URL.Path)
+					http.NotFound(w, q)
+				}
+			})
+			r, _ := runnerFixture(t, handler)
+			r.cfg.Role, r.cfg.AgentID = "owner", "owner"
+			r.targets = []targetProfile{{AgentID: "worker-a", Profile: r.profile.wire()}}
+			d := dispatchFixture(r)
+			d.Type, d.MessageID, d.ToAgentID = "task.result", resultA, "owner"
+			d.Payload, _ = json.Marshal(swarm.ResultPayload{Outcome: "succeeded", Summary: "A done", Evidence: []swarm.Evidence{}, Origin: "worker"})
+			storeInput(t, r, d)
+			makeReview := func(idJob, idAttempt, idResult string) action {
+				b, _ := json.Marshal(reviewAction{JobID: idJob, AttemptID: idAttempt, ReviewPayload: swarm.ReviewPayload{ResultMessageID: idResult, Verdict: "accepted", Reason: "verified", Evidence: []swarm.Evidence{}}})
+				return action{Kind: "review", Data: b}
+			}
+			first, _ := json.Marshal(ownerOutput{Actions: []action{makeReview(job, attempt, resultA), makeReview(jobB, attemptB, resultB)}, Reply: "A and B done"})
+			corrected, _ := json.Marshal(ownerOutput{Actions: []action{makeReview(job, attempt, resultA)}, Reply: "A done; B was already reviewed"})
+			r.model = modelFunc(func(_ context.Context, _, input string) (string, bool, error) {
+				launches++
+				if launches == 1 {
+					return string(first), false, nil
+				}
+				if !strings.Contains(input, "preceding FINAL JSON was rejected") {
+					t.Fatal("missing corrective guidance")
+				}
+				mu.Lock()
+				count := len(published)
+				mu.Unlock()
+				if count != 0 {
+					t.Fatal("partial review published before correction")
+				}
+				switch mode {
+				case "corrected":
+					return string(corrected), false, nil
+				case "invalid_again":
+					return string(first), false, nil
+				default:
+					return "", true, nil
+				}
+			})
+			if err := r.owner(context.Background(), d); err != nil {
+				t.Fatal(err)
+			}
+			if launches != 2 {
+				t.Fatalf("Pi launches=%d", launches)
+			}
+			wantMessages, wantOutcome := 0, "failed"
+			if mode == "corrected" {
+				wantMessages, wantOutcome = 1, "succeeded"
+			}
+			if mode == "cancelled" {
+				wantOutcome = "cancelled"
+			}
+			if len(published) != wantMessages || finished.Outcome != wantOutcome {
+				t.Fatalf("published=%d finish=%+v", len(published), finished)
+			}
+			if wantMessages == 1 && (published[0].JobID != job || published[0].AttemptID != attempt || published[0].Type != "task.review") {
+				t.Fatalf("wrong published review: %+v", published)
+			}
+			var modelOutput string
+			if err := r.journal.db.QueryRow("SELECT model_output FROM inbox WHERE seq=?", d.MailboxSeq).Scan(&modelOutput); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "cancelled" && modelOutput != string(first) {
+				t.Fatal("completed first model output lost on corrective cancellation")
+			}
+		})
+	}
+}
+
+// A recovery delivery of an immutable task.result may arrive after its review
+// was already accepted. That turn can report the outcome but cannot repeat or
+// start work from an old trigger.
+func TestAcceptedTaskResultRecoveryIsSummaryOnly(t *testing.T) {
+	for _, firstHasAction := range []bool{false, true} {
+		t.Run(fmt.Sprint("first_has_action=", firstHasAction), func(t *testing.T) {
+			resultID, priorJob, priorAttempt, priorResult := swarm.NewID(), swarm.NewID(), swarm.NewID(), swarm.NewID()
+			var published []swarm.Envelope
+			var finished swarm.OwnerFinishRequest
+			handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+				switch {
+				case q.Method == http.MethodPost && strings.HasSuffix(q.URL.Path, "/owner-turns/start"):
+					writeJSON(w, swarm.OwnerStartReceipt{TurnID: swarm.NewID(), State: "running"})
+				case q.Method == http.MethodGet && strings.Contains(q.URL.Path, "/owner-turns/"):
+					writeJSON(w, swarm.OwnerTurn{State: "running", FeatureID: feature})
+				case q.Method == http.MethodGet && strings.Contains(q.URL.Path, "/jobs/"):
+					if strings.Contains(q.URL.Path, priorJob) {
+						writeJSON(w, swarm.JobView{JobID: priorJob, FeatureID: feature, CurrentAttemptID: priorAttempt, Attempts: []swarm.Attempt{{AttemptID: priorAttempt, AssignedAgentID: "worker-b", State: "succeeded", Review: "accepted", ResultMessageID: priorResult, Result: &swarm.ResultPayload{Outcome: "succeeded", Summary: "B recorded", Evidence: []swarm.Evidence{}, Origin: "worker"}}}})
+					} else {
+						writeJSON(w, swarm.JobView{JobID: job, FeatureID: feature, CurrentAttemptID: attempt, Attempts: []swarm.Attempt{{AttemptID: attempt, AssignedAgentID: "worker-a", State: "succeeded", Review: "accepted", ResultMessageID: resultID, Result: &swarm.ResultPayload{Outcome: "succeeded", Summary: "A done", Evidence: []swarm.Evidence{}, Origin: "worker"}}}})
+					}
+				case q.Method == http.MethodPost && strings.HasSuffix(q.URL.Path, "/messages"):
+					var m swarm.Envelope
+					_ = json.NewDecoder(q.Body).Decode(&m)
+					published = append(published, m)
+					writeJSON(w, swarm.Receipt{MessageID: m.MessageID, Receipt: "stored"})
+				case q.Method == http.MethodPost && strings.HasSuffix(q.URL.Path, "/finish"):
+					if err := json.NewDecoder(q.Body).Decode(&finished); err != nil {
+						t.Error(err)
+					}
+					writeJSON(w, swarm.OwnerFinishReceipt{State: finished.Outcome, ReplyStatus: "queued"})
+				default:
+					t.Errorf("unexpected %s %s", q.Method, q.URL.Path)
+					http.NotFound(w, q)
+				}
+			})
+			r, _ := runnerFixture(t, handler)
+			r.cfg.Role, r.cfg.AgentID = "owner", "owner"
+			d := dispatchFixture(r)
+			d.Type, d.MessageID, d.ToAgentID = "task.result", resultID, "owner"
+			d.MailboxSeq = 2
+			d.Payload, _ = json.Marshal(swarm.ResultPayload{Outcome: "succeeded", Summary: "A done", Evidence: []swarm.Evidence{}, Origin: "worker"})
+			prior := d
+			prior.MailboxSeq, prior.MessageID, prior.JobID, prior.AttemptID = 1, priorResult, priorJob, priorAttempt
+			prior.Payload, _ = json.Marshal(swarm.ResultPayload{Outcome: "succeeded", Summary: "B recorded", Evidence: []swarm.Evidence{}, Origin: "worker"})
+			storeInput(t, r, prior)
+			storeInput(t, r, d)
+			dispatch, _ := json.Marshal(dispatchAction{WorkerAgentID: "worker-a", DispatchPayload: swarm.DispatchPayload{Goal: "repeat", Scope: "stale", ExpectedResult: []string{"done"}, Context: swarm.TaskContext{Text: "", Refs: []swarm.ContextRef{}}, Profile: r.profile.wire()}})
+			bad, _ := json.Marshal(ownerOutput{Actions: []action{{Kind: "dispatch", Data: dispatch}}, Reply: "starting again"})
+			good, _ := json.Marshal(ownerOutput{Actions: []action{}, Reply: "Recorded work is complete"})
+			launches := 0
+			r.model = modelFunc(func(_ context.Context, _, input string) (string, bool, error) {
+				launches++
+				if !strings.Contains(input, "This task.result was already accepted") || !strings.Contains(input, "actions:[]") || !strings.Contains(input, `"summary":"B recorded"`) {
+					t.Fatal("missing summary-only guidance")
+				}
+				if firstHasAction && launches == 1 {
+					return string(bad), false, nil
+				}
+				if firstHasAction && launches == 2 && !strings.Contains(input, "preceding FINAL JSON was rejected") {
+					t.Fatal("missing corrective guidance")
+				}
+				return string(good), false, nil
+			})
+			if err := r.owner(context.Background(), d); err != nil {
+				t.Fatal(err)
+			}
+			wantLaunches := 1
+			if firstHasAction {
+				wantLaunches = 2
+			}
+			if launches != wantLaunches || len(published) != 0 || finished.Outcome != "succeeded" || finished.Reply != "Recorded work is complete" {
+				t.Fatalf("launches=%d published=%d finish=%+v", launches, len(published), finished)
+			}
+		})
 	}
 }
