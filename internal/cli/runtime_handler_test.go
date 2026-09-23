@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spexus-ai/spexus-agent/internal/acpxadapter"
 	"github.com/spexus-ai/spexus-agent/internal/config"
+	"github.com/spexus-ai/spexus-agent/internal/harness"
 	"github.com/spexus-ai/spexus-agent/internal/registry"
 	runtimemodel "github.com/spexus-ai/spexus-agent/internal/runtime"
 	"github.com/spexus-ai/spexus-agent/internal/slack"
@@ -155,21 +155,21 @@ func (c *recordingSlackClient) Close() error { return nil }
 
 type fakePromptAdapter struct {
 	mu          sync.Mutex
-	results     []acpxadapter.SessionResult
-	calls       []acpxadapter.SessionRequest
-	sendPrompt  func(context.Context, acpxadapter.SessionRequest) (acpxadapter.SessionResult, error)
-	startPrompt func(context.Context, acpxadapter.SessionRequest) (acpxadapter.PromptStream, error)
+	results     []harness.SessionResult
+	calls       []harness.SessionRequest
+	sendPrompt  func(context.Context, harness.SessionRequest) (harness.SessionResult, error)
+	startPrompt func(context.Context, harness.SessionRequest) (harness.PromptStream, error)
 }
 
-func (a *fakePromptAdapter) EnsureSession(context.Context, acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
-	return acpxadapter.SessionResult{}, nil
+func (a *fakePromptAdapter) EnsureSession(context.Context, harness.SessionRequest) (harness.SessionResult, error) {
+	return harness.SessionResult{}, nil
 }
 
-func (a *fakePromptAdapter) SendPrompt(ctx context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+func (a *fakePromptAdapter) SendPrompt(ctx context.Context, req harness.SessionRequest) (harness.SessionResult, error) {
 	return a.nextPromptResult(ctx, req)
 }
 
-func (a *fakePromptAdapter) StartPrompt(ctx context.Context, req acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+func (a *fakePromptAdapter) StartPrompt(ctx context.Context, req harness.SessionRequest) (harness.PromptStream, error) {
 	a.mu.Lock()
 	startPrompt := a.startPrompt
 	a.mu.Unlock()
@@ -183,7 +183,7 @@ func (a *fakePromptAdapter) StartPrompt(ctx context.Context, req acpxadapter.Ses
 		return nil, err
 	}
 
-	events, err := acpxadapter.TranslatePromptOutput(result.Output)
+	events, err := harness.TranslatePromptOutput(result.Output)
 	if err != nil {
 		return nil, err
 	}
@@ -194,13 +194,13 @@ func (a *fakePromptAdapter) StartPrompt(ctx context.Context, req acpxadapter.Ses
 	}, nil
 }
 
-func (a *fakePromptAdapter) recordCall(req acpxadapter.SessionRequest) {
+func (a *fakePromptAdapter) recordCall(req harness.SessionRequest) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.calls = append(a.calls, req)
 }
 
-func (a *fakePromptAdapter) nextPromptResult(ctx context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+func (a *fakePromptAdapter) nextPromptResult(ctx context.Context, req harness.SessionRequest) (harness.SessionResult, error) {
 	a.mu.Lock()
 	a.calls = append(a.calls, req)
 	sendPrompt := a.sendPrompt
@@ -210,7 +210,7 @@ func (a *fakePromptAdapter) nextPromptResult(ctx context.Context, req acpxadapte
 	}
 	if len(a.results) == 0 {
 		a.mu.Unlock()
-		return acpxadapter.SessionResult{SessionName: acpxadapter.SessionName(req.ThreadTS)}, nil
+		return harness.SessionResult{SessionName: harness.SessionName(req.ThreadTS)}, nil
 	}
 	result := a.results[0]
 	a.results = a.results[1:]
@@ -218,33 +218,33 @@ func (a *fakePromptAdapter) nextPromptResult(ctx context.Context, req acpxadapte
 	return result, nil
 }
 
-func (a *fakePromptAdapter) snapshotCalls() []acpxadapter.SessionRequest {
+func (a *fakePromptAdapter) snapshotCalls() []harness.SessionRequest {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	return append([]acpxadapter.SessionRequest(nil), a.calls...)
+	return append([]harness.SessionRequest(nil), a.calls...)
 }
 
-func (a *fakePromptAdapter) Status(context.Context, string) (acpxadapter.SessionResult, error) {
-	return acpxadapter.SessionResult{}, nil
+func (a *fakePromptAdapter) Status(context.Context, string) (harness.SessionResult, error) {
+	return harness.SessionResult{}, nil
 }
 
 func (a *fakePromptAdapter) Cancel(context.Context, string) error { return nil }
 
-func (f *fakeRuntimeCancelAdapter) EnsureSession(context.Context, acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
-	return acpxadapter.SessionResult{}, nil
+func (f *fakeRuntimeCancelAdapter) EnsureSession(context.Context, harness.SessionRequest) (harness.SessionResult, error) {
+	return harness.SessionResult{}, nil
 }
 
-func (f *fakeRuntimeCancelAdapter) SendPrompt(context.Context, acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
-	return acpxadapter.SessionResult{}, nil
+func (f *fakeRuntimeCancelAdapter) SendPrompt(context.Context, harness.SessionRequest) (harness.SessionResult, error) {
+	return harness.SessionResult{}, nil
 }
 
-func (f *fakeRuntimeCancelAdapter) StartPrompt(context.Context, acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+func (f *fakeRuntimeCancelAdapter) StartPrompt(context.Context, harness.SessionRequest) (harness.PromptStream, error) {
 	return nil, errors.New("not implemented")
 }
 
-func (f *fakeRuntimeCancelAdapter) Status(context.Context, string) (acpxadapter.SessionResult, error) {
-	return acpxadapter.SessionResult{}, nil
+func (f *fakeRuntimeCancelAdapter) Status(context.Context, string) (harness.SessionResult, error) {
+	return harness.SessionResult{}, nil
 }
 
 func (f *fakeRuntimeCancelAdapter) Cancel(_ context.Context, threadTS string) error {
@@ -259,7 +259,7 @@ func (r *recordingRuntimeStarter) Start(_ context.Context, status runtimemodel.S
 
 type fakePromptStream struct {
 	sessionName string
-	events      []acpxadapter.Event
+	events      []harness.Event
 	waitErr     error
 }
 
@@ -267,8 +267,8 @@ func (s *fakePromptStream) SessionName() string {
 	return s.sessionName
 }
 
-func (s *fakePromptStream) Events() <-chan acpxadapter.Event {
-	out := make(chan acpxadapter.Event, len(s.events))
+func (s *fakePromptStream) Events() <-chan harness.Event {
+	out := make(chan harness.Event, len(s.events))
 	for _, event := range s.events {
 		out <- event
 	}
@@ -288,7 +288,7 @@ var _ io.Closer = (*fakePromptStream)(nil)
 
 type controlledPromptStream struct {
 	sessionName string
-	events      chan acpxadapter.Event
+	events      chan harness.Event
 	waitCh      chan error
 	closeErr    error
 }
@@ -297,7 +297,7 @@ func (s *controlledPromptStream) SessionName() string {
 	return s.sessionName
 }
 
-func (s *controlledPromptStream) Events() <-chan acpxadapter.Event {
+func (s *controlledPromptStream) Events() <-chan harness.Event {
 	return s.events
 }
 
@@ -812,7 +812,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool
 	t.Fatalf("condition not met within %s", timeout)
 }
 
-// Test: root app_mention invocations are treated as command execution, dispatched through ACPX with the parsed command text, and rendered back into the root thread.
+// Test: root app_mention invocations are treated as command execution, dispatched through Agent with the parsed command text, and rendered back into the root thread.
 // Validates: AC-1815 (REQ-1181 - root mentions start a new thread execution), AC-1815 (REQ-1183 - mention command text is parsed from the payload)
 func TestForegroundRuntimeStarterProcessesRootMentionCommand(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -846,11 +846,12 @@ func TestForegroundRuntimeStarterProcessesRootMentionCommand(t *testing.T) {
 
 	client := &recordingSlackClient{}
 	adapter := &fakePromptAdapter{
-		results: []acpxadapter.SessionResult{
+		results: []harness.SessionResult{
 			{
-				SessionName: acpxadapter.SessionName("1713686400.000100"),
-				Output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello from acpx"}}}}
-{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+				SessionName: harness.SessionName("1713686400.000100"),
+				Output: `{"kind":"assistant_message_chunk","text":"hello from agent"}
+{"kind":"assistant_message_final","text":"hello from agent"}
+{"kind":"session_done"}`,
 			},
 		},
 	}
@@ -901,8 +902,8 @@ func TestForegroundRuntimeStarterProcessesRootMentionCommand(t *testing.T) {
 	if got, want := len(client.messages), 1; got != want {
 		t.Fatalf("slack message count = %d, want %d", got, want)
 	}
-	if client.messages[0].Text != "hello from acpx" {
-		t.Fatalf("slack reply text = %q, want %q", client.messages[0].Text, "hello from acpx")
+	if client.messages[0].Text != "hello from agent" {
+		t.Fatalf("slack reply text = %q, want %q", client.messages[0].Text, "hello from agent")
 	}
 
 	output := debug.String()
@@ -910,7 +911,7 @@ func TestForegroundRuntimeStarterProcessesRootMentionCommand(t *testing.T) {
 		"runtime.loop: connected to slack socket mode",
 		"runtime.loop: received slack invocation delivery=Ev123 source=mention",
 		"runtime.loop: dispatching mention delivery=Ev123 project=alpha session=slack-1713686400.000100",
-		"runtime.loop: acpx events session=slack-1713686400.000100 payload=assistant_message_chunk:hello from acpx | assistant_message_final:hello from acpx | session_done",
+		"runtime.loop: agent events session=slack-1713686400.000100 payload=assistant_message_chunk:hello from agent | assistant_message_final:hello from agent | session_done",
 		"runtime.loop: rendered slack reply thread=1713686400.000100 session=slack-1713686400.000100",
 		"runtime.loop: mention processed delivery=Ev123 session=slack-1713686400.000100",
 	} {
@@ -926,11 +927,11 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesLiveProgressBeforeC
 	client := &recordingSlackClient{}
 	stream := &controlledPromptStream{
 		sessionName: "slack-1713686400.000100",
-		events:      make(chan acpxadapter.Event, 8),
+		events:      make(chan harness.Event, 8),
 		waitCh:      make(chan error, 1),
 	}
 	adapter := &fakePromptAdapter{
-		startPrompt: func(context.Context, acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+		startPrompt: func(context.Context, harness.SessionRequest) (harness.PromptStream, error) {
 			return stream, nil
 		},
 	}
@@ -957,7 +958,7 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesLiveProgressBeforeC
 
 	type result struct {
 		sessionName string
-		events      []runtimemodel.ACPXTurnEvent
+		events      []runtimemodel.AgentTurnEvent
 		err         error
 	}
 	resultCh := make(chan result, 1)
@@ -975,14 +976,14 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesLiveProgressBeforeC
 		SessionName: prepared.SessionName,
 	}
 	go func() {
-		got, err := starter.collectPromptEvents(context.Background(), prepared, request, "status", false)
+		got, err := starter.collectPromptEvents(context.Background(), prepared, request, "status")
 		resultCh <- result{sessionName: got.sessionName, events: got.events, err: err}
 	}()
 
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventSessionStarted, Text: "slack-1713686400.000100"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantThinking, Text: "analyzing"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantThinking, Text: "checking"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantThinking, Text: "ready"}
+	stream.events <- harness.Event{Kind: harness.EventSessionStarted, Text: "slack-1713686400.000100"}
+	stream.events <- harness.Event{Kind: harness.EventAssistantThinking, Text: "analyzing"}
+	stream.events <- harness.Event{Kind: harness.EventAssistantThinking, Text: "checking"}
+	stream.events <- harness.Event{Kind: harness.EventAssistantThinking, Text: "ready"}
 
 	waitForCondition(t, 2*time.Second, func() bool {
 		messages := client.snapshotMessages()
@@ -994,8 +995,8 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesLiveProgressBeforeC
 		t.Fatalf("live progress message = %q", messages[0].Text)
 	}
 
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageFinal, Text: "final answer"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventSessionDone}
+	stream.events <- harness.Event{Kind: harness.EventAssistantMessageFinal, Text: "final answer"}
+	stream.events <- harness.Event{Kind: harness.EventSessionDone}
 	close(stream.events)
 	stream.waitCh <- nil
 
@@ -1023,18 +1024,18 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesLiveProgressBeforeC
 }
 
 // Test: assistant-only streamed chunks are published to Slack before terminal completion without waiting for a tool event boundary.
-// Validates: AC-1978 (REQ-1425 - assistant progress is published before ACPX reaches a terminal outcome), AC-1980 (REQ-1427 - terminal success does not duplicate an identical live answer)
+// Validates: AC-1978 (REQ-1425 - assistant progress is published before Agent reaches a terminal outcome), AC-1980 (REQ-1427 - terminal success does not duplicate an identical live answer)
 func TestForegroundRuntimeStarterCollectPromptEventsPublishesAssistantOnlyProgressBeforeCompletion(t *testing.T) {
 	t.Parallel()
 
 	client := &recordingSlackClient{}
 	stream := &controlledPromptStream{
 		sessionName: "slack-1713686400.000100",
-		events:      make(chan acpxadapter.Event, 8),
+		events:      make(chan harness.Event, 8),
 		waitCh:      make(chan error, 1),
 	}
 	adapter := &fakePromptAdapter{
-		startPrompt: func(context.Context, acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+		startPrompt: func(context.Context, harness.SessionRequest) (harness.PromptStream, error) {
 			return stream, nil
 		},
 	}
@@ -1070,22 +1071,22 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesAssistantOnlyProgre
 
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := starter.collectPromptEvents(context.Background(), prepared, request, "status", false)
+		_, err := starter.collectPromptEvents(context.Background(), prepared, request, "status")
 		resultCh <- err
 	}()
 
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: "hello"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: " world"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: "\nfrom"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: " acpx"}
+	stream.events <- harness.Event{Kind: harness.EventAssistantMessageChunk, Text: "hello"}
+	stream.events <- harness.Event{Kind: harness.EventAssistantMessageChunk, Text: " world"}
+	stream.events <- harness.Event{Kind: harness.EventAssistantMessageChunk, Text: "\nfrom"}
+	stream.events <- harness.Event{Kind: harness.EventAssistantMessageChunk, Text: " agent"}
 
 	waitForCondition(t, 2*time.Second, func() bool {
 		messages := client.snapshotMessages()
 		return len(messages) == 1 && messages[0].Text == "hello world"
 	})
 
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageFinal, Text: "hello world\nfrom acpx"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventSessionDone}
+	stream.events <- harness.Event{Kind: harness.EventAssistantMessageFinal, Text: "hello world\nfrom agent"}
+	stream.events <- harness.Event{Kind: harness.EventSessionDone}
 	close(stream.events)
 	stream.waitCh <- nil
 
@@ -1100,13 +1101,13 @@ func TestForegroundRuntimeStarterCollectPromptEventsPublishesAssistantOnlyProgre
 	if messages[0].Text != "hello world" {
 		t.Fatalf("first slack message = %q, want streamed prefix", messages[0].Text)
 	}
-	if messages[1].Text != "from acpx" {
+	if messages[1].Text != "from agent" {
 		t.Fatalf("second slack message = %q, want final tail", messages[1].Text)
 	}
 }
 
 // Test: streamed mention progress that later fails still produces one terminal Slack error and persists failed lifecycle state.
-// Validates: AC-1978 (REQ-1425 - progress is published before ACPX reaches a terminal outcome), AC-1981 (REQ-1429 - execution state keeps a unique failed lifecycle record), AC-1981 (REQ-1430 - lifecycle timestamps and publisher checkpoints persist through failure)
+// Validates: AC-1978 (REQ-1425 - progress is published before Agent reaches a terminal outcome), AC-1981 (REQ-1429 - execution state keeps a unique failed lifecycle record), AC-1981 (REQ-1430 - lifecycle timestamps and publisher checkpoints persist through failure)
 func TestForegroundRuntimeStarterReportsRenderedStreamFailureOnlyOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1139,13 +1140,13 @@ func TestForegroundRuntimeStarterReportsRenderedStreamFailureOnlyOnce(t *testing
 
 	client := &recordingSlackClient{}
 	adapter := &fakePromptAdapter{
-		startPrompt: func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+		startPrompt: func(_ context.Context, req harness.SessionRequest) (harness.PromptStream, error) {
 			return &fakePromptStream{
-				sessionName: acpxadapter.SessionName(req.ThreadTS),
-				events: []acpxadapter.Event{
-					{Kind: acpxadapter.EventAssistantMessageChunk, Text: "working"},
+				sessionName: harness.SessionName(req.ThreadTS),
+				events: []harness.Event{
+					{Kind: harness.EventAssistantMessageChunk, Text: "working"},
 				},
-				waitErr: errors.New("acpx async failure"),
+				waitErr: errors.New("agent async failure"),
 			}, nil
 		},
 	}
@@ -1177,7 +1178,7 @@ func TestForegroundRuntimeStarterReportsRenderedStreamFailureOnlyOnce(t *testing
 
 	waitForCondition(t, 2*time.Second, func() bool {
 		messages := client.snapshotMessages()
-		return len(messages) == 2 && messages[1].Text == "Session error: acpx async failure"
+		return len(messages) == 2 && messages[1].Text == "Session error: agent async failure"
 	})
 	cancel()
 
@@ -1192,7 +1193,7 @@ func TestForegroundRuntimeStarterReportsRenderedStreamFailureOnlyOnce(t *testing
 	if messages[0].Text != "working" {
 		t.Fatalf("progress message = %q", messages[0].Text)
 	}
-	if messages[1].Text != "Session error: acpx async failure" {
+	if messages[1].Text != "Session error: agent async failure" {
 		t.Fatalf("terminal message = %q, want one rendered stream failure", messages[1].Text)
 	}
 
@@ -1209,10 +1210,10 @@ func TestForegroundRuntimeStarterReportsRenderedStreamFailureOnlyOnce(t *testing
 	if executionState.QueuedAt.IsZero() || executionState.StartedAt == nil || executionState.RenderingStartedAt == nil {
 		t.Fatalf("LoadExecutionStateByDelivery() timestamps = %#v, want queued/running/rendering markers before failure", executionState)
 	}
-	if executionState.LastError != "acpx async failure" {
-		t.Fatalf("LoadExecutionStateByDelivery() last error = %q, want acpx async failure", executionState.LastError)
+	if executionState.LastError != "agent async failure" {
+		t.Fatalf("LoadExecutionStateByDelivery() last error = %q, want agent async failure", executionState.LastError)
 	}
-	if executionState.PublisherCheckpointKind != string(runtimemodel.ACPXEventAssistantMessageChunk) || executionState.PublisherCheckpointSummary != "working" {
+	if executionState.PublisherCheckpointKind != string(runtimemodel.AgentEventAssistantMessageChunk) || executionState.PublisherCheckpointSummary != "working" {
 		t.Fatalf("LoadExecutionStateByDelivery() checkpoint = (%q, %q), want assistant chunk/working", executionState.PublisherCheckpointKind, executionState.PublisherCheckpointSummary)
 	}
 
@@ -1233,8 +1234,8 @@ func TestForegroundRuntimeStarterReportsRenderedStreamFailureOnlyOnce(t *testing
 	}
 }
 
-// Test: accepted mention invocations are enqueued so the intake loop can continue processing a later mention without waiting for the first ACPX prompt to complete.
-// Validates: AC-1975 (REQ-1417 - mention ingestion does not wait for ACPX completion), AC-1975 (REQ-1418 - accepted mentions are enqueued for async execution), AC-1975 (REQ-1419 - intake returns immediately after normalization, resolution, and dedupe claim)
+// Test: accepted mention invocations are enqueued so the intake loop can continue processing a later mention without waiting for the first Agent prompt to complete.
+// Validates: AC-1975 (REQ-1417 - mention ingestion does not wait for Agent completion), AC-1975 (REQ-1418 - accepted mentions are enqueued for async execution), AC-1975 (REQ-1419 - intake returns immediately after normalization, resolution, and dedupe claim)
 func TestForegroundRuntimeStarterEnqueuesMentionExecutionWithoutBlockingNextInvocation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1273,7 +1274,7 @@ func TestForegroundRuntimeStarterEnqueuesMentionExecutionWithoutBlockingNextInvo
 	adapter := &fakePromptAdapter{}
 	var adapterCalls int
 	var adapterCallsMu sync.Mutex
-	adapter.sendPrompt = func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+	adapter.sendPrompt = func(_ context.Context, req harness.SessionRequest) (harness.SessionResult, error) {
 		adapterCallsMu.Lock()
 		adapterCalls++
 		callIndex := adapterCalls
@@ -1283,18 +1284,20 @@ func TestForegroundRuntimeStarterEnqueuesMentionExecutionWithoutBlockingNextInvo
 		case 1:
 			close(firstStarted)
 			<-releaseFirst
-			return acpxadapter.SessionResult{
-				SessionName: acpxadapter.SessionName(req.ThreadTS),
-				Output:      `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first async result"}}}}`,
+			return harness.SessionResult{
+				SessionName: harness.SessionName(req.ThreadTS),
+				Output: `{"kind":"assistant_message_chunk","text":"first async result"}
+{"kind":"assistant_message_final","text":"first async result"}`,
 			}, nil
 		case 2:
 			close(secondStarted)
-			return acpxadapter.SessionResult{
-				SessionName: acpxadapter.SessionName(req.ThreadTS),
-				Output:      `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a8","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second async result"}}}}`,
+			return harness.SessionResult{
+				SessionName: harness.SessionName(req.ThreadTS),
+				Output: `{"kind":"assistant_message_chunk","text":"second async result"}
+{"kind":"assistant_message_final","text":"second async result"}`,
 			}, nil
 		default:
-			return acpxadapter.SessionResult{}, fmt.Errorf("unexpected SendPrompt call %d", callIndex)
+			return harness.SessionResult{}, fmt.Errorf("unexpected SendPrompt call %d", callIndex)
 		}
 	}
 
@@ -1390,7 +1393,7 @@ func TestForegroundRuntimeStarterEnqueuesMentionExecutionWithoutBlockingNextInvo
 	}
 }
 
-// Test: threaded app_mention invocations keep using the existing Slack thread anchor while dispatching only the parsed command text to ACPX.
+// Test: threaded app_mention invocations keep using the existing Slack thread anchor while dispatching only the parsed command text to Agent.
 // Validates: AC-1816 (REQ-1182 - threaded mentions continue the existing thread), AC-1816 (REQ-1183 - mention command text is parsed from the payload)
 func TestForegroundRuntimeStarterProcessesThreadedMentionCommand(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1424,11 +1427,12 @@ func TestForegroundRuntimeStarterProcessesThreadedMentionCommand(t *testing.T) {
 
 	client := &recordingSlackClient{}
 	adapter := &fakePromptAdapter{
-		results: []acpxadapter.SessionResult{
+		results: []harness.SessionResult{
 			{
-				SessionName: acpxadapter.SessionName("1713686400.000100"),
-				Output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"thread reply from acpx"}}}}
-{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+				SessionName: harness.SessionName("1713686400.000100"),
+				Output: `{"kind":"assistant_message_chunk","text":"thread reply from agent"}
+{"kind":"assistant_message_final","text":"thread reply from agent"}
+{"kind":"session_done"}`,
 			},
 		},
 	}
@@ -1470,9 +1474,6 @@ func TestForegroundRuntimeStarterProcessesThreadedMentionCommand(t *testing.T) {
 	if adapter.calls[0].Prompt != "summarize current project state" {
 		t.Fatalf("adapter call prompt = %q, want ask payload without command prefix", adapter.calls[0].Prompt)
 	}
-	if !adapter.calls[0].ForceNew {
-		t.Fatal("adapter call ForceNew = false, want true for ask mention")
-	}
 	if adapter.calls[0].ThreadTS != "1713686400.000100" {
 		t.Fatalf("adapter call thread ts = %q, want existing thread anchor", adapter.calls[0].ThreadTS)
 	}
@@ -1486,7 +1487,7 @@ func TestForegroundRuntimeStarterProcessesThreadedMentionCommand(t *testing.T) {
 }
 
 // Test: accepted mention invocations are enqueued so a blocked execution in one thread does not stop intake or another thread in the same project.
-// Validates: AC-1975 (REQ-1417 - mention ingestion does not wait for ACPX completion), AC-1975 (REQ-1418 - accepted mentions are enqueued), AC-1975 (REQ-1419 - intake continues immediately without project-wide serialization)
+// Validates: AC-1975 (REQ-1417 - mention ingestion does not wait for Agent completion), AC-1975 (REQ-1418 - accepted mentions are enqueued), AC-1975 (REQ-1419 - intake continues immediately without project-wide serialization)
 func TestForegroundRuntimeStarterEnqueuesMentionsWithoutBlockingLaterThreads(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1523,26 +1524,28 @@ func TestForegroundRuntimeStarterEnqueuesMentionsWithoutBlockingLaterThreads(t *
 	releaseFirst := make(chan struct{})
 	releaseSecond := make(chan struct{})
 	adapter := &fakePromptAdapter{
-		sendPrompt: func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+		sendPrompt: func(_ context.Context, req harness.SessionRequest) (harness.SessionResult, error) {
 			switch req.ThreadTS {
 			case "1713686400.000100":
 				firstStarted <- struct{}{}
 				<-releaseFirst
-				return acpxadapter.SessionResult{
-					SessionName: acpxadapter.SessionName(req.ThreadTS),
-					Output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first async mention result"}}}}
-{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+				return harness.SessionResult{
+					SessionName: harness.SessionName(req.ThreadTS),
+					Output: `{"kind":"assistant_message_chunk","text":"first async mention result"}
+{"kind":"assistant_message_final","text":"first async mention result"}
+{"kind":"session_done"}`,
 				}, nil
 			case "1713686400.000200":
 				secondStarted <- struct{}{}
 				<-releaseSecond
-				return acpxadapter.SessionResult{
-					SessionName: acpxadapter.SessionName(req.ThreadTS),
-					Output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second async mention result"}}}}
-{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+				return harness.SessionResult{
+					SessionName: harness.SessionName(req.ThreadTS),
+					Output: `{"kind":"assistant_message_chunk","text":"second async mention result"}
+{"kind":"assistant_message_final","text":"second async mention result"}
+{"kind":"session_done"}`,
 				}, nil
 			default:
-				return acpxadapter.SessionResult{}, fmt.Errorf("unexpected thread %s", req.ThreadTS)
+				return harness.SessionResult{}, fmt.Errorf("unexpected thread %s", req.ThreadTS)
 			}
 		},
 	}
@@ -1715,7 +1718,7 @@ func TestForegroundRuntimeStarterSerializesSameMentionSessionWithoutBlockingOthe
 	var sharedCalls int
 	var sharedCallsMu sync.Mutex
 	adapter := &fakePromptAdapter{
-		sendPrompt: func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+		sendPrompt: func(_ context.Context, req harness.SessionRequest) (harness.SessionResult, error) {
 			switch req.ThreadTS {
 			case "1713686400.000100":
 				sharedCallsMu.Lock()
@@ -1727,29 +1730,32 @@ func TestForegroundRuntimeStarterSerializesSameMentionSessionWithoutBlockingOthe
 				case 1:
 					firstSharedStarted <- struct{}{}
 					<-releaseFirstShared
-					return acpxadapter.SessionResult{
-						SessionName: acpxadapter.SessionName(req.ThreadTS),
-						Output:      `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first shared mention result"}}}}` + "\n" + `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+					return harness.SessionResult{
+						SessionName: harness.SessionName(req.ThreadTS),
+						Output: `{"kind":"assistant_message_chunk","text":"first shared mention result"}
+{"kind":"assistant_message_final","text":"first shared mention result"}` + "\n" + `{"kind":"session_done"}`,
 					}, nil
 				case 2:
 					secondSharedStarted <- struct{}{}
 					<-releaseSecondShared
-					return acpxadapter.SessionResult{
-						SessionName: acpxadapter.SessionName(req.ThreadTS),
-						Output:      `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second shared mention result"}}}}` + "\n" + `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+					return harness.SessionResult{
+						SessionName: harness.SessionName(req.ThreadTS),
+						Output: `{"kind":"assistant_message_chunk","text":"second shared mention result"}
+{"kind":"assistant_message_final","text":"second shared mention result"}` + "\n" + `{"kind":"session_done"}`,
 					}, nil
 				default:
-					return acpxadapter.SessionResult{}, fmt.Errorf("unexpected shared-session SendPrompt call %d", callIndex)
+					return harness.SessionResult{}, fmt.Errorf("unexpected shared-session SendPrompt call %d", callIndex)
 				}
 			case "1713686400.000200":
 				otherStarted <- struct{}{}
 				<-releaseOther
-				return acpxadapter.SessionResult{
-					SessionName: acpxadapter.SessionName(req.ThreadTS),
-					Output:      `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a8","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"other thread mention result"}}}}` + "\n" + `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+				return harness.SessionResult{
+					SessionName: harness.SessionName(req.ThreadTS),
+					Output: `{"kind":"assistant_message_chunk","text":"other thread mention result"}
+{"kind":"assistant_message_final","text":"other thread mention result"}` + "\n" + `{"kind":"session_done"}`,
 				}, nil
 			default:
-				return acpxadapter.SessionResult{}, fmt.Errorf("unexpected thread %s", req.ThreadTS)
+				return harness.SessionResult{}, fmt.Errorf("unexpected thread %s", req.ThreadTS)
 			}
 		},
 	}
@@ -1901,13 +1907,14 @@ func TestForegroundRuntimeStarterDefersQueuedMentionsWhenGlobalConcurrencyIsFull
 		"1713686400.000500": make(chan struct{}),
 	}
 	adapter := &fakePromptAdapter{
-		sendPrompt: func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+		sendPrompt: func(_ context.Context, req harness.SessionRequest) (harness.SessionResult, error) {
 			started <- req.ThreadTS
 			<-releaseByThread[req.ThreadTS]
-			return acpxadapter.SessionResult{
-				SessionName: acpxadapter.SessionName(req.ThreadTS),
+			return harness.SessionResult{
+				SessionName: harness.SessionName(req.ThreadTS),
 				Output: fmt.Sprintf(
-					`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"result for %s"}}}}`+"\n"+`{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+					`{"kind":"assistant_message_chunk","text":"result for %[1]s"}
+{"kind":"assistant_message_final","text":"result for %[1]s"}`+"\n"+`{"kind":"session_done"}`,
 					req.ThreadTS,
 				),
 			}, nil
@@ -2007,7 +2014,7 @@ func TestForegroundRuntimeStarterDefersQueuedMentionsWhenGlobalConcurrencyIsFull
 	}
 }
 
-// Test: empty app_mention invocations do not call ACPX and instead return usage guidance in the mention thread.
+// Test: empty app_mention invocations do not call Agent and instead return usage guidance in the mention thread.
 // Validates: AC-1817 (REQ-1184 - empty mention invocations return usage-oriented guidance)
 func TestForegroundRuntimeStarterRendersUsageForEmptyMentionCommand(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2092,7 +2099,7 @@ func TestForegroundRuntimeStarterRendersUsageForEmptyMentionCommand(t *testing.T
 	}
 }
 
-// Test: unregistered mention invocations render a human-readable Slack message and do not start ACPX execution.
+// Test: unregistered mention invocations render a human-readable Slack message and do not start Agent execution.
 // Validates: AC-1821 (REQ-1190 - unregistered channels reject before execution starts), AC-1821 (REQ-1191 - mention rejections are regular Slack messages)
 func TestForegroundRuntimeStarterRendersUnregisteredMentionRejection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2190,7 +2197,7 @@ func TestForegroundRuntimeStarterRendersUnregisteredMentionRejection(t *testing.
 	}
 }
 
-// Test: unregistered slash invocations render an ephemeral response_url rejection and do not start ACPX execution.
+// Test: unregistered slash invocations render an ephemeral response_url rejection and do not start Agent execution.
 // Validates: AC-1822 (REQ-1190 - unregistered channels reject before execution starts), AC-1822 (REQ-1192 - slash rejections are ephemeral)
 func TestForegroundRuntimeStarterRendersUnregisteredSlashRejection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2329,13 +2336,14 @@ func TestForegroundRuntimeStarterAcknowledgesSlashAndPublishesAsyncThreadResult(
 	sendPromptStarted := make(chan struct{}, 1)
 	releasePrompt := make(chan struct{})
 	adapter := &fakePromptAdapter{
-		sendPrompt: func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
+		sendPrompt: func(_ context.Context, req harness.SessionRequest) (harness.SessionResult, error) {
 			sendPromptStarted <- struct{}{}
 			<-releasePrompt
-			return acpxadapter.SessionResult{
-				SessionName: acpxadapter.SessionName(req.ThreadTS),
-				Output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"async slash result"}}}}
-{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+			return harness.SessionResult{
+				SessionName: harness.SessionName(req.ThreadTS),
+				Output: `{"kind":"assistant_message_chunk","text":"async slash result"}
+{"kind":"assistant_message_final","text":"async slash result"}
+{"kind":"session_done"}`,
 			}, nil
 		},
 	}
@@ -2432,7 +2440,7 @@ func TestForegroundRuntimeStarterAcknowledgesSlashAndPublishesAsyncThreadResult(
 	if executionState.QueuedAt.IsZero() || executionState.StartedAt == nil || executionState.RenderingStartedAt == nil {
 		t.Fatalf("LoadExecutionStateByDelivery() timestamps = %#v, want queued/running/rendering markers", executionState)
 	}
-	if executionState.PublisherCheckpointKind != string(runtimemodel.ACPXEventSessionDone) || executionState.PublisherCheckpointSummary != "" {
+	if executionState.PublisherCheckpointKind != string(runtimemodel.AgentEventSessionDone) || executionState.PublisherCheckpointSummary != "" {
 		t.Fatalf("LoadExecutionStateByDelivery() checkpoint = (%q, %q), want session_done/empty summary", executionState.PublisherCheckpointKind, executionState.PublisherCheckpointSummary)
 	}
 
@@ -2599,11 +2607,12 @@ func TestForegroundRuntimeStarterProcessesSlashStatusCommand(t *testing.T) {
 
 	client := &recordingSlackClient{}
 	adapter := &fakePromptAdapter{
-		results: []acpxadapter.SessionResult{
+		results: []harness.SessionResult{
 			{
-				SessionName: acpxadapter.SessionName("1713686400.000100"),
-				Output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"slash status result"}}}}
-{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+				SessionName: harness.SessionName("1713686400.000100"),
+				Output: `{"kind":"assistant_message_chunk","text":"slash status result"}
+{"kind":"assistant_message_final","text":"slash status result"}
+{"kind":"session_done"}`,
 			},
 		},
 	}
@@ -2644,7 +2653,8 @@ func TestForegroundRuntimeStarterProcessesSlashStatusCommand(t *testing.T) {
 
 	waitForCondition(t, 2*time.Second, func() bool {
 		messages := client.snapshotMessages()
-		return len(messages) == 2 && messages[1].ThreadTS == "1713686400.000100" && messages[1].Text == "slash status result"
+		state, err := store.Runtime().LoadExecutionStateByDelivery(ctx, slack.InboundSourceSlash, "3-fwdc5")
+		return err == nil && state.Status == runtimemodel.ExecutionStatusProcessed && len(messages) == 2 && messages[1].ThreadTS == "1713686400.000100" && messages[1].Text == "slash status result"
 	})
 	cancel()
 
@@ -2676,7 +2686,7 @@ func TestForegroundRuntimeStarterProcessesSlashStatusCommand(t *testing.T) {
 		t.Fatalf("slash result thread ts = %q, want execution thread timestamp", messages[1].ThreadTS)
 	}
 	if messages[1].Text != "slash status result" {
-		t.Fatalf("slash result text = %q, want rendered ACPX output", messages[1].Text)
+		t.Fatalf("slash result text = %q, want rendered Agent output", messages[1].Text)
 	}
 
 	debugMu.Lock()
@@ -2733,8 +2743,8 @@ func TestForegroundRuntimeStarterReportsSlashAsyncFailureInExecutionThread(t *te
 
 	client := &recordingSlackClient{}
 	adapter := &fakePromptAdapter{
-		sendPrompt: func(_ context.Context, req acpxadapter.SessionRequest) (acpxadapter.SessionResult, error) {
-			return acpxadapter.SessionResult{}, errors.New("acpx async failure")
+		sendPrompt: func(_ context.Context, req harness.SessionRequest) (harness.SessionResult, error) {
+			return harness.SessionResult{}, errors.New("agent async failure")
 		},
 	}
 
@@ -2774,7 +2784,7 @@ func TestForegroundRuntimeStarterReportsSlashAsyncFailureInExecutionThread(t *te
 
 	waitForCondition(t, 2*time.Second, func() bool {
 		messages := client.snapshotMessages()
-		return len(messages) == 2 && messages[1].ThreadTS == "1713686400.000100" && strings.Contains(messages[1].Text, "Session error: acpx async failure")
+		return len(messages) == 2 && messages[1].ThreadTS == "1713686400.000100" && strings.Contains(messages[1].Text, "Session error: agent async failure")
 	})
 	cancel()
 
@@ -2789,7 +2799,7 @@ func TestForegroundRuntimeStarterReportsSlashAsyncFailureInExecutionThread(t *te
 	if messages[0].Text != slashStartText("status") {
 		t.Fatalf("slash start message text = %q, want %q", messages[0].Text, slashStartText("status"))
 	}
-	if messages[1].Text != "Session error: acpx async failure" {
+	if messages[1].Text != "Session error: agent async failure" {
 		t.Fatalf("slash failure message text = %q, want session error", messages[1].Text)
 	}
 
@@ -2798,7 +2808,7 @@ func TestForegroundRuntimeStarterReportsSlashAsyncFailureInExecutionThread(t *te
 	debugMu.Unlock()
 	for _, fragment := range []string{
 		"runtime.loop: slash ack sent delivery=3-fwdc3",
-		"runtime.loop: slash async failed delivery=3-fwdc3: acpx async failure",
+		"runtime.loop: slash async failed delivery=3-fwdc3: agent async failure",
 	} {
 		if !strings.Contains(output, fragment) {
 			t.Fatalf("debug output missing %q: %s", fragment, output)
@@ -2806,7 +2816,7 @@ func TestForegroundRuntimeStarterReportsSlashAsyncFailureInExecutionThread(t *te
 	}
 }
 
-// Test: if the worker cannot create the slash execution root message after ack, the runtime reports the failure through response_url and never starts ACPX.
+// Test: if the worker cannot create the slash execution root message after ack, the runtime reports the failure through response_url and never starts Agent.
 // Validates: AC-1983 (REQ-1435 - accepted slash execution is bound to a worker-owned execution thread), AC-1984 (REQ-1434 - post-ack bootstrap failures are deterministic and do not start execution)
 func TestForegroundRuntimeStarterReportsSlashBootstrapFailureViaResponseURL(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3008,7 +3018,7 @@ func TestForegroundRuntimeStarterHandleSlashInvocationAcknowledgesBeforeEnqueue(
 	}
 }
 
-// Test: duplicate mention deliveries reuse the source-aware dedupe record and do not execute ACPX twice.
+// Test: duplicate mention deliveries reuse the source-aware dedupe record and do not execute Agent twice.
 // Validates: AC-1825 (REQ-1193 - mention invocations are classified as source=mention), AC-1825 (REQ-1196 - duplicate mention deliveries are deduplicated), AC-1823 (REQ-1197 - mention lifecycle logs record source and status)
 func TestForegroundRuntimeStarterSkipsDuplicateMentionDelivery(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3355,7 +3365,7 @@ func TestForegroundRuntimeStarterReconcilesNonTerminalExecutionsOnStartup(t *tes
 	}
 }
 
-// Test: cancelled ACPX prompt streams persist cancelled execution state instead of being overwritten as processed.
+// Test: cancelled Agent prompt streams persist cancelled execution state instead of being overwritten as processed.
 // Validates: AC-1981 (REQ-1429 - cancelled lifecycle status is persisted), AC-1981 (REQ-1430 - publisher checkpoints and cancellation details are retained)
 func TestForegroundRuntimeStarterPersistsCancelledExecutionState(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3388,13 +3398,13 @@ func TestForegroundRuntimeStarterPersistsCancelledExecutionState(t *testing.T) {
 	}
 
 	stream := &controlledPromptStream{
-		sessionName: acpxadapter.SessionName("1713686400.000100"),
-		events:      make(chan acpxadapter.Event, 4),
+		sessionName: harness.SessionName("1713686400.000100"),
+		events:      make(chan harness.Event, 4),
 		waitCh:      make(chan error, 1),
 	}
 	client := &recordingSlackClient{}
 	adapter := &fakePromptAdapter{
-		startPrompt: func(context.Context, acpxadapter.SessionRequest) (acpxadapter.PromptStream, error) {
+		startPrompt: func(context.Context, harness.SessionRequest) (harness.PromptStream, error) {
 			return stream, nil
 		},
 	}
@@ -3422,8 +3432,8 @@ func TestForegroundRuntimeStarterPersistsCancelledExecutionState(t *testing.T) {
 		errCh <- starter.Start(ctx, runtimemodel.Status{})
 	}()
 
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventAssistantMessageChunk, Text: "working"}
-	stream.events <- acpxadapter.Event{Kind: acpxadapter.EventSessionCancelled, Text: "cancelled by operator"}
+	stream.events <- harness.Event{Kind: harness.EventAssistantMessageChunk, Text: "working"}
+	stream.events <- harness.Event{Kind: harness.EventSessionCancelled, Text: "cancelled by operator"}
 	close(stream.events)
 	stream.waitCh <- nil
 
@@ -3447,8 +3457,8 @@ func TestForegroundRuntimeStarterPersistsCancelledExecutionState(t *testing.T) {
 	if executionState.LastError != "cancelled by operator" {
 		t.Fatalf("LoadExecutionStateByDelivery() last error = %q, want cancellation reason", executionState.LastError)
 	}
-	if executionState.PublisherCheckpointKind != string(runtimemodel.ACPXEventSessionCancelled) {
-		t.Fatalf("LoadExecutionStateByDelivery() checkpoint kind = %q, want %q", executionState.PublisherCheckpointKind, runtimemodel.ACPXEventSessionCancelled)
+	if executionState.PublisherCheckpointKind != string(runtimemodel.AgentEventSessionCancelled) {
+		t.Fatalf("LoadExecutionStateByDelivery() checkpoint kind = %q, want %q", executionState.PublisherCheckpointKind, runtimemodel.AgentEventSessionCancelled)
 	}
 
 	threadState, err := store.Runtime().LoadThreadState(context.Background(), "1713686400.000100")
@@ -3510,11 +3520,12 @@ func TestForegroundRuntimeStarterSkipsDuplicateSlashDelivery(t *testing.T) {
 
 	client := &recordingSlackClient{}
 	adapter := &fakePromptAdapter{
-		results: []acpxadapter.SessionResult{
+		results: []harness.SessionResult{
 			{
-				SessionName: acpxadapter.SessionName("1713686400.000100"),
-				Output: `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"019db13d-f733-7ce0-8186-5aced7cdb2a7","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"deduped slash result"}}}}
-{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
+				SessionName: harness.SessionName("1713686400.000100"),
+				Output: `{"kind":"assistant_message_chunk","text":"deduped slash result"}
+{"kind":"assistant_message_final","text":"deduped slash result"}
+{"kind":"session_done"}`,
 			},
 		},
 	}
@@ -3800,7 +3811,7 @@ func TestRuntimeReloadPreservesStateOnInvalidConfigChange(t *testing.T) {
 	}
 }
 
-// Test: canceling an inactive thread returns an explicit no-op status and does not invoke ACPX.
+// Test: canceling an inactive thread returns an explicit no-op status and does not invoke Agent.
 // Validates: AC-1795 (REQ-1156 - cancel requests cancellation without corrupting the thread/session mapping)
 func TestRuntimeCancelReturnsNoOpForInactiveThread(t *testing.T) {
 	ctx := context.Background()
@@ -3859,11 +3870,11 @@ func TestRuntimeCancelReturnsNoOpForInactiveThread(t *testing.T) {
 		t.Fatalf("cancel report thread ts = %q, want thread timestamp", report.ThreadTS)
 	}
 	if len(cancelAdapter.cancelCalls) != 0 {
-		t.Fatalf("Cancel() invoked ACPX for inactive thread: %#v", cancelAdapter.cancelCalls)
+		t.Fatalf("Cancel() invoked Agent for inactive thread: %#v", cancelAdapter.cancelCalls)
 	}
 }
 
-// Test: canceling an active thread interrupts ACPX, preserves the thread/session mapping, and updates runtime status.
+// Test: canceling an active thread interrupts Agent, preserves the thread/session mapping, and updates runtime status.
 // Validates: AC-1795 (REQ-1156 - cancel requests cancellation without corrupting the thread/session mapping)
 func TestRuntimeCancelCancelsActiveThreadWithoutCorruptingMapping(t *testing.T) {
 	ctx := context.Background()
@@ -4116,7 +4127,7 @@ func TestRuntimeCancelCancelsRunningExecutionWhenThreadSummaryIsQueued(t *testin
 }
 
 // Test: threaded app_mention close still routes through the local cancel surface after startup recovery has already reconciled stale running work.
-// Validates: thread mention close uses the local runtime cancel surface instead of ACPX prompt routing, and reports a no-op when startup recovery already marked the thread inactive
+// Validates: thread mention close uses the local runtime cancel surface instead of Agent prompt routing, and reports a no-op when startup recovery already marked the thread inactive
 func TestForegroundRuntimeStarterCancelsActiveThreadFromMentionCommand(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -4247,7 +4258,7 @@ func TestForegroundRuntimeStarterCancelsActiveThreadFromMentionCommand(t *testin
 		t.Fatalf("slack messages = %#v, debug=%s", messages, debug.String())
 	}
 	if len(cancelAdapter.cancelCalls) != 0 {
-		t.Fatalf("Cancel() calls = %#v, want no ACPX cancel after startup recovery", cancelAdapter.cancelCalls)
+		t.Fatalf("Cancel() calls = %#v, want no Agent cancel after startup recovery", cancelAdapter.cancelCalls)
 	}
 	verifyCtx := context.Background()
 	execution, err := store.Runtime().LoadExecutionState(verifyCtx, "exec-mention-cancel-1")

@@ -60,7 +60,7 @@ func ParseSlackCommand(text string) SlackCommand {
 			Kind:   SlackCommandAsk,
 			Prompt: remainder,
 		}
-	case string(SlackCommandClose):
+	case string(SlackCommandClose), "stop":
 		if remainder != "" {
 			return SlackCommand{Kind: SlackCommandInvalid}
 		}
@@ -79,7 +79,7 @@ func (c SlackCommand) ShouldExecute() bool {
 	}
 }
 
-func (c SlackCommand) ACPXPrompt() string {
+func (c SlackCommand) AgentPrompt() string {
 	switch c.Kind {
 	case SlackCommandStatus:
 		return "status"
@@ -95,10 +95,10 @@ func (c SlackCommand) ACPXPrompt() string {
 func SlackCommandHelpText(surface SlackCommandSurface) string {
 	switch surface {
 	case SlackCommandSurfaceSlash:
-		return "Supported commands: `help`, `status`, `ask <prompt>`, and `close`. Usage: `/spexus help`, `/spexus status`, `/spexus ask <prompt>`, or `/spexus close`."
+		return "Supported commands: `help`, `status`, `ask <prompt>`, `stop`, and `close`. Use `!stop` in a thread to interrupt the current turn; reply to continue. Usage: `/spexus help`, `/spexus status`, `/spexus ask <prompt>`, or `/spexus close`."
 	default:
 		return fmt.Sprintf(
-			"Supported commands: `help`, `status`, `ask <prompt>`, and `close`. Usage: mention the agent with one of those commands, for example `%s`.",
+			"Supported commands: `help`, `status`, `ask <prompt>`, `stop`, and `close`. Use `!stop` in a thread to interrupt the current turn; reply to continue. Usage: mention the agent with one of those commands, for example `%s`.",
 			"<@agent> ask summarize current project state",
 		)
 	}

@@ -39,25 +39,25 @@ func TestParseSlackCommandRecognizesSupportedCommands(t *testing.T) {
 	}
 }
 
-// Test: the shared Slack command parser routes only valid executable commands into ACPX-ready prompt text.
+// Test: the shared Slack command parser routes only valid executable commands into Agent-ready prompt text.
 // Validates: AC-1817 (REQ-1184 - empty mention commands return usage guidance), AC-1820 (REQ-1189 - ask forwards prompt text)
-func TestParseSlackCommandBuildsACPXPromptOnlyForExecutableCommands(t *testing.T) {
+func TestParseSlackCommandBuildsAgentPromptOnlyForExecutableCommands(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name       string
-		input      string
-		shouldRun  bool
-		acpxPrompt string
-		expectKind SlackCommandKind
+		name        string
+		input       string
+		shouldRun   bool
+		agentPrompt string
+		expectKind  SlackCommandKind
 	}{
 		{name: "empty", input: "", shouldRun: false, expectKind: SlackCommandInvalid},
 		{name: "help", input: "help", shouldRun: false, expectKind: SlackCommandHelp},
 		{name: "unknown", input: "review", shouldRun: false, expectKind: SlackCommandInvalid},
 		{name: "ask missing prompt", input: "ask", shouldRun: false, expectKind: SlackCommandInvalid},
-		{name: "status", input: "status", shouldRun: true, acpxPrompt: "status", expectKind: SlackCommandStatus},
-		{name: "ask", input: "ask summarize open work", shouldRun: true, acpxPrompt: "summarize open work", expectKind: SlackCommandAsk},
-		{name: "close", input: "close", shouldRun: true, acpxPrompt: "cancel", expectKind: SlackCommandClose},
+		{name: "status", input: "status", shouldRun: true, agentPrompt: "status", expectKind: SlackCommandStatus},
+		{name: "ask", input: "ask summarize open work", shouldRun: true, agentPrompt: "summarize open work", expectKind: SlackCommandAsk},
+		{name: "close", input: "close", shouldRun: true, agentPrompt: "cancel", expectKind: SlackCommandClose},
 	}
 
 	for _, tc := range cases {
@@ -72,8 +72,8 @@ func TestParseSlackCommandBuildsACPXPromptOnlyForExecutableCommands(t *testing.T
 			if command.ShouldExecute() != tc.shouldRun {
 				t.Fatalf("ParseSlackCommand(%q) ShouldExecute() = %t, want %t", tc.input, command.ShouldExecute(), tc.shouldRun)
 			}
-			if got := command.ACPXPrompt(); got != tc.acpxPrompt {
-				t.Fatalf("ParseSlackCommand(%q) ACPXPrompt() = %q, want %q", tc.input, got, tc.acpxPrompt)
+			if got := command.AgentPrompt(); got != tc.agentPrompt {
+				t.Fatalf("ParseSlackCommand(%q) AgentPrompt() = %q, want %q", tc.input, got, tc.agentPrompt)
 			}
 		})
 	}

@@ -93,7 +93,7 @@ func TestSlashExecutionRequestWithThreadBuildsPreparedEvent(t *testing.T) {
 }
 
 // Test: enqueue returns before the async handler completes so ingress can continue without waiting for execution.
-// Validates: AC-1975 (REQ-1417 - ingress does not wait for ACPX completion), AC-1975 (REQ-1419 - ingress returns control to the intake loop immediately)
+// Validates: AC-1975 (REQ-1417 - ingress does not wait for Agent completion), AC-1975 (REQ-1419 - ingress returns control to the intake loop immediately)
 func TestAsyncExecutionQueueEnqueueReturnsBeforeHandlerCompletes(t *testing.T) {
 	t.Parallel()
 

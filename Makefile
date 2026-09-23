@@ -28,8 +28,9 @@ write-service-env:
 	{ \
 		printf 'HOME=%s\n' "$(HOME)"; \
 		printf 'PATH=%s\n' "$$PATH"; \
-		printf 'SPEXUS_AGENT_ACPX_BIN=%s\n' "$$(command -v acpx)"; \
-		if [ -n "$$CODEX_HOME" ]; then printf 'CODEX_HOME=%s\n' "$$CODEX_HOME"; fi; \
+		printf 'SPEXUS_AGENT_PI_BIN=%s\n' "$$(command -v pi)"; \
+		if [ -n "$$SPEXUS_AGENT_HOME" ]; then printf 'SPEXUS_AGENT_HOME=%s\n' "$$SPEXUS_AGENT_HOME"; fi; \
+		if [ -n "$$PI_CODING_AGENT_DIR" ]; then printf 'PI_CODING_AGENT_DIR=%s\n' "$$PI_CODING_AGENT_DIR"; fi; \
 		if [ -n "$$XDG_CONFIG_HOME" ]; then printf 'XDG_CONFIG_HOME=%s\n' "$$XDG_CONFIG_HOME"; fi; \
 		if [ -n "$$ANDROID_HOME" ]; then printf 'ANDROID_HOME=%s\n' "$$ANDROID_HOME"; fi; \
 		if [ -n "$$ANDROID_SDK_ROOT" ]; then printf 'ANDROID_SDK_ROOT=%s\n' "$$ANDROID_SDK_ROOT"; fi; \
@@ -73,6 +74,11 @@ tests:
 	go test ./...
 
 # SP-EP-016 release evidence: the agent has no direct Spexus backend/RBAC API
-# client. Keep that boundary and its supported Slack -> ACPX flow reproducible.
+# client. Keep that boundary and its supported Slack -> Pi flow reproducible.
 verify-sp-ep-016-agent-compat:
 	./scripts/sp-ep-016-agent-compat.sh
+
+.PHONY: verify-pi
+verify-pi:
+	@command -v pi >/dev/null || (echo "Install Pi first" >&2; exit 1)
+	SPEXUS_TEST_PI_BIN="$$(command -v pi)" go test -race ./... -count=1

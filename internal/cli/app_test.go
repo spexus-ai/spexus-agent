@@ -232,7 +232,7 @@ func TestAppRunRuntimeStartRoutesDebugFlag(t *testing.T) {
 // Test the runtime start path treats SIGTERM-style cancellation as a clean service shutdown.
 // Validates: AC-1800 (REQ-1161 - runtime start is suitable as an ExecStart target for user-level service managers), AC-1801 (REQ-1162 - runtime lifecycle surface includes a stop-compatible termination path)
 func TestAppRunRuntimeStartExitsCleanlyOnShutdownSignal(t *testing.T) {
-	t.Parallel()
+	// Overrides a process-wide signal hook; must not overlap parallel CLI tests.
 
 	originalSignalNotifyContext := signalNotifyContext
 	defer func() {

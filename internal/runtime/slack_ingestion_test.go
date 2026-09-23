@@ -23,7 +23,7 @@ func (f *fakeProjectContextResolver) GetByChannelID(context.Context, string) (re
 	return f.project, nil
 }
 
-// Test: registered channel events resolve the project context and prepare thread/session metadata without invoking ACPX.
+// Test: registered channel events resolve the project context and prepare thread/session metadata without invoking Agent.
 // Validates: AC-1789 (REQ-1150 - runtime resolves project context from the active registered channel binding), AC-1787 (REQ-1148 - root messages create or ensure a thread session)
 func TestPrepareSlackEventResolvesRegisteredChannelContext(t *testing.T) {
 	t.Parallel()
@@ -106,7 +106,7 @@ func TestPrepareSlackEventResolvesThreadReplyContext(t *testing.T) {
 }
 
 // Test: unregistered channels are rejected before the runtime can prepare any orchestration state.
-// Validates: AC-1790 (REQ-1151 - runtime does not invoke ACPX for unregistered channels)
+// Validates: AC-1790 (REQ-1151 - runtime does not invoke Agent for unregistered channels)
 func TestPrepareSlackEventRejectsUnregisteredChannel(t *testing.T) {
 	t.Parallel()
 
@@ -170,7 +170,7 @@ func TestPrepareSlackInvocationResolvesRegisteredSlashChannelContext(t *testing.
 	}
 }
 
-// Test: unregistered mention invocations produce a human-readable Slack message rejection before ACPX can start.
+// Test: unregistered mention invocations produce a human-readable Slack message rejection before Agent can start.
 // Validates: AC-1821 (REQ-1190 - unregistered channels reject before execution starts), AC-1821 (REQ-1191 - mention rejections are regular Slack messages)
 func TestPrepareSlackInvocationRejectsUnregisteredMentionChannel(t *testing.T) {
 	t.Parallel()
@@ -204,7 +204,7 @@ func TestPrepareSlackInvocationRejectsUnregisteredMentionChannel(t *testing.T) {
 	}
 }
 
-// Test: unregistered slash invocations produce an ephemeral rejection contract before ACPX can start.
+// Test: unregistered slash invocations produce an ephemeral rejection contract before Agent can start.
 // Validates: AC-1822 (REQ-1190 - unregistered channels reject before execution starts), AC-1822 (REQ-1192 - slash rejections are ephemeral)
 func TestPrepareSlackInvocationRejectsUnregisteredSlashChannel(t *testing.T) {
 	t.Parallel()
@@ -373,7 +373,7 @@ func TestPrepareSlackMentionEventLeavesEmptyCommandForUsageHandling(t *testing.T
 	}
 }
 
-// Test: plain thread message invocations preserve their text as the direct ACPX prompt.
+// Test: plain thread message invocations preserve their text as the direct Agent prompt.
 func TestPrepareSlackMessageEventPreservesPromptText(t *testing.T) {
 	t.Parallel()
 
