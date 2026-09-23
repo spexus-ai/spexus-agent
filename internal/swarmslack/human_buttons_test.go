@@ -134,13 +134,13 @@ func TestHumanQuestionShowsCompactContextWithoutInternalIdentifiers(t *testing.T
 	message := "Решение человека требуется для работы.\nЗапрос: " + id +
 		"\nПричина: " + strings.Repeat("Нужны данные. ", 30) +
 		"\nКонтекст: " + strings.Repeat("Исполнитель ждёт. ", 30) +
-		"\nBlocked work: internal detail\nВопрос: Какой формат выбрать?\nРекомендация: Короткий текст.\nОжидает: подготовка результата (job " + id + ", attempt " + id + ")\n• short — Коротко\nВыберите вариант кнопкой ниже."
+		"\nBlocked work: internal detail\nВопрос: Какой формат выбрать?\nРекомендация: Короткий текст.\nОжидает: Goal: подготовка результата (job " + id + ", attempt " + id + ")\n• short — Коротко\nВыберите вариант кнопкой ниже."
 	got := humanReadableQuestionText(message, []swarm.HumanOption{{ID: "short", Label: "Коротко"}}, 0, true)
 	if !strings.HasPrefix(got, "Нужен ваш ответ: Какой формат выбрать?") ||
 		!strings.Contains(got, "Почему спрашиваю:") || strings.Contains(got, "Контекст:") ||
 		!strings.Contains(got, "Рекомендация:") || !strings.Contains(got, "Ждёт ответа:") ||
 		!strings.Contains(got, "Выберите вариант или ответьте своими словами") ||
-		strings.Contains(got, id) || strings.Contains(got, "Blocked work:") ||
+		strings.Contains(got, id) || strings.Contains(got, "Blocked work:") || strings.Contains(got, "Goal:") ||
 		strings.Contains(got, "!answer") || len([]rune(got)) > 700 {
 		t.Fatalf("question not compact and actionable: %q", got)
 	}

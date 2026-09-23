@@ -322,6 +322,7 @@ func humanReadableQuestionText(message string, options []swarm.HumanOption, _ in
 			if before, _, ok := strings.Cut(waiting, " (step "); ok {
 				waiting = before
 			}
+			waiting = strings.TrimSpace(strings.TrimPrefix(waiting, "Goal: "))
 			readable := []string{"Нужен ваш ответ: " + compactHumanField(fields["Вопрос: "], 240)}
 			for _, item := range []struct {
 				label, value string
