@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/spexus-ai/spexus-agent/internal/slack"
@@ -208,6 +209,37 @@ func (a *API) call(ctx context.Context, method string, payload any, result any) 
 	}
 	return nil
 }
+
+// SetThreadStatus shows transient progress in an existing Slack thread.
+// An empty status clears the indicator; durable human state remains in Spexus.
+func (a *API) SetThreadStatus(ctx context.Context, channelID, threadTS, status string) error {
+	if len(channelID) < 2 || len(channelID) > 128 || (channelID[0] != 'C' && channelID[0] != 'G' && channelID[0] != 'D') || !validTimestamp(threadTS) || len(status) > 200 || !utf8.ValidString(status) || (status != "" && strings.TrimSpace(status) != status) {
+		return errors.New("invalid Slack thread status")
+	}
+	for _, c := range channelID[1:] {
+		if c < 'A' || c > 'Z' {
+			if c < '0' || c > '9' {
+				return errors.New("invalid Slack thread status")
+			}
+		}
+	}
+	for _, r := range status {
+		if unicode.IsControl(r) {
+			return errors.New("invalid Slack thread status")
+		}
+	}
+	var result struct {
+		OK bool `json:"ok"`
+	}
+	if err := a.call(ctx, "assistant.threads.setStatus", map[string]string{"channel_id": channelID, "thread_ts": threadTS, "status": status}, &result); err != nil {
+		return err
+	}
+	if !result.OK {
+		return errors.New("Slack thread status rejected")
+	}
+	return nil
+}
+
 func (a *API) Post(ctx context.Context, d swarm.SlackDelivery) (string, error) {
 	var res struct {
 		OK    bool   `json:"ok"`
