@@ -432,3 +432,38 @@ func TestOwnerFinishCancellationBetweenReadAndCommit(t *testing.T) {
 		t.Fatal("accepted reconciliation not applied")
 	}
 }
+
+func TestOwnerReviewEvidenceRequiresObjects(t *testing.T) {
+	var gets atomic.Int32
+	r, _ := runnerFixture(t, http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		gets.Add(1)
+		if !strings.Contains(q.URL.Path, "/jobs/") {
+			t.Errorf("unexpected network action %s", q.URL.Path)
+		}
+		writeJSON(w, swarm.JobView{JobID: job, FeatureID: feature, CurrentAttemptID: attempt, Attempts: []swarm.Attempt{{AttemptID: attempt, AssignedAgentID: "worker-a", State: "succeeded"}}})
+	}))
+	r.cfg.Role = "owner"
+	r.cfg.AgentID = "owner"
+	d := dispatchFixture(r)
+	data := map[string]any{"job_id": job, "attempt_id": attempt, "result_message_id": swarm.NewID(), "verdict": "accepted", "reason": "17+25+38=80", "evidence": []string{"Сумма: 80", "ALPHA-619"}}
+	encode := func() string {
+		raw, _ := json.Marshal(data)
+		output, _ := json.Marshal(ownerOutput{Actions: []action{{Kind: "review", Data: raw}}, Reply: "Reviewed"})
+		return string(output)
+	}
+	if _, actions, e := r.ownerActions(d, swarm.NewID(), encode()); e == nil || actions != nil {
+		t.Fatal("live invalid string evidence was accepted or coerced")
+	}
+	if gets.Load() != 0 {
+		t.Fatal("invalid evidence reached dependent API before strict decode")
+	}
+	data["evidence"] = []swarm.Evidence{{Kind: "text", Label: "sum", ContentOrRef: "17+25+38=80"}}
+	_, actions, e := r.ownerActions(d, swarm.NewID(), encode())
+	if e != nil || len(actions) != 1 || actions[0].Type != "task.review" {
+		t.Fatalf("schema-valid evidence object rejected: %v", e)
+	}
+	h, _ := r.journal.History()
+	if h.Pending != 0 {
+		t.Fatal("validation had publish side effect")
+	}
+}
