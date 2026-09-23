@@ -62,7 +62,7 @@ func slackTSCompare(a, b string) int {
 }
 
 func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, error) {
-	if s.cfg.WireVersion != 2 || !uuid(in.FeatureID) || in.WorkspaceID != s.cfg.Human.WorkspaceID || in.ChannelID == "" || in.ActorID == "" || !validSlackTS(in.MessageTS) || !validSlackTS(in.ThreadTS) || len(in.Text) > 16*1024 || in.SourceKind != "" && in.SourceKind != "block_action" && in.SourceKind != "button_control" {
+	if s.cfg.WireVersion != 2 || !uuid(in.FeatureID) || in.WorkspaceID != s.cfg.Human.WorkspaceID || in.ChannelID == "" || in.ActorID == "" || !validSlackTS(in.MessageTS) || !validSlackTS(in.ThreadTS) || len(in.Text) > 16*1024 || in.SourceKind != "" && in.SourceKind != "block_action" && in.SourceKind != "button_control" && in.SourceKind != "feature_control" {
 		return false, wireError(400, "invalid_slack_source")
 	}
 	if in.SourceKind == "block_action" && (!uuid(in.RequestID) || !validSlackTS(in.QuestionTS) || in.OptionID == "" || len(in.OptionID) > 64 || in.Text != "") {
@@ -70,6 +70,9 @@ func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, er
 	}
 	if in.SourceKind == "button_control" && (!uuid(in.RequestID) || !validSlackTS(in.QuestionTS) || in.OptionID != "details" && in.OptionID != "stop" || in.OptionID == "details" && in.Text != HumanDetailsControlText || in.OptionID == "stop" && in.Text != "!stop") {
 		return false, wireError(400, "invalid_slack_control")
+	}
+	if in.SourceKind == "feature_control" && (in.RequestID != "" || in.OptionID != "stop" || in.Text != "!stop" || in.QuestionTS != in.ThreadTS) {
+		return false, wireError(400, "invalid_feature_control")
 	}
 	duplicate := false
 	err := s.transaction(ctx, func(tx *sql.Tx) error {

@@ -44,14 +44,15 @@ type MessageUpdater interface {
 }
 
 type Event struct {
-	ID          string
-	WorkspaceID string
-	ChannelID   string
-	ThreadTS    string
-	Timestamp   string
-	UserID      string
-	Text        string
-	HumanAction *HumanAction
+	ID             string
+	WorkspaceID    string
+	ChannelID      string
+	ThreadTS       string
+	Timestamp      string
+	UserID         string
+	Text           string
+	HumanAction    *HumanAction
+	FeatureControl *FeatureControl
 }
 
 // HumanAction is transport metadata from a Block Kit click, never model text.
@@ -60,6 +61,13 @@ type HumanAction struct {
 	OptionID   string
 	ControlID  string
 	QuestionTS string
+}
+
+// FeatureControl is a button on the feature's root Slack message.
+type FeatureControl struct {
+	FeatureID string
+	AnchorTS  string
+	ControlID string
 }
 
 const (

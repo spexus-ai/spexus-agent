@@ -450,6 +450,15 @@ func (h *humanIngress) scanAll(ctx context.Context) error {
 }
 
 func (h *humanIngress) handle(ctx context.Context, event slack.Event) error {
+	if event.FeatureControl != nil {
+		for _, f := range h.bridge.Features {
+			if f.FeatureID == event.FeatureControl.FeatureID && f.ChannelID == event.ChannelID && f.ThreadTS == event.FeatureControl.AnchorTS && event.ThreadTS == f.ThreadTS {
+				_, err := h.commit(ctx, f, event)
+				return err
+			}
+		}
+		return errors.New("Slack feature control scope mismatch")
+	}
 	if event.HumanAction != nil {
 		featureID, thread, err := h.store.PublishedHumanQuestion(ctx, event.HumanAction.RequestID, event.HumanAction.QuestionTS)
 		if err != nil {
@@ -484,6 +493,12 @@ func (h *humanIngress) commit(ctx context.Context, f swarm.Feature, event slack.
 	if !allowed(f, event.UserID) {
 		return false, nil
 	}
+	if event.FeatureControl != nil {
+		if event.FeatureControl.ControlID != "stop" {
+			return false, errors.New("unknown feature control")
+		}
+		event.Text = "!stop"
+	}
 	if event.HumanAction != nil && event.HumanAction.ControlID != "" {
 		switch event.HumanAction.ControlID {
 		case "details":
@@ -507,6 +522,9 @@ func (h *humanIngress) commit(ctx context.Context, f swarm.Feature, event slack.
 		} else {
 			in.OptionID = event.HumanAction.OptionID
 		}
+	}
+	if event.FeatureControl != nil {
+		in.SourceKind, in.QuestionTS, in.OptionID = "feature_control", event.FeatureControl.AnchorTS, event.FeatureControl.ControlID
 	}
 	duplicate, err := h.store.CommitSlackSource(ctx, in)
 	if err != nil {
@@ -569,8 +587,14 @@ func (h *humanIngress) processStop(ctx context.Context, source swarm.SlackSource
 	}
 	for _, in := range pending {
 		if in.ChannelID == source.ChannelID && in.MessageTS == source.MessageTS {
-			if err := h.store.StopFeature(ctx, in.FeatureID, in.ActorID, "Slack !stop"); err != nil {
+			view, err := h.store.History(ctx, in.FeatureID)
+			if err != nil {
 				return err
+			}
+			if !view.Feature.Stopped {
+				if err := h.store.StopFeature(ctx, in.FeatureID, in.ActorID, "Slack !stop"); err != nil {
+					return err
+				}
 			}
 			if err := h.notice(ctx, in, "Работа остановлена. Активные процессы завершаются штатным контролем."); err != nil {
 				return err

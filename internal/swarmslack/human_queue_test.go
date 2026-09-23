@@ -10,6 +10,46 @@ import (
 	"github.com/spexus-ai/spexus-agent/internal/swarm"
 )
 
+func TestRootStopButtonWorksWithoutQuestionAndDoesNotRepeatStop(t *testing.T) {
+	ctx := context.Background()
+	store, feature := newHumanTransportStore(t)
+	h := &humanIngress{bridge: &Bridge{Store: store, Features: []swarm.Feature{feature}}, store: store, workspace: "W"}
+	click := slack.Event{ID: "delivery-1", WorkspaceID: "W", ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "100.000001", UserID: "U", FeatureControl: &slack.FeatureControl{FeatureID: feature.FeatureID, AnchorTS: feature.ThreadTS, ControlID: "stop"}}
+	if err := h.handle(ctx, click); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.handle(ctx, click); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	click.ID, click.Timestamp = "delivery-2", "100.000002"
+	if err := h.handle(ctx, click); err != nil {
+		t.Fatalf("second click: %v", err)
+	}
+	history, err := store.History(ctx, feature.FeatureID)
+	if err != nil || !history.Feature.Stopped || countOwnerInputs(history) != 0 {
+		t.Fatalf("stop result=%+v err=%v", history.Feature, err)
+	}
+	stops := 0
+	for _, a := range history.Audit {
+		if a.Event == "feature_stopped" {
+			stops++
+		}
+	}
+	if stops != 1 {
+		t.Fatalf("feature stopped %d times", stops)
+	}
+	click.FeatureControl.FeatureID = swarm.NewID()
+	click.Timestamp = "100.000003"
+	if err := h.handle(ctx, click); err == nil {
+		t.Fatal("foreign feature button accepted")
+	}
+	click.FeatureControl.FeatureID = feature.FeatureID
+	click.FeatureControl.AnchorTS = "2.000001"
+	if err := h.handle(ctx, click); err == nil {
+		t.Fatal("foreign anchor button accepted")
+	}
+}
+
 func TestStoppedThreadDeliversStopAndLaterMessagesAfterContinue(t *testing.T) {
 	ctx := context.Background()
 	store, feature := newHumanTransportStore(t)

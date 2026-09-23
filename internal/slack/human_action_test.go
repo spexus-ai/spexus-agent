@@ -80,3 +80,44 @@ func TestHumanControlBlockActionEnvelope(t *testing.T) {
 		}
 	}
 }
+
+func TestFeatureStopControlRequiresRootMessage(t *testing.T) {
+	value, _ := json.Marshal(map[string]string{"feature_id": "123e4567-e89b-42d3-a456-426614174000"})
+	base := map[string]any{
+		"type": "block_actions", "team": map[string]string{"id": "T"}, "user": map[string]string{"id": "U", "team_id": "T"},
+		"channel": map[string]string{"id": "C"}, "container": map[string]string{"type": "message", "channel_id": "C", "message_ts": "1.000001"},
+		"message": map[string]string{"ts": "1.000001"},
+		"actions": []any{map[string]string{"type": "button", "action_id": FeatureControlActionID + ":stop", "value": string(value), "action_ts": "2.000001"}},
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(map[string]any)
+		valid  bool
+	}{
+		{"root", func(map[string]any) {}, true},
+		{"root thread metadata", func(m map[string]any) { m["message"] = map[string]string{"ts": "1.000001", "thread_ts": "1.000001"} }, true},
+		{"reply", func(m map[string]any) { m["message"] = map[string]string{"ts": "1.000001", "thread_ts": "0.000001"} }, false},
+		{"wrong channel", func(m map[string]any) { m["channel"] = map[string]string{"id": "other"} }, false},
+		{"wrong workspace", func(m map[string]any) { m["user"] = map[string]string{"id": "U", "team_id": "other"} }, false},
+		{"missing feature", func(m map[string]any) {
+			m["actions"] = []any{map[string]string{"type": "button", "action_id": FeatureControlActionID + ":stop", "value": "{}", "action_ts": "2.000001"}}
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := map[string]any{}
+			for key, v := range base {
+				m[key] = v
+			}
+			tc.mutate(m)
+			payload, _ := json.Marshal(m)
+			got, ok, err := eventFromSocketModeEnvelope(socketModeEnvelope{EnvelopeID: "delivery", Type: "interactive", Payload: payload})
+			if tc.valid {
+				if err != nil || !ok || got.FeatureControl == nil || got.FeatureControl.FeatureID != "123e4567-e89b-42d3-a456-426614174000" || got.ThreadTS != "1.000001" || got.Timestamp != "2.000001" {
+					t.Fatalf("root control: got=%+v ok=%t err=%v", got, ok, err)
+				}
+			} else if err == nil || ok {
+				t.Fatalf("invalid root control accepted: got=%+v ok=%t err=%v", got, ok, err)
+			}
+		})
+	}
+}

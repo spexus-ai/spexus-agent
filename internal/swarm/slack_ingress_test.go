@@ -40,6 +40,38 @@ func TestSlackSourceDedupAndConflict(t *testing.T) {
 	}
 }
 
+func TestFeatureStopButtonSourceIsScopedAndIdempotent(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	in := SlackSource{WorkspaceID: "workspace", ChannelID: f.feature.ChannelID, ThreadTS: f.feature.ThreadTS, MessageTS: "124.000001", FeatureID: f.feature.FeatureID, ActorID: "human", SourceKind: "feature_control", QuestionTS: f.feature.ThreadTS, OptionID: "stop", Text: "!stop"}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*SlackSource)
+	}{
+		{"wrong anchor", func(s *SlackSource) { s.QuestionTS = "1.000002" }},
+		{"foreign actor", func(s *SlackSource) { s.ActorID = "other" }},
+		{"foreign channel", func(s *SlackSource) { s.ChannelID = "other" }},
+		{"forged command", func(s *SlackSource) { s.Text = "!continue" }},
+		{"request attached", func(s *SlackSource) { s.RequestID = NewID() }},
+	} {
+		bad := in
+		tc.mutate(&bad)
+		if _, err := f.s.CommitSlackSource(ctx, bad); err == nil {
+			t.Fatalf("%s accepted", tc.name)
+		}
+	}
+	if duplicate, err := f.s.CommitSlackSource(ctx, in); err != nil || duplicate {
+		t.Fatalf("first stop control duplicate=%t err=%v", duplicate, err)
+	}
+	if duplicate, err := f.s.CommitSlackSource(ctx, in); err != nil || !duplicate {
+		t.Fatalf("replayed stop control duplicate=%t err=%v", duplicate, err)
+	}
+	committed, err := f.s.CommittedSlackSource(ctx, in.WorkspaceID, in.ChannelID, in.MessageTS)
+	if err != nil || committed.SourceKind != "feature_control" || committed.Text != "!stop" {
+		t.Fatalf("committed stop control=%+v err=%v", committed, err)
+	}
+}
+
 // Test: the click is committed only for the published request's exact channel,
 // thread and bot message. A repeated Socket envelope has one local source.
 // Validates: AC-431/464 (REQ-349/391 - click provenance and deduplication).
