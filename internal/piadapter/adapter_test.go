@@ -180,6 +180,15 @@ func TestPiHelperProcess(t *testing.T) {
 		history += r.Message
 		_ = os.WriteFile(file, []byte(history), 0600)
 		emit(map[string]any{"type": "response", "command": "prompt", "success": true})
+		if r.Message == "two-messages" || r.Message == "no-final" {
+			emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "UNTRUSTED DRAFT"}})
+			if r.Message == "two-messages" {
+				emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "stop", "content": []map[string]any{{"type": "text", "text": "draft must not be final"}}}})
+				emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "stop", "content": []map[string]any{{"type": "text", "text": `{"outcome":"succeeded"}`}}}})
+			}
+			emit(map[string]any{"type": "agent_settled"})
+			continue
+		}
 		if r.Message == "provider-error" {
 			emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "test provider rejected request"}})
 			emit(map[string]any{"type": "agent_settled"})
@@ -187,9 +196,29 @@ func TestPiHelperProcess(t *testing.T) {
 		}
 		emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": fmt.Sprintf("history=%s model=%s system=%s cwd=%s", history, arg("--model"), arg("--system-prompt"), cwd)}})
 		if r.Message != "wait" {
+			emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "stop", "content": []map[string]any{{"type": "text", "text": fmt.Sprintf("history=%s model=%s system=%s cwd=%s", history, arg("--model"), arg("--system-prompt"), cwd)}}}})
 			emit(map[string]any{"type": "agent_end"})
 			emit(map[string]any{"type": "agent_settled"})
 		}
 	}
 	os.Exit(0)
+}
+
+func TestFinalMessageIsNotDraftDeltaConcatenation(t *testing.T) {
+	a := helperAdapter(t)
+	for _, tc := range []struct{ prompt, want string }{{"two-messages", `{"outcome":"succeeded"}`}, {"no-final", ""}} {
+		events, err := prompt(t, a, tc.prompt, tc.prompt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		final := ""
+		for _, event := range events {
+			if event.Kind == harness.EventAssistantMessageFinal {
+				final = event.Text
+			}
+		}
+		if final != tc.want {
+			t.Fatalf("final=%q want=%q", final, tc.want)
+		}
+	}
 }

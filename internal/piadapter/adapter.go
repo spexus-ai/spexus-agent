@@ -172,11 +172,21 @@ type promptStream struct {
 	mu          sync.Mutex
 	err         error
 	cancelled   bool
+	completed   bool
 }
 
 func (s *promptStream) SessionName() string          { return s.name }
 func (s *promptStream) Events() <-chan harness.Event { return s.events }
 func (s *promptStream) Wait() error                  { <-s.done; s.mu.Lock(); defer s.mu.Unlock(); return s.err }
+
+// Completed distinguishes settled model completion from a cancellation arriving
+// after output, independently of whether that output is empty or invalid JSON.
+func (s *promptStream) Completed() bool {
+	<-s.done
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.completed
+}
 func (s *promptStream) send(v any) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -224,7 +234,7 @@ func (s *promptStream) run(stdout io.ReadCloser, cleanup func()) {
 	settled := false
 	var runErr error
 	var modelErr error
-	var text strings.Builder
+	var finalText string
 	for scanner.Scan() {
 		var r record
 		if err := json.Unmarshal(scanner.Bytes(), &r); err != nil {
@@ -238,11 +248,17 @@ func (s *promptStream) run(stdout io.ReadCloser, cleanup func()) {
 			}
 		case "message_update":
 			if r.AssistantMessageEvent.Type == "text_delta" {
-				text.WriteString(r.AssistantMessageEvent.Delta)
 				s.emit(harness.Event{Kind: harness.EventAssistantMessageChunk, Text: r.AssistantMessageEvent.Delta})
 			}
 		case "message_end":
 			if r.Message.Role == "assistant" {
+				var last strings.Builder
+				for _, block := range r.Message.Content {
+					if block.Type == "text" {
+						last.WriteString(block.Text)
+					}
+				}
+				finalText = last.String()
 				if r.Message.StopReason == "error" {
 					modelErr = fmt.Errorf("Pi model error: %s", r.Message.ErrorMessage)
 				} else {
@@ -304,14 +320,15 @@ func (s *promptStream) run(stdout io.ReadCloser, cleanup func()) {
 		if runErr != nil {
 			s.emit(harness.Event{Kind: harness.EventSessionError, Text: runErr.Error()})
 		} else {
-			if text.Len() > 0 {
-				s.emit(harness.Event{Kind: harness.EventAssistantMessageFinal, Text: text.String()})
+			if finalText != "" {
+				s.emit(harness.Event{Kind: harness.EventAssistantMessageFinal, Text: finalText})
 			}
 			s.emit(harness.Event{Kind: harness.EventSessionDone})
 		}
 	}
 	s.mu.Lock()
 	s.err = runErr
+	s.completed = settled && !cancelled
 	s.mu.Unlock()
 }
 
@@ -329,6 +346,10 @@ type record struct {
 		Delta string `json:"delta"`
 	} `json:"assistantMessageEvent"`
 	Message struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
 		Role         string `json:"role"`
 		StopReason   string `json:"stopReason"`
 		ErrorMessage string `json:"errorMessage"`
