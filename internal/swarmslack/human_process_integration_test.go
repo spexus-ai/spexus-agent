@@ -224,7 +224,16 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 		cfg.Profiles = append(cfg.Profiles, swarm.ProfileSnapshot{Bytes: b})
 		cfg.Agents = append(cfg.Agents, swarm.AgentConfig{AgentID: ids[i], Role: role, CredentialSHA256: swarm.Digest([]byte(tokens[i])), ProfileID: p.ID})
 	}
-	feature := swarm.Feature{FeatureID: swarm.NewID(), TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, OwnerAgentID: ids[0], ChannelID: "C-P3-INTEGRATION", ThreadTS: "1790000000.000001", AllowedActorIDs: []string{"U-P3-HUMAN"}}
+	// The provider keeps Slack source identities across test runs. Give every
+	// run its own realistic thread/message timestamps and event IDs so retries
+	// never conflict with previously committed PostgreSQL decisions.
+	baseMicros := time.Now().UTC().UnixMicro()
+	ts := func(offset int64) string {
+		micros := baseMicros + offset
+		return fmt.Sprintf("%d.%06d", micros/1_000_000, micros%1_000_000)
+	}
+	feature := swarm.Feature{FeatureID: swarm.NewID(), TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, OwnerAgentID: ids[0], ChannelID: "C-P3-INTEGRATION", ThreadTS: ts(1), AllowedActorIDs: []string{"U-P3-HUMAN"}}
+	eventID := func(kind string) string { return "Ev-P3-" + kind + "-" + feature.FeatureID }
 	cfg.Features = []swarm.Feature{feature}
 	statePath := filepath.Join(dir, "coordinator.db")
 	store, err := swarm.Open(ctx, statePath, cfg)
@@ -362,7 +371,7 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 		}
 		return true
 	}, false)
-	start := slack.Event{ID: "Ev-P3-start", WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "1790000000.000002", UserID: "U-P3-HUMAN", Text: "Run A and independent B"}
+	start := slack.Event{ID: eventID("start"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(2), UserID: "U-P3-HUMAN", Text: "Run A and independent B"}
 	if err = source.Send(ctx, start); err != nil {
 		t.Fatal(err)
 	}
@@ -438,14 +447,14 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 	if len(h.Turns) != beforeTurns || len(h.Jobs) != 2 || len(h.Jobs[0].Attempts) != 1 || len(h.Jobs[1].Attempts) != 1 {
 		t.Fatal("coordinator restart repeated waiting work")
 	}
-	foreign := slack.Event{ID: "Ev-P3-foreign", WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "1790000000.000004", UserID: "U-FOREIGN", Text: "!answer " + dep.RequestID + " safe"}
+	foreign := slack.Event{ID: eventID("foreign"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(4), UserID: "U-FOREIGN", Text: "!answer " + dep.RequestID + " safe"}
 	if err = source.Send(ctx, foreign); err != nil {
 		t.Fatal(err)
 	}
 	if h = history(); h.HumanRequests[0].BackendState != "open" || h.Dependencies[0].State != "human_waiting" {
 		t.Fatal("foreign Slack actor changed human request")
 	}
-	answer := slack.Event{ID: "Ev-P3-answer", WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "1790000000.000003", UserID: "U-P3-HUMAN", Text: "!answer " + dep.RequestID + " safe Use the safe path"}
+	answer := slack.Event{ID: eventID("answer"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(3), UserID: "U-P3-HUMAN", Text: "!answer " + dep.RequestID + " safe Use the safe path"}
 	if err = source.Send(ctx, answer); err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +587,7 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 	if json.Unmarshal(body, &readback) != nil || readback.Data.State != "answered" || readback.Data.Terminal.ID != decisionID || readback.Data.Terminal.Source.ActorID != "U-P3-HUMAN" || readback.Data.Terminal.Source.MessageTS != answer.Timestamp {
 		t.Fatalf("Spexus decision source mismatch: %+v", readback.Data)
 	}
-	denyStart := slack.Event{ID: "Ev-P3-deny-start", WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "1790000000.000005", UserID: "U-P3-HUMAN", Text: "Ask deny"}
+	denyStart := slack.Event{ID: eventID("deny-start"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(5), UserID: "U-P3-HUMAN", Text: "Ask deny"}
 	if err = source.Send(ctx, denyStart); err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +595,7 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 		return len(h.Dependencies) == 2 && h.Dependencies[1].State == "human_waiting"
 	}, true)
 	denyID := h.Dependencies[1].RequestID
-	deny := slack.Event{ID: "Ev-P3-deny", WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "1790000000.000006", UserID: "U-P3-HUMAN", Text: "!answer " + denyID + " deny No authorization"}
+	deny := slack.Event{ID: eventID("deny"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(6), UserID: "U-P3-HUMAN", Text: "!answer " + denyID + " deny No authorization"}
 	if err = source.Send(ctx, deny); err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +603,7 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 		return len(h.Dependencies) == 2 && h.Dependencies[1].State == "denied" && len(h.HumanRequests) == 2 && h.HumanRequests[1].BackendState == "denied"
 	}, true)
 	deniedTurns := len(h.Turns)
-	late := slack.Event{ID: "Ev-P3-late-answer", WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "1790000000.000007", UserID: "U-P3-HUMAN", Text: "!answer " + denyID + " yes Too late"}
+	late := slack.Event{ID: eventID("late-answer"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(7), UserID: "U-P3-HUMAN", Text: "!answer " + denyID + " yes Too late"}
 	if err = source.Send(ctx, late); err != nil {
 		t.Fatal(err)
 	}
@@ -608,7 +617,7 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 	if h.Dependencies[1].State != "denied" || len(h.Turns) != deniedTurns {
 		t.Fatal("late answer reopened denied step")
 	}
-	cancelStart := slack.Event{ID: "Ev-P3-cancel-start", WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "1790000000.000008", UserID: "U-P3-HUMAN", Text: "Ask cancel"}
+	cancelStart := slack.Event{ID: eventID("cancel-start"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(8), UserID: "U-P3-HUMAN", Text: "Ask cancel"}
 	if err = source.Send(ctx, cancelStart); err != nil {
 		t.Fatal(err)
 	}
@@ -616,18 +625,18 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 		return len(h.Dependencies) == 3 && h.Dependencies[2].State == "human_waiting"
 	}, true)
 	cancelID := h.Dependencies[2].RequestID
-	stop := slack.Event{ID: "Ev-P3-stop", WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "1790000000.000009", UserID: "U-P3-HUMAN", Text: "!stop"}
+	stop := slack.Event{ID: eventID("stop"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(9), UserID: "U-P3-HUMAN", Text: "!stop"}
 	if err = source.Send(ctx, stop); err != nil {
 		t.Fatal(err)
 	}
 	h = wait("stop cancellation in Spexus", func(h swarm.History) bool {
 		return h.Feature.Stopped && len(h.Dependencies) == 3 && h.Dependencies[2].State == "cancelled" && len(h.HumanRequests) == 3 && h.HumanRequests[2].BackendState == "cancelled"
 	}, true)
-	lateAfterStop := slack.Event{ID: "Ev-P3-late-stop-answer", WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "1790000000.000010", UserID: "U-P3-HUMAN", Text: "!answer " + cancelID + " yes Too late"}
+	lateAfterStop := slack.Event{ID: eventID("late-stop-answer"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(10), UserID: "U-P3-HUMAN", Text: "!answer " + cancelID + " yes Too late"}
 	if err = source.Send(ctx, lateAfterStop); err != nil {
 		t.Fatal(err)
 	}
-	continued := slack.Event{ID: "Ev-P3-continue", WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: "1790000000.000011", UserID: "U-P3-HUMAN", Text: "!continue"}
+	continued := slack.Event{ID: eventID("continue"), WorkspaceID: cfg.Human.WorkspaceID, ChannelID: feature.ChannelID, ThreadTS: feature.ThreadTS, Timestamp: ts(11), UserID: "U-P3-HUMAN", Text: "!continue"}
 	if err = source.Send(ctx, continued); err != nil {
 		t.Fatal(err)
 	}

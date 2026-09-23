@@ -671,12 +671,14 @@ func (s *Store) applyHumanTerminal(ctx context.Context, tx *sql.Tx, d Dependency
 			reason = "actor_revoked"
 		}
 	}
+	// Keep the canonical terminal identity on every dependency state. The
+	// owner runner verifies human.decision against this local projection even
+	// when a denial grants no continuation authority.
+	d.DecisionID = v.Terminal.ID
 	if v.Terminal.Kind == "answer" && status == "applied" {
 		d.State = "resolved"
-		d.DecisionID = v.Terminal.ID
 	} else if v.Terminal.Kind == "answer" {
 		d.State = "cancelled"
-		d.DecisionID = v.Terminal.ID
 	} else if v.Terminal.Kind == "deny" {
 		d.State = "denied"
 	} else if v.Terminal.Kind == "cancel" {
