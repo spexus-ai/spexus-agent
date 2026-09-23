@@ -562,14 +562,15 @@ func (s *Store) mailbox(ctx context.Context, p Principal, lane string, limit int
 				return err
 			}
 		}
-		rows, err := tx.QueryContext(ctx, "SELECT m.canonical,m.receipt,d.pending_notification FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row LEFT JOIN recovery_barriers b ON b.feature_id=m.feature_id WHERE d.agent_id=? AND d.lane=? AND d.acked=0 AND d.superseded=0 AND (b.feature_id IS NULL OR m.kind IN ('task.result','task.cancel','turn.cancel')) ORDER BY d.seq LIMIT ?", p.AgentID, lane, limit)
+		rows, err := tx.QueryContext(ctx, "SELECT m.canonical,m.receipt,d.seq,d.pending_notification FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row LEFT JOIN recovery_barriers b ON b.feature_id=m.feature_id WHERE d.agent_id=? AND d.lane=? AND d.acked=0 AND d.superseded=0 AND (b.feature_id IS NULL OR m.kind IN ('task.result','task.cancel','turn.cancel')) ORDER BY d.seq LIMIT ?", p.AgentID, lane, limit)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var b, rr []byte
-			if err = rows.Scan(&b, &rr, &pending); err != nil {
+			var deliverySeq int64
+			if err = rows.Scan(&b, &rr, &deliverySeq, &pending); err != nil {
 				return err
 			}
 			// Control is delivered independently even when normal notifications exhaust
@@ -585,7 +586,10 @@ func (s *Store) mailbox(ctx context.Context, p Principal, lane string, limit int
 			if err = json.Unmarshal(rr, &r); err != nil {
 				return err
 			}
-			out.Messages = append(out.Messages, Delivery{e, r.MailboxSeq, r.ReceivedAt})
+			// A narrowly scoped offline owner recovery can redeliver the same
+			// immutable message under a new mailbox sequence. The original
+			// message receipt remains immutable; delivery identity is d.seq.
+			out.Messages = append(out.Messages, Delivery{e, deliverySeq, r.ReceivedAt})
 		}
 		return rows.Err()
 	})

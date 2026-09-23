@@ -79,9 +79,16 @@ CREATE INDEX IF NOT EXISTS slack_sources_pending ON slack_sources(status,feature
 CREATE TABLE IF NOT EXISTS slack_catchup (feature_id TEXT PRIMARY KEY REFERENCES features(id),watermark TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS recovery_barriers (feature_id TEXT PRIMARY KEY REFERENCES features(id),reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS human_gateway_writer (id INTEGER PRIMARY KEY CHECK(id=1),writer_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS owner_redeliveries (failed_turn_id TEXT PRIMARY KEY REFERENCES owner_turns(id),feature_id TEXT NOT NULL REFERENCES features(id),original_seq INTEGER NOT NULL,result_message_id TEXT NOT NULL,review_message_id TEXT NOT NULL,new_seq INTEGER NOT NULL,actor TEXT NOT NULL,reason TEXT NOT NULL,at TEXT NOT NULL,UNIQUE(feature_id,new_seq));
 `
 
 func Open(ctx context.Context, path string, cfg Config) (*Store, error) {
+	return openStore(ctx, path, cfg, true)
+}
+
+// Offline operators need the same exclusive lock and schema checks without
+// applying service-start recovery transitions before inspecting the state.
+func openStore(ctx context.Context, path string, cfg Config, serviceStart bool) (*Store, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -108,7 +115,7 @@ func Open(ctx context.Context, path string, cfg Config) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	s := &Store{db: db, lock: lock, cfg: cfg, profiles: map[string]Profile{}, now: time.Now, mailboxLimit: 1000, mailboxBytes: 10 * 1024 * 1024, mailboxReserve: 40}
-	if err = s.bootstrap(ctx); err != nil {
+	if err = s.bootstrapMode(ctx, serviceStart); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -136,7 +143,8 @@ func (s *Store) wireVersion() int {
 	}
 	return 1
 }
-func (s *Store) bootstrap(ctx context.Context) error {
+func (s *Store) bootstrap(ctx context.Context) error { return s.bootstrapMode(ctx, true) }
+func (s *Store) bootstrapMode(ctx context.Context, serviceStart bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -192,7 +200,7 @@ func (s *Store) bootstrap(ctx context.Context) error {
 			return fmt.Errorf("immutable gateway writer changed")
 		}
 	}
-	if target == 2 {
+	if target == 2 && serviceStart {
 		if _, err = tx.ExecContext(ctx, "UPDATE backend_sync_operations SET status='retry' WHERE status='inflight'"); err != nil {
 			return err
 		}
@@ -247,13 +255,16 @@ func (s *Store) bootstrap(ctx context.Context) error {
 		if err = s.registerFeature(ctx, tx, f); err != nil {
 			return err
 		}
-		if s.cfg.WireVersion == 2 {
+		if s.cfg.WireVersion == 2 && serviceStart {
 			if _, err = tx.ExecContext(ctx, "INSERT INTO recovery_barriers(feature_id,reason) VALUES(?,?) ON CONFLICT(feature_id) DO UPDATE SET reason=excluded.reason", f.FeatureID, "source_catchup_required"); err != nil {
 				return err
 			}
 		}
 	}
 	// A send accepted by Slack but not settled locally must never be blindly replayed.
+	if !serviceStart {
+		return tx.Commit()
+	}
 	rows, err := tx.QueryContext(ctx, "SELECT data FROM slack_outbox WHERE status='sending'")
 	if err != nil {
 		return err

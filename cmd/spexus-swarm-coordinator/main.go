@@ -48,7 +48,7 @@ func load(path string, out any) error {
 }
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: spexus-swarm-coordinator serve|history|reconcile")
+		return errors.New("usage: spexus-swarm-coordinator serve|history|reconcile|recover-owner")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	configPath := fs.String("config", "", "coordinator JSON configuration")
@@ -58,6 +58,10 @@ func run(args []string) error {
 	key := fs.String("tls-key", "", "TLS key")
 	slackPath := fs.String("slack-config", "", "private SlackAuth JSON file")
 	feature := fs.String("feature-id", "", "feature UUID for history")
+	failedTurn := fs.String("failed-turn-id", "", "failed owner turn UUID for offline recovery")
+	inputSeq := fs.Int64("input-mailbox-seq", 0, "original task.result mailbox sequence")
+	resultMessage := fs.String("result-message-id", "", "original task.result message UUID")
+	reviewMessage := fs.String("review-message-id", "", "accepted review message UUID in failed turn")
 	agent := fs.String("agent-id", "", "agent UUID for offline reconciliation")
 	oldID := fs.String("old-instance", "", "old instance UUID")
 	newID := fs.String("new-instance", "", "new instance UUID")
@@ -109,6 +113,17 @@ func run(args []string) error {
 			return fmt.Errorf("runner: %w", err)
 		}
 		return swarm.ReconcileOffline(ctx, *state, cfg, swarm.ReconcileRequest{AgentID: *agent, OldInstanceID: *oldID, NewInstanceID: *newID, Reason: *reason, Actor: *actor, ContainerID: *container, ContainerStopped: true, CheckedAt: time.Now().UTC()})
+	}
+	if args[0] == "recover-owner" {
+		coordinatorLabels := map[string]string{"io.spexus.swarm.tenant-id": cfg.TenantID, "io.spexus.swarm.project-id": cfg.ProjectID, "io.spexus.swarm.role": "coordinator"}
+		if err := verifyStopped(ctx, *coordinator, coordinatorLabels); err != nil {
+			return fmt.Errorf("coordinator: %w", err)
+		}
+		receipt, err := swarm.RedeliverOwnerResultOffline(ctx, *state, cfg, swarm.OwnerRedeliveryRequest{FeatureID: *feature, FailedTurnID: *failedTurn, OriginalSeq: *inputSeq, ResultMessageID: *resultMessage, ReviewMessageID: *reviewMessage, Actor: *actor, Reason: *reason})
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(receipt)
 	}
 	if args[0] != "serve" {
 		return errors.New("unknown command")
