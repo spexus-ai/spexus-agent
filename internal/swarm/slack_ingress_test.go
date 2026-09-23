@@ -87,6 +87,46 @@ func TestHumanButtonSourceRequiresPublishedQuestion(t *testing.T) {
 	if _, err := f.s.CommitSlackSource(ctx, conflict); err == nil {
 		t.Fatal("one click timestamp changed option")
 	}
+	control := base
+	control.MessageTS, control.SourceKind, control.OptionID, control.Text = "124.000002", "button_control", "stop", "!stop"
+	if duplicate, err := f.s.CommitSlackSource(ctx, control); err != nil || duplicate {
+		t.Fatalf("stop control commit duplicate=%t err=%v", duplicate, err)
+	}
+	if duplicate, err := f.s.CommitSlackSource(ctx, control); err != nil || !duplicate {
+		t.Fatalf("stop control redelivery duplicate=%t err=%v", duplicate, err)
+	}
+	control.MessageTS, control.OptionID, control.Text = "124.000003", "details", HumanDetailsControlText
+	if _, err := f.s.CommitSlackSource(ctx, control); err == nil {
+		t.Fatal("details control on inactive question accepted")
+	}
+	control.MessageTS, control.OptionID, control.Text = "124.000004", "stop", "!continue"
+	if _, err := f.s.CommitSlackSource(ctx, control); err == nil {
+		t.Fatal("control value forged an unsafe command")
+	}
+}
+
+func TestDetailsControlRequiresActiveQuestionAndDedupsAfterClose(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	requestID := publishedHumanRequest(t, f, nil, "sent")
+	in := SlackSource{WorkspaceID: "workspace", ChannelID: f.feature.ChannelID, ThreadTS: f.feature.ThreadTS, MessageTS: "124.000001", FeatureID: f.feature.FeatureID, ActorID: "human", SourceKind: "button_control", QuestionTS: "123.000005", RequestID: requestID, OptionID: "details", Text: HumanDetailsControlText}
+	if duplicate, err := f.s.CommitSlackSource(ctx, in); err != nil || duplicate {
+		t.Fatalf("active details control duplicate=%t err=%v", duplicate, err)
+	}
+	committed, err := f.s.CommittedSlackSource(ctx, in.WorkspaceID, in.ChannelID, in.MessageTS)
+	if err != nil || committed.ActiveHumanRequest == nil || committed.ActiveHumanRequest.RequestID != requestID {
+		t.Fatalf("details context=%+v err=%v", committed.ActiveHumanRequest, err)
+	}
+	if _, err := f.s.db.ExecContext(ctx, `UPDATE human_projections SET state='answered' WHERE request_id=?`, requestID); err != nil {
+		t.Fatal(err)
+	}
+	if duplicate, err := f.s.CommitSlackSource(ctx, in); err != nil || !duplicate {
+		t.Fatalf("redelivery after close duplicate=%t err=%v", duplicate, err)
+	}
+	in.MessageTS = "124.000002"
+	if _, err := f.s.CommitSlackSource(ctx, in); err == nil {
+		t.Fatal("new details click on closed question accepted")
+	}
 }
 
 // Test: a valid but oversized request is rejected before backend create, so

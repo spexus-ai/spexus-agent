@@ -484,6 +484,16 @@ func (h *humanIngress) commit(ctx context.Context, f swarm.Feature, event slack.
 	if !allowed(f, event.UserID) {
 		return false, nil
 	}
+	if event.HumanAction != nil && event.HumanAction.ControlID != "" {
+		switch event.HumanAction.ControlID {
+		case "details":
+			event.Text = swarm.HumanDetailsControlText
+		case "stop":
+			event.Text = "!stop"
+		default:
+			return false, errors.New("unknown human control")
+		}
+	}
 	stop := event.Text == "!stop"
 	if stop {
 		h.stopMu.Lock()
@@ -491,7 +501,12 @@ func (h *humanIngress) commit(ctx context.Context, f swarm.Feature, event slack.
 	}
 	in := swarm.SlackSource{WorkspaceID: h.workspace, ChannelID: event.ChannelID, MessageTS: event.Timestamp, ThreadTS: event.ThreadTimestamp(), FeatureID: f.FeatureID, ActorID: event.UserID, Text: event.Text, EventID: event.ID}
 	if event.HumanAction != nil {
-		in.SourceKind, in.QuestionTS, in.RequestID, in.OptionID = "block_action", event.HumanAction.QuestionTS, event.HumanAction.RequestID, event.HumanAction.OptionID
+		in.SourceKind, in.QuestionTS, in.RequestID = "block_action", event.HumanAction.QuestionTS, event.HumanAction.RequestID
+		if event.HumanAction.ControlID != "" {
+			in.SourceKind, in.OptionID = "button_control", event.HumanAction.ControlID
+		} else {
+			in.OptionID = event.HumanAction.OptionID
+		}
 	}
 	duplicate, err := h.store.CommitSlackSource(ctx, in)
 	if err != nil {

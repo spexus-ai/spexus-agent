@@ -69,14 +69,14 @@ func TestHumanQuestionButtonsAndTerminalUpdate(t *testing.T) {
 					t.Fatalf("not button: %#v", button)
 				}
 				id := button["action_id"].(string)
-				if !strings.HasPrefix(id, slack.HumanAnswerActionID+":") || seen[id] {
+				if !strings.HasPrefix(id, slack.HumanAnswerActionID+":") && !strings.HasPrefix(id, slack.HumanControlActionID+":") || seen[id] {
 					t.Fatalf("invalid or duplicate action ID %q", id)
 				}
 				seen[id] = true
 				buttons++
 			}
 		}
-		want := 2
+		want := 4
 		if i >= 2 {
 			want = 0
 		}
@@ -119,8 +119,12 @@ func TestFreeTextQuestionInvitesNaturalReplyWithoutUUID(t *testing.T) {
 		t.Fatalf("free-text question is not human-readable: %q", text)
 	}
 	for _, raw := range posted["blocks"].([]any) {
-		if raw.(map[string]any)["type"] == "actions" {
-			t.Fatalf("free-text question unexpectedly offered option buttons: %#v", raw)
+		if raw.(map[string]any)["type"] != "actions" {
+			continue
+		}
+		elements := raw.(map[string]any)["elements"].([]any)
+		if len(elements) != 2 || elements[0].(map[string]any)["action_id"] != slack.HumanControlActionID+":details" || elements[1].(map[string]any)["action_id"] != slack.HumanControlActionID+":stop" {
+			t.Fatalf("free-text question controls: %#v", elements)
 		}
 	}
 }
@@ -133,11 +137,11 @@ func TestHumanQuestionShowsCompactContextWithoutInternalIdentifiers(t *testing.T
 		"\nBlocked work: internal detail\nВопрос: Какой формат выбрать?\nРекомендация: Короткий текст.\nОжидает: подготовка результата (job " + id + ", attempt " + id + ")\n• short — Коротко\nВыберите вариант кнопкой ниже."
 	got := humanReadableQuestionText(message, []swarm.HumanOption{{ID: "short", Label: "Коротко"}}, 0, true)
 	if !strings.HasPrefix(got, "Нужен ваш ответ: Какой формат выбрать?") ||
-		!strings.Contains(got, "Почему спрашиваю:") || !strings.Contains(got, "Контекст:") ||
+		!strings.Contains(got, "Почему спрашиваю:") || strings.Contains(got, "Контекст:") ||
 		!strings.Contains(got, "Рекомендация:") || !strings.Contains(got, "Ждёт ответа:") ||
-		!strings.Contains(got, "Выберите кнопку или ответьте своими словами") ||
+		!strings.Contains(got, "Выберите вариант или ответьте своими словами") ||
 		strings.Contains(got, id) || strings.Contains(got, "Blocked work:") ||
-		strings.Contains(got, "!answer") || len([]rune(got)) > 1100 {
+		strings.Contains(got, "!answer") || len([]rune(got)) > 700 {
 		t.Fatalf("question not compact and actionable: %q", got)
 	}
 	closed := humanReadableQuestionText(message, []swarm.HumanOption{{ID: "short", Label: "Коротко"}}, 0, false)

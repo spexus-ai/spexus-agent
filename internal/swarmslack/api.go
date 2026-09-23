@@ -322,15 +322,14 @@ func humanReadableQuestionText(message string, options []swarm.HumanOption, _ in
 			if before, _, ok := strings.Cut(waiting, " (step "); ok {
 				waiting = before
 			}
-			readable := []string{"Нужен ваш ответ: " + compactHumanField(fields["Вопрос: "], 320)}
+			readable := []string{"Нужен ваш ответ: " + compactHumanField(fields["Вопрос: "], 240)}
 			for _, item := range []struct {
 				label, value string
 				limit        int
 			}{
-				{"Почему спрашиваю: ", fields["Причина: "], 160},
-				{"Контекст: ", fields["Контекст: "], 180},
-				{"Рекомендация: ", fields["Рекомендация: "], 180},
-				{"Ждёт ответа: ", waiting, 180},
+				{"Почему спрашиваю: ", fields["Причина: "], 130},
+				{"Рекомендация: ", fields["Рекомендация: "], 130},
+				{"Ждёт ответа: ", waiting, 100},
 			} {
 				if item.value != "" {
 					readable = append(readable, item.label+compactHumanField(item.value, item.limit))
@@ -338,9 +337,9 @@ func humanReadableQuestionText(message string, options []swarm.HumanOption, _ in
 			}
 			if actionable {
 				if len(options) > 0 {
-					readable = append(readable, "Выберите кнопку или ответьте своими словами в этом треде.")
+					readable = append(readable, "Выберите вариант или ответьте своими словами в треде.")
 				} else {
-					readable = append(readable, "Ответьте своими словами в этом треде; можно уточнить вопрос или объяснить отказ.")
+					readable = append(readable, "Ответьте своими словами в треде.")
 				}
 			}
 			return strings.Join(readable, "\n")
@@ -388,8 +387,8 @@ func humanQuestionBlocks(message, requestID string, options []swarm.HumanOption,
 		blocks = append(blocks, map[string]any{"type": "section", "text": map[string]any{"type": "plain_text", "text": message[:cut], "emoji": false}})
 		message = message[cut:]
 	}
-	if !closed && len(options) > 0 {
-		elements := make([]map[string]any, 0, len(options))
+	if !closed {
+		elements := make([]map[string]any, 0, len(options)+2)
 		for _, option := range options {
 			label := option.Label
 			if len([]rune(label)) > 70 {
@@ -397,6 +396,10 @@ func humanQuestionBlocks(message, requestID string, options []swarm.HumanOption,
 			}
 			value, _ := json.Marshal(map[string]string{"request_id": requestID, "option_id": option.ID})
 			elements = append(elements, map[string]any{"type": "button", "text": map[string]any{"type": "plain_text", "text": label, "emoji": false}, "action_id": slack.HumanAnswerActionID + ":" + option.ID, "value": string(value), "accessibility_label": label})
+		}
+		for _, control := range []struct{ id, label string }{{"details", "Подробнее"}, {"stop", "Остановить"}} {
+			value, _ := json.Marshal(map[string]string{"request_id": requestID, "control_id": control.id})
+			elements = append(elements, map[string]any{"type": "button", "text": map[string]any{"type": "plain_text", "text": control.label, "emoji": false}, "action_id": slack.HumanControlActionID + ":" + control.id, "value": string(value), "accessibility_label": control.label})
 		}
 		blocks = append(blocks, map[string]any{"type": "actions", "elements": elements})
 	}

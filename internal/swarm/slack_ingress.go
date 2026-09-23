@@ -31,6 +31,8 @@ type SlackSource struct {
 	ActiveHumanRequest *HumanRequestContext `json:"active_human_request,omitempty"`
 }
 
+const HumanDetailsControlText = "Расскажи подробнее о текущем вопросе. Это запрос информации, не ответ и не разрешение продолжить работу."
+
 func validSlackTS(ts string) bool {
 	parts := strings.Split(ts, ".")
 	if len(parts) != 2 || len(parts[0]) == 0 || len(parts[1]) == 0 || len(parts[1]) > 6 {
@@ -60,11 +62,14 @@ func slackTSCompare(a, b string) int {
 }
 
 func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, error) {
-	if s.cfg.WireVersion != 2 || !uuid(in.FeatureID) || in.WorkspaceID != s.cfg.Human.WorkspaceID || in.ChannelID == "" || in.ActorID == "" || !validSlackTS(in.MessageTS) || !validSlackTS(in.ThreadTS) || len(in.Text) > 16*1024 || in.SourceKind != "" && in.SourceKind != "block_action" {
+	if s.cfg.WireVersion != 2 || !uuid(in.FeatureID) || in.WorkspaceID != s.cfg.Human.WorkspaceID || in.ChannelID == "" || in.ActorID == "" || !validSlackTS(in.MessageTS) || !validSlackTS(in.ThreadTS) || len(in.Text) > 16*1024 || in.SourceKind != "" && in.SourceKind != "block_action" && in.SourceKind != "button_control" {
 		return false, wireError(400, "invalid_slack_source")
 	}
 	if in.SourceKind == "block_action" && (!uuid(in.RequestID) || !validSlackTS(in.QuestionTS) || in.OptionID == "" || len(in.OptionID) > 64 || in.Text != "") {
 		return false, wireError(400, "invalid_slack_action")
+	}
+	if in.SourceKind == "button_control" && (!uuid(in.RequestID) || !validSlackTS(in.QuestionTS) || in.OptionID != "details" && in.OptionID != "stop" || in.OptionID == "details" && in.Text != HumanDetailsControlText || in.OptionID == "stop" && in.Text != "!stop") {
+		return false, wireError(400, "invalid_slack_control")
 	}
 	duplicate := false
 	err := s.transaction(ctx, func(tx *sql.Tx) error {
@@ -75,7 +80,7 @@ func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, er
 		if f.ChannelID != in.ChannelID || f.ThreadTS != in.ThreadTS || !allowedActor(f, in.ActorID) {
 			return wireError(403, "untrusted_slack_source")
 		}
-		if in.SourceKind == "block_action" {
+		if in.SourceKind == "block_action" || in.SourceKind == "button_control" {
 			var raw []byte
 			if err := tx.QueryRowContext(ctx, "SELECT data FROM slack_outbox WHERE id=? AND feature_id=?", in.RequestID, in.FeatureID).Scan(&raw); err != nil {
 				return wireError(403, "unknown_slack_question")
@@ -118,6 +123,9 @@ func (s *Store) CommitSlackSource(ctx context.Context, in SlackSource) (bool, er
 		canonical.ActiveHumanRequest, activeQuestion, err = activeHumanRequestTx(ctx, tx, in.FeatureID)
 		if err != nil {
 			return err
+		}
+		if in.SourceKind == "button_control" && in.OptionID == "details" && (canonical.ActiveHumanRequest == nil || activeQuestion.ID != in.RequestID || activeQuestion.SlackTS != in.QuestionTS) {
+			return wireError(409, "question_not_active")
 		}
 		if canonical.ActiveHumanRequest != nil && slackTSCompare(in.MessageTS, activeQuestion.SlackTS) <= 0 {
 			canonical.ActiveHumanRequest = nil

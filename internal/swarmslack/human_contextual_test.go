@@ -89,6 +89,26 @@ func TestButtonIsStructuredOwnerInputNotDirectDecision(t *testing.T) {
 	}
 }
 
+func TestDetailsControlIsOwnerQuestionNotDecision(t *testing.T) {
+	store := &conversationRouteStore{}
+	h := &humanIngress{store: store, workspace: "W"}
+	requestID := swarm.NewID()
+	feature := swarm.Feature{FeatureID: swarm.NewID(), ChannelID: "C", ThreadTS: "1.000001", AllowedActorIDs: []string{"U"}}
+	event := slack.Event{WorkspaceID: "W", ChannelID: "C", ThreadTS: "1.000001", Timestamp: "2.000001", UserID: "U", HumanAction: &slack.HumanAction{RequestID: requestID, ControlID: "details", QuestionTS: "1.000002"}}
+	if _, err := h.commit(context.Background(), feature, event); err != nil {
+		t.Fatal(err)
+	}
+	if store.committed.SourceKind != "button_control" || store.committed.RequestID != requestID || store.committed.OptionID != "details" || store.committed.Text != swarm.HumanDetailsControlText || store.interrupts != 0 {
+		t.Fatalf("details button source=%+v interrupts=%d", store.committed, store.interrupts)
+	}
+	if err := h.processOne(context.Background(), store.committed, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.inputs) != 1 || store.inputs[0].Text != swarm.HumanDetailsControlText || store.inputs[0].HumanAction != nil {
+		t.Fatalf("details button was treated as decision: %+v", store.inputs)
+	}
+}
+
 func TestBangMessageInterruptsAndReachesOwnerUnchanged(t *testing.T) {
 	for _, body := range []string{"!", "!status", "! ответьте срочно"} {
 		store := &conversationRouteStore{}

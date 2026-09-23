@@ -56,3 +56,27 @@ func TestHumanBlockActionEnvelope(t *testing.T) {
 		})
 	}
 }
+
+func TestHumanControlBlockActionEnvelope(t *testing.T) {
+	requestID := "123e4567-e89b-42d3-a456-426614174000"
+	for _, control := range []string{"details", "stop"} {
+		value, _ := json.Marshal(map[string]string{"request_id": requestID, "control_id": control})
+		payload := map[string]any{
+			"type": "block_actions", "team": map[string]string{"id": "T"}, "user": map[string]string{"id": "U", "team_id": "T"},
+			"channel": map[string]string{"id": "C"}, "container": map[string]string{"type": "message", "channel_id": "C", "message_ts": "9.000001"},
+			"message": map[string]string{"ts": "9.000001", "thread_ts": "1.000001"},
+			"actions": []any{map[string]string{"type": "button", "action_id": HumanControlActionID + ":" + control, "value": string(value), "action_ts": "10.000001"}},
+		}
+		b, _ := json.Marshal(payload)
+		got, ok, err := eventFromSocketModeEnvelope(socketModeEnvelope{EnvelopeID: "delivery", Type: "interactive", Payload: b})
+		if err != nil || !ok || got.HumanAction == nil || got.HumanAction.ControlID != control || got.HumanAction.OptionID != "" {
+			t.Fatalf("control %s: got=%+v ok=%t err=%v", control, got, ok, err)
+		}
+		value, _ = json.Marshal(map[string]string{"request_id": requestID, "control_id": "continue"})
+		payload["actions"] = []any{map[string]string{"type": "button", "action_id": HumanControlActionID + ":continue", "value": string(value), "action_ts": "10.000001"}}
+		b, _ = json.Marshal(payload)
+		if _, ok, err := eventFromSocketModeEnvelope(socketModeEnvelope{EnvelopeID: "delivery", Type: "interactive", Payload: b}); ok || err == nil {
+			t.Fatalf("unapproved control accepted: ok=%t err=%v", ok, err)
+		}
+	}
+}

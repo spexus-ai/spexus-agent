@@ -58,6 +58,7 @@ type Event struct {
 type HumanAction struct {
 	RequestID  string
 	OptionID   string
+	ControlID  string
 	QuestionTS string
 }
 
