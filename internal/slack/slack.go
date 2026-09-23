@@ -97,6 +97,13 @@ type EventSource interface {
 	Close() error
 }
 
+// DurableEventSource acknowledges each Socket Mode envelope only after its
+// consumer has committed it. Connection callbacks gate work during catchup.
+type DurableEventSource interface {
+	RunDurable(context.Context, func(context.Context) error, func(context.Context) error, func(context.Context, Event) error) error
+	Close() error
+}
+
 type InboundInvocationSource interface {
 	InboundInvocations(context.Context) (<-chan InboundInvocation, error)
 	Close() error

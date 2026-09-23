@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS backend_sync_operations (operation_id TEXT PRIMARY KE
 CREATE INDEX IF NOT EXISTS backend_sync_due ON backend_sync_operations(status,next_at);
 CREATE TABLE IF NOT EXISTS decision_applications (request_id TEXT NOT NULL,revision INTEGER NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',mailbox_seq INTEGER,PRIMARY KEY(request_id,revision));
 CREATE TABLE IF NOT EXISTS source_ingress (workspace_id TEXT NOT NULL,channel_id TEXT NOT NULL,message_ts TEXT NOT NULL,feature_id TEXT NOT NULL,payload BLOB NOT NULL,receipt BLOB NOT NULL,PRIMARY KEY(workspace_id,channel_id,message_ts));
+CREATE TABLE IF NOT EXISTS slack_sources (workspace_id TEXT NOT NULL,channel_id TEXT NOT NULL,message_ts TEXT NOT NULL,feature_id TEXT NOT NULL REFERENCES features(id),payload BLOB NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','done')),PRIMARY KEY(workspace_id,channel_id,message_ts));
+CREATE INDEX IF NOT EXISTS slack_sources_pending ON slack_sources(status,feature_id,message_ts);
+CREATE TABLE IF NOT EXISTS slack_catchup (feature_id TEXT PRIMARY KEY REFERENCES features(id),watermark TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS recovery_barriers (feature_id TEXT PRIMARY KEY REFERENCES features(id),reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS human_gateway_writer (id INTEGER PRIMARY KEY CHECK(id=1),writer_id TEXT NOT NULL);
 `

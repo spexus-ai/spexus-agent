@@ -132,6 +132,14 @@ func run(args []string) error {
 		if err = store.HumanPreflight(ctx); err != nil {
 			return fmt.Errorf("human provider preflight: %w", err)
 		}
+		for _, f := range cfg.Features {
+			if _, err = store.SlackWatermark(ctx, f.FeatureID); err != nil {
+				return fmt.Errorf("initialize Slack catchup: %w", err)
+			}
+			if err = store.SetRecoveryBarrier(ctx, f.FeatureID, "slack_startup"); err != nil {
+				return fmt.Errorf("close Slack startup barrier: %w", err)
+			}
+		}
 	}
 	source := slack.NewSocketModeClient(auth.AppToken)
 	bridge := &swarmslack.Bridge{Store: store, Features: cfg.Features, API: swarmslack.NewAPI(auth.BotToken), Logf: log.Printf}
@@ -145,7 +153,14 @@ func run(args []string) error {
 			errorsCh <- err
 		}
 	}()
-	go func() { defer workers.Done(); errorsCh <- bridge.Run(ctx, source) }()
+	go func() {
+		defer workers.Done()
+		if cfg.WireVersion == 2 {
+			errorsCh <- bridge.RunHuman(ctx, source, auth.WorkspaceID)
+		} else {
+			errorsCh <- bridge.Run(ctx, source)
+		}
+	}()
 	go func() {
 		defer workers.Done()
 		tick := time.NewTicker(time.Second)
