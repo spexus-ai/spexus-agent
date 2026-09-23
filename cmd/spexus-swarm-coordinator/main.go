@@ -128,12 +128,17 @@ func run(args []string) error {
 		return err
 	}
 	defer store.Close()
+	if cfg.WireVersion == 2 {
+		if err = store.HumanPreflight(ctx); err != nil {
+			return fmt.Errorf("human provider preflight: %w", err)
+		}
+	}
 	source := slack.NewSocketModeClient(auth.AppToken)
 	bridge := &swarmslack.Bridge{Store: store, Features: cfg.Features, API: swarmslack.NewAPI(auth.BotToken), Logf: log.Printf}
 	server := &http.Server{Addr: *listen, Handler: store.Handler(), TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 35 * time.Second, WriteTimeout: 35 * time.Second, IdleTimeout: 60 * time.Second}
-	errorsCh := make(chan error, 3)
+	errorsCh := make(chan error, 4)
 	var workers sync.WaitGroup
-	workers.Add(2)
+	workers.Add(3)
 	go func() {
 		err := server.ListenAndServeTLS(*cert, *key)
 		if !errors.Is(err, http.ErrServerClosed) {
@@ -153,6 +158,27 @@ func run(args []string) error {
 				if err := store.Sweep(ctx); err != nil {
 					errorsCh <- err
 					return
+				}
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		if cfg.WireVersion != 2 {
+			return
+		}
+		tick := time.NewTicker(2 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if e := store.SyncHuman(ctx); e != nil {
+					log.Printf("human sync: %v", e)
+				}
+				if e := store.ApplyPendingHuman(ctx); e != nil {
+					log.Printf("human application: %v", e)
 				}
 			}
 		}

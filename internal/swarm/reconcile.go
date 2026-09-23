@@ -38,7 +38,7 @@ func ReconcileOffline(ctx context.Context, path string, cfg Config, r ReconcileR
 				return err
 			}
 			result := ResultPayload{Outcome: "interrupted", Summary: "Previous runner was stopped; unknown execution outcome requires review", Evidence: []Evidence{{Kind: "ref", Label: "Stopped container", ContentOrRef: "container:" + r.ContainerID}}, Error: &TaskError{Code: "operator_reconciled", Message: r.Reason, Retryable: false}, Origin: "coordinator"}
-			e := Envelope{ProtocolVersion: 1, MessageID: NewID(), Type: "task.result", TenantID: f.TenantID, ProjectID: f.ProjectID, FeatureID: f.FeatureID, FromAgentID: "coordinator", ToAgentID: f.OwnerAgentID, JobID: a.JobID, AttemptID: a.AttemptID, CausationID: cause(a.DispatchMessageID), SentAt: s.stamp(), Payload: mustJSON(result)}
+			e := Envelope{ProtocolVersion: s.wireVersion(), MessageID: NewID(), Type: "task.result", TenantID: f.TenantID, ProjectID: f.ProjectID, FeatureID: f.FeatureID, FromAgentID: "coordinator", ToAgentID: f.OwnerAgentID, JobID: a.JobID, AttemptID: a.AttemptID, CausationID: cause(a.DispatchMessageID), SentAt: s.stamp(), Payload: mustJSON(result)}
 			if _, _, err = s.applyMessage(ctx, tx, Principal{AgentID: "coordinator"}, e, true); err != nil {
 				return err
 			}

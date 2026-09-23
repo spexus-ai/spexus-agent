@@ -14,6 +14,9 @@ func (s *Store) postMessage(ctx context.Context, p Principal, e Envelope) (Recei
 	var r Receipt
 	duplicate := false
 	err := validateEnvelope(e)
+	if err == nil && e.ProtocolVersion != s.wireVersion() {
+		err = wireError(400, "unsupported_version")
+	}
 	if err == nil {
 		err = s.transaction(ctx, func(tx *sql.Tx) error {
 			if err := bound(ctx, tx, p); err != nil {
@@ -51,7 +54,7 @@ func (s *Store) existing(ctx context.Context, tx *sql.Tx, e Envelope) (Receipt, 
 }
 func (s *Store) phaseDuplicate(ctx context.Context, tx *sql.Tx, e Envelope) (Receipt, bool, error) {
 	var r Receipt
-	if e.Type != "task.accepted" && e.Type != "task.started" && e.Type != "task.result" && e.Type != "task.review" && e.Type != "task.dispatch" {
+	if e.Type != "task.accepted" && e.Type != "task.started" && e.Type != "task.result" && e.Type != "task.review" && e.Type != "task.dispatch" && e.Type != "task.resume" {
 		return r, false, nil
 	}
 	var raw, rr []byte
@@ -97,17 +100,23 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 		return r, false, wireError(403, "scope_mismatch")
 	}
 	var targetRole string
-	if err = tx.QueryRowContext(ctx, "SELECT role FROM agents WHERE agent_id=?", e.ToAgentID).Scan(&targetRole); err != nil {
+	if e.ToAgentID == "coordinator" {
+		targetRole = "coordinator"
+	} else if err = tx.QueryRowContext(ctx, "SELECT role FROM agents WHERE agent_id=?", e.ToAgentID).Scan(&targetRole); err != nil {
 		return r, false, wireError(404, "recipient_unknown")
 	}
-	ownerAction := e.Type == "task.dispatch" || e.Type == "task.review" || e.Type == "task.cancel"
+	ownerAction := e.Type == "task.dispatch" || e.Type == "task.review" || e.Type == "task.cancel" || e.Type == "human.request" || e.Type == "dependency.resolve" || e.Type == "task.resume" || e.Type == "step.complete"
 	if !internal {
 		if ownerAction {
-			if e.FromAgentID != f.OwnerAgentID || targetRole != "worker" {
+			expected := "worker"
+			if e.Type == "human.request" || e.Type == "dependency.resolve" || e.Type == "step.complete" {
+				expected = "coordinator"
+			}
+			if e.FromAgentID != f.OwnerAgentID || targetRole != expected {
 				return r, false, wireError(403, "forbidden")
 			}
 		}
-		if e.Type == "agent.input" || e.Type == "turn.cancel" {
+		if e.Type == "agent.input" || e.Type == "turn.cancel" || e.Type == "human.decision" {
 			return r, false, wireError(403, "coordinator_only")
 		}
 		if e.Type == "task.result" {
@@ -125,7 +134,7 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 		return r, found, err
 	}
 	var a attemptRecord
-	if e.Type != "task.dispatch" && e.Type != "agent.input" && e.Type != "turn.cancel" {
+	if e.Type != "task.dispatch" && e.Type != "task.resume" && e.Type != "human.request" && e.Type != "dependency.resolve" && e.Type != "step.complete" && e.Type != "agent.input" && e.Type != "turn.cancel" && e.Type != "human.decision" {
 		a, err = attempt(ctx, tx, e.AttemptID)
 		if err != nil {
 			return r, false, err
@@ -173,13 +182,34 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 	}
 	now := s.stamp()
 	switch e.Type {
-	case "agent.input":
+	case "human.request":
+		var p HumanRequestPayload
+		_ = json.Unmarshal(e.Payload, &p)
+		if err = s.humanRequest(ctx, tx, e, p); err != nil {
+			return r, false, err
+		}
+	case "dependency.resolve":
+		var p ResolveDependencyPayload
+		_ = json.Unmarshal(e.Payload, &p)
+		if err = s.resolveDependency(ctx, tx, e, p); err != nil {
+			return r, false, err
+		}
+	case "step.complete":
+		var p CompleteStepPayload
+		_ = json.Unmarshal(e.Payload, &p)
+		if err = s.completeStep(ctx, tx, e, p); err != nil {
+			return r, false, err
+		}
+	case "agent.input", "human.decision":
 		if !internal || e.ToAgentID != f.OwnerAgentID {
 			return r, false, wireError(403, "coordinator_only")
 		}
 	case "task.dispatch":
 		if f.Stopped {
 			return r, false, wireError(409, "feature_stopped")
+		}
+		if err = barrier(ctx, tx, f.FeatureID); err != nil {
+			return r, false, err
 		}
 		var d DispatchPayload
 		_ = json.Unmarshal(e.Payload, &d)
@@ -201,10 +231,10 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 			d.RunTimeoutSeconds = 600
 		}
 		var active, total int
-		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM attempts WHERE agent_id=? AND state NOT IN ('succeeded','failed','cancelled','interrupted')", e.ToAgentID).Scan(&active); err != nil {
+		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM attempts WHERE agent_id=? AND state NOT IN ('succeeded','failed','cancelled','interrupted','blocked')", e.ToAgentID).Scan(&active); err != nil {
 			return r, false, err
 		}
-		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM attempts WHERE state NOT IN ('succeeded','failed','cancelled','interrupted')").Scan(&total); err != nil {
+		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM attempts WHERE state NOT IN ('succeeded','failed','cancelled','interrupted','blocked')").Scan(&total); err != nil {
 			return r, false, err
 		}
 		if active > 0 || total >= 2 {
@@ -215,6 +245,13 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 		if err == nil {
 			if featureID != f.FeatureID {
 				return r, false, wireError(404, "not_found")
+			}
+			var gated int
+			if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM dependencies WHERE feature_id=? AND job_id=?", f.FeatureID, e.JobID).Scan(&gated); err != nil {
+				return r, false, err
+			}
+			if gated > 0 {
+				return r, false, wireError(409, "human_gate_requires_resume")
 			}
 			old, err := attempt(ctx, tx, current)
 			if err != nil {
@@ -237,7 +274,57 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 		if _, err = tx.ExecContext(ctx, "INSERT INTO attempts(id,job_id,agent_id,state,data) VALUES(?,?,?,?,?)", a.AttemptID, e.JobID, e.ToAgentID, a.State, mustJSON(a)); err != nil {
 			return r, false, wireError(409, "attempt_conflict")
 		}
+	case "task.resume":
+		if f.Stopped {
+			return r, false, wireError(409, "feature_stopped")
+		}
+		var p ResumeTaskPayload
+		_ = json.Unmarshal(e.Payload, &p)
+		d, err := s.canResume(ctx, tx, e, p)
+		if err != nil {
+			return r, false, err
+		}
+		var profileID string
+		if err = tx.QueryRowContext(ctx, "SELECT profile_id FROM agents WHERE agent_id=?", e.ToAgentID).Scan(&profileID); err != nil {
+			return r, false, err
+		}
+		if profileID != p.Dispatch.Profile.ID || s.profiles[profileID] != p.Dispatch.Profile {
+			return r, false, wireError(422, "profile_unavailable")
+		}
+		if p.Dispatch.AcceptBy == "" {
+			p.Dispatch.AcceptBy = s.now().UTC().Add(60 * time.Second).Format(time.RFC3339Nano)
+		}
+		deadline, _ := time.Parse(time.RFC3339Nano, p.Dispatch.AcceptBy)
+		if !deadline.After(s.now()) || deadline.After(s.now().Add(300*time.Second)) {
+			return r, false, wireError(400, "invalid_deadline")
+		}
+		if p.Dispatch.RunTimeoutSeconds == 0 {
+			p.Dispatch.RunTimeoutSeconds = 600
+		}
+		var active, total int
+		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM attempts WHERE agent_id=? AND state NOT IN ('succeeded','failed','cancelled','interrupted','blocked')", e.ToAgentID).Scan(&active); err != nil {
+			return r, false, err
+		}
+		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM attempts WHERE state NOT IN ('succeeded','failed','cancelled','interrupted','blocked')").Scan(&total); err != nil {
+			return r, false, err
+		}
+		if active > 0 || total >= 2 {
+			return r, false, wireError(429, "capacity_exceeded")
+		}
+		a = attemptRecord{Attempt: Attempt{AttemptID: e.AttemptID, AssignedAgentID: e.ToAgentID, State: "queued", Review: "pending", DispatchMessageID: e.MessageID, DependencyID: d.ID}, JobID: e.JobID, FeatureID: f.FeatureID, Dispatch: p.Dispatch}
+		if _, err = tx.ExecContext(ctx, "INSERT INTO attempts(id,job_id,agent_id,state,data) VALUES(?,?,?,?,?)", a.AttemptID, e.JobID, e.ToAgentID, a.State, mustJSON(a)); err != nil {
+			return r, false, wireError(409, "attempt_conflict")
+		}
+		if _, err = tx.ExecContext(ctx, "UPDATE jobs SET current_attempt_id=? WHERE id=? AND current_attempt_id=?", e.AttemptID, e.JobID, d.AttemptID); err != nil {
+			return r, false, err
+		}
+		if err = s.markResumed(ctx, tx, d, e); err != nil {
+			return r, false, err
+		}
 	case "task.accepted":
+		if err = barrier(ctx, tx, f.FeatureID); err != nil {
+			return r, false, err
+		}
 		var d AcceptedPayload
 		_ = json.Unmarshal(e.Payload, &d)
 		if a.State != "queued" || a.CancelRequested {
@@ -258,6 +345,9 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 			return r, false, err
 		}
 	case "task.started":
+		if err = barrier(ctx, tx, f.FeatureID); err != nil {
+			return r, false, err
+		}
 		var d StartedPayload
 		_ = json.Unmarshal(e.Payload, &d)
 		if a.State != "accepted" || a.CancelRequested {
@@ -327,6 +417,11 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 		if err = saveAttempt(ctx, tx, a); err != nil {
 			return r, false, err
 		}
+		if d.Outcome == "blocked" {
+			if err = s.blocked(ctx, tx, a, e, d); err != nil {
+				return r, false, err
+			}
+		}
 	case "task.review":
 		var d ReviewPayload
 		_ = json.Unmarshal(e.Payload, &d)
@@ -365,7 +460,7 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 func (s *Store) enqueue(ctx context.Context, tx *sql.Tx, e Envelope) (Receipt, error) {
 	var r Receipt
 	lane := "normal"
-	special := e.Type == "task.result" || e.Type == "task.cancel" || e.Type == "turn.cancel"
+	special := e.Type == "task.result" || e.Type == "human.decision" || e.Type == "task.cancel" || e.Type == "turn.cancel"
 	if e.Type == "task.cancel" || e.Type == "turn.cancel" {
 		lane = "control"
 	}
@@ -375,6 +470,11 @@ func (s *Store) enqueue(ctx context.Context, tx *sql.Tx, e Envelope) (Receipt, e
 	}
 	var count, bytes int
 	if err = tx.QueryRowContext(ctx, "SELECT count(*),coalesce(sum(bytes),0) FROM mailbox_delivery WHERE agent_id=? AND acked=0 AND superseded=0 AND pending_notification=0", e.ToAgentID).Scan(&count, &bytes); err != nil {
+		return r, err
+	}
+	if e.ToAgentID == "coordinator" {
+		r = Receipt{MessageID: e.MessageID, Receipt: "stored", ReceivedAt: s.stamp()}
+		_, err = tx.ExecContext(ctx, "INSERT INTO messages(sender,message_id,feature_id,kind,job_id,attempt_id,turn_id,canonical,receipt) VALUES(?,?,?,?,?,?,?,?,?)", e.FromAgentID, e.MessageID, e.FeatureID, e.Type, e.JobID, e.AttemptID, e.OwnerTurnID, canon, mustJSON(r))
 		return r, err
 	}
 	pending := 0
@@ -433,7 +533,7 @@ func (s *Store) Ingest(ctx context.Context, featureID string, input InputPayload
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		e := Envelope{ProtocolVersion: 1, MessageID: NewID(), Type: "agent.input", TenantID: f.TenantID, ProjectID: f.ProjectID, FeatureID: f.FeatureID, FromAgentID: "coordinator", ToAgentID: f.OwnerAgentID, SentAt: s.stamp(), Payload: mustJSON(input)}
+		e := Envelope{ProtocolVersion: s.wireVersion(), MessageID: NewID(), Type: "agent.input", TenantID: f.TenantID, ProjectID: f.ProjectID, FeatureID: f.FeatureID, FromAgentID: "coordinator", ToAgentID: f.OwnerAgentID, SentAt: s.stamp(), Payload: mustJSON(input)}
 		if err = validateEnvelope(e); err != nil {
 			return err
 		}
@@ -462,7 +562,7 @@ func (s *Store) mailbox(ctx context.Context, p Principal, lane string, limit int
 				return err
 			}
 		}
-		rows, err := tx.QueryContext(ctx, "SELECT m.canonical,m.receipt,d.pending_notification FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row WHERE d.agent_id=? AND d.lane=? AND d.acked=0 AND d.superseded=0 ORDER BY d.seq LIMIT ?", p.AgentID, lane, limit)
+		rows, err := tx.QueryContext(ctx, "SELECT m.canonical,m.receipt,d.pending_notification FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row LEFT JOIN recovery_barriers b ON b.feature_id=m.feature_id WHERE d.agent_id=? AND d.lane=? AND d.acked=0 AND d.superseded=0 AND (b.feature_id IS NULL OR m.kind IN ('task.result','task.cancel','turn.cancel')) ORDER BY d.seq LIMIT ?", p.AgentID, lane, limit)
 		if err != nil {
 			return err
 		}
@@ -525,7 +625,7 @@ func (s *Store) synthetic(ctx context.Context, tx *sql.Tx, a attemptRecord, code
 		return err
 	}
 	result := ResultPayload{Outcome: "failed", Summary: fmt.Sprintf("Task could not start: %s", code), Evidence: []Evidence{}, Error: &TaskError{Code: code, Message: code, Retryable: true}, Origin: "coordinator"}
-	e := Envelope{ProtocolVersion: 1, MessageID: NewID(), Type: "task.result", TenantID: f.TenantID, ProjectID: f.ProjectID, FeatureID: f.FeatureID, FromAgentID: "coordinator", ToAgentID: f.OwnerAgentID, JobID: a.JobID, AttemptID: a.AttemptID, CausationID: cause(a.DispatchMessageID), SentAt: s.stamp(), Payload: mustJSON(result)}
+	e := Envelope{ProtocolVersion: s.wireVersion(), MessageID: NewID(), Type: "task.result", TenantID: f.TenantID, ProjectID: f.ProjectID, FeatureID: f.FeatureID, FromAgentID: "coordinator", ToAgentID: f.OwnerAgentID, JobID: a.JobID, AttemptID: a.AttemptID, CausationID: cause(a.DispatchMessageID), SentAt: s.stamp(), Payload: mustJSON(result)}
 	_, _, err = s.applyMessage(ctx, tx, Principal{AgentID: "coordinator"}, e, true)
 	return err
 }

@@ -26,6 +26,7 @@ type Store struct {
 	mailboxLimit   int
 	mailboxBytes   int
 	mailboxReserve int
+	humanPollAfter string
 }
 
 type attemptRecord struct {
@@ -64,6 +65,16 @@ CREATE TABLE IF NOT EXISTS slack_outbox (id TEXT PRIMARY KEY,feature_id TEXT NOT
 CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT NOT NULL,agent_id TEXT NOT NULL,instance_id TEXT NOT NULL,feature_id TEXT NOT NULL,message_id TEXT NOT NULL,job_id TEXT NOT NULL,attempt_id TEXT NOT NULL,turn_id TEXT NOT NULL,event TEXT NOT NULL,code TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS pending_mailbox ON mailbox_delivery(agent_id,lane,acked,superseded,seq);
 CREATE INDEX IF NOT EXISTS phase_messages ON messages(attempt_id,kind);
+`
+const humanSchema = `
+CREATE TABLE IF NOT EXISTS dependencies (id TEXT PRIMARY KEY,feature_id TEXT NOT NULL REFERENCES features(id),job_id TEXT NOT NULL DEFAULT '',source_message_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,data BLOB NOT NULL);
+CREATE INDEX IF NOT EXISTS dependency_job ON dependencies(feature_id,job_id,state);
+CREATE TABLE IF NOT EXISTS human_projections (request_id TEXT PRIMARY KEY,dependency_id TEXT NOT NULL UNIQUE REFERENCES dependencies(id),state TEXT NOT NULL,revision INTEGER NOT NULL,data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS backend_sync_operations (operation_id TEXT PRIMARY KEY,request_id TEXT NOT NULL,kind TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at TEXT NOT NULL DEFAULT '',payload BLOB NOT NULL,reason TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS backend_sync_due ON backend_sync_operations(status,next_at);
+CREATE TABLE IF NOT EXISTS decision_applications (request_id TEXT NOT NULL,revision INTEGER NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',mailbox_seq INTEGER,PRIMARY KEY(request_id,revision));
+CREATE TABLE IF NOT EXISTS source_ingress (workspace_id TEXT NOT NULL,channel_id TEXT NOT NULL,message_ts TEXT NOT NULL,feature_id TEXT NOT NULL,payload BLOB NOT NULL,receipt BLOB NOT NULL,PRIMARY KEY(workspace_id,channel_id,message_ts));
+CREATE TABLE IF NOT EXISTS recovery_barriers (feature_id TEXT PRIMARY KEY REFERENCES features(id),reason TEXT NOT NULL);
 `
 
 func Open(ctx context.Context, path string, cfg Config) (*Store, error) {
@@ -115,6 +126,12 @@ func (s *Store) Close() error {
 	return err
 }
 func (s *Store) stamp() string { return s.now().UTC().Format(time.RFC3339Nano) }
+func (s *Store) wireVersion() int {
+	if s.cfg.WireVersion == 2 {
+		return 2
+	}
+	return 1
+}
 func (s *Store) bootstrap(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -126,15 +143,43 @@ func (s *Store) bootstrap(ctx context.Context) error {
 	}
 	var version int
 	err = tx.QueryRowContext(ctx, "SELECT version FROM schema_version").Scan(&version)
+	target := 1
+	if s.cfg.WireVersion == 2 {
+		target = 2
+	}
 	if errors.Is(err, sql.ErrNoRows) {
-		_, err = tx.ExecContext(ctx, "INSERT INTO schema_version VALUES(1)")
-		version = 1
+		_, err = tx.ExecContext(ctx, "INSERT INTO schema_version VALUES(?)", target)
+		version = target
 	}
 	if err != nil {
 		return err
 	}
-	if version != 1 {
-		return fmt.Errorf("unsupported schema version %d", version)
+	if version != target {
+		if version != 1 || target != 2 {
+			return fmt.Errorf("unsupported or mixed schema version %d for wire %d", version, target)
+		}
+		// Retained P2 execution/receipt migration is a separate phase. A fresh
+		// fixture may be upgraded, but an active/history-bearing state fails closed.
+		var retained int
+		if err = tx.QueryRowContext(ctx, "SELECT (SELECT count(*) FROM jobs)+(SELECT count(*) FROM owner_turns)+(SELECT count(*) FROM messages)+(SELECT count(*) FROM ingress)+(SELECT count(*) FROM slack_outbox)").Scan(&retained); err != nil {
+			return err
+		}
+		if retained != 0 {
+			return fmt.Errorf("retained schema-1 state requires explicit migration")
+		}
+		if _, err = tx.ExecContext(ctx, "UPDATE schema_version SET version=2 WHERE version=1"); err != nil {
+			return err
+		}
+	}
+	// Auxiliary tables are inert under wire1; adding them does not reclassify
+	// retained execution state or permit a mixed wire/schema stand.
+	if _, err = tx.ExecContext(ctx, humanSchema); err != nil {
+		return err
+	}
+	if target == 2 {
+		if _, err = tx.ExecContext(ctx, "UPDATE backend_sync_operations SET status='retry' WHERE status='inflight'"); err != nil {
+			return err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO scope VALUES(1,?,?)", s.cfg.TenantID, s.cfg.ProjectID); err != nil {
 		return err
@@ -185,6 +230,11 @@ func (s *Store) bootstrap(ctx context.Context) error {
 	for _, f := range s.cfg.Features {
 		if err = s.registerFeature(ctx, tx, f); err != nil {
 			return err
+		}
+		if s.cfg.WireVersion == 2 {
+			if _, err = tx.ExecContext(ctx, "INSERT INTO recovery_barriers(feature_id,reason) VALUES(?,?) ON CONFLICT(feature_id) DO UPDATE SET reason=excluded.reason", f.FeatureID, "source_catchup_required"); err != nil {
+				return err
+			}
 		}
 	}
 	// A send accepted by Slack but not settled locally must never be blindly replayed.
@@ -317,7 +367,7 @@ func saveTurn(ctx context.Context, tx *sql.Tx, t turnRecord) error {
 	return err
 }
 func terminal(state string) bool {
-	return state == "succeeded" || state == "failed" || state == "cancelled" || state == "interrupted"
+	return state == "succeeded" || state == "failed" || state == "cancelled" || state == "interrupted" || state == "blocked"
 }
 func (s *Store) audit(ctx context.Context, tx *sql.Tx, p Principal, e Envelope, event, code string) error {
 	_, err := tx.ExecContext(ctx, "INSERT INTO audit(at,agent_id,instance_id,feature_id,message_id,job_id,attempt_id,turn_id,event,code) VALUES(?,?,?,?,?,?,?,?,?,?)", s.stamp(), p.AgentID, p.InstanceID, e.FeatureID, e.MessageID, e.JobID, e.AttemptID, e.OwnerTurnID, event, code)

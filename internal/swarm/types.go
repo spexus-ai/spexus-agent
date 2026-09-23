@@ -14,11 +14,22 @@ const APIPrefix = "/internal/agent/v1"
 const MaxEnvelopeBytes = 128 * 1024
 
 type Config struct {
-	TenantID  string            `json:"tenant_id"`
-	ProjectID string            `json:"project_id"`
-	Agents    []AgentConfig     `json:"agents"`
-	Features  []Feature         `json:"features"`
-	Profiles  []ProfileSnapshot `json:"profiles"`
+	TenantID    string            `json:"tenant_id"`
+	ProjectID   string            `json:"project_id"`
+	WireVersion int               `json:"wire_version,omitempty"`
+	Human       *HumanConfig      `json:"human,omitempty"`
+	Agents      []AgentConfig     `json:"agents"`
+	Features    []Feature         `json:"features"`
+	Profiles    []ProfileSnapshot `json:"profiles"`
+}
+
+// HumanConfig is coordinator-only. Runners never receive backend credentials.
+type HumanConfig struct {
+	BaseURL     string `json:"base_url"`
+	CAFile      string `json:"ca_file"`
+	TokenFile   string `json:"token_file"`
+	EpicID      string `json:"epic_id"`
+	WorkspaceID string `json:"workspace_id"`
 }
 type AgentConfig struct {
 	AgentID          string `json:"agent_id"`
@@ -133,6 +144,51 @@ type ResultPayload struct {
 	Error       *TaskError   `json:"error"`
 	Origin      string       `json:"origin"`
 	Observation *Observation `json:"observation,omitempty"`
+	Blocker     *Blocker     `json:"blocker,omitempty"`
+}
+type HumanOption struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+type Blocker struct {
+	Reason         string        `json:"reason"`
+	Context        string        `json:"context"`
+	Question       string        `json:"question"`
+	Options        []HumanOption `json:"options"`
+	Recommendation string        `json:"recommendation"`
+	Kind           string        `json:"kind"`
+}
+type HumanRequestPayload struct {
+	DependencyID string `json:"dependency_id,omitempty"`
+	StepKey      string `json:"step_key,omitempty"`
+	BlockedWork  string `json:"blocked_work,omitempty"`
+	Blocker
+}
+type ResolveDependencyPayload struct {
+	DependencyID string     `json:"dependency_id"`
+	Resolution   string     `json:"resolution"`
+	Evidence     []Evidence `json:"evidence"`
+}
+type ResumeTaskPayload struct {
+	DependencyID  string          `json:"dependency_id"`
+	DecisionID    string          `json:"decision_id,omitempty"`
+	WorkerAgentID string          `json:"worker_agent_id"`
+	Dispatch      DispatchPayload `json:"dispatch"`
+}
+type CompleteStepPayload struct {
+	DependencyID string `json:"dependency_id"`
+	DecisionID   string `json:"decision_id"`
+	Summary      string `json:"summary"`
+}
+type HumanDecisionPayload struct {
+	RequestID         string          `json:"request_id"`
+	DependencyID      string          `json:"dependency_id"`
+	DecisionID        string          `json:"decision_id"`
+	State             string          `json:"state"`
+	Revision          int             `json:"revision"`
+	Response          json.RawMessage `json:"response,omitempty"`
+	Source            json.RawMessage `json:"source,omitempty"`
+	ApplicationStatus string          `json:"application_status"`
 }
 type ReviewPayload struct {
 	ResultMessageID string     `json:"result_message_id"`
@@ -200,13 +256,15 @@ type Attempt struct {
 	AcceptedMessageID string         `json:"accepted_message_id,omitempty"`
 	ResultMessageID   string         `json:"result_message_id,omitempty"`
 	CancelMessageID   string         `json:"cancel_message_id,omitempty"`
+	DependencyID      string         `json:"dependency_id,omitempty"`
 }
 type JobView struct {
-	JobID            string    `json:"job_id"`
-	FeatureID        string    `json:"feature_id"`
-	CurrentAttemptID string    `json:"current_attempt_id"`
-	Attempts         []Attempt `json:"attempts"`
-	NextCursor       *string   `json:"next_cursor"`
+	JobID            string      `json:"job_id"`
+	FeatureID        string      `json:"feature_id"`
+	CurrentAttemptID string      `json:"current_attempt_id"`
+	Attempts         []Attempt   `json:"attempts"`
+	NextCursor       *string     `json:"next_cursor"`
+	Dependency       *Dependency `json:"dependency,omitempty"`
 }
 type OwnerStartRequest struct {
 	TurnID          string `json:"turn_id"`
@@ -274,13 +332,54 @@ type AgentStatus struct {
 	LastHeartbeat *string `json:"last_heartbeat"`
 }
 type History struct {
-	Feature     Feature         `json:"feature"`
-	Jobs        []JobView       `json:"jobs"`
-	Turns       []OwnerTurn     `json:"turns"`
-	Messages    []Delivery      `json:"messages"`
-	Audit       []AuditEvent    `json:"audit"`
-	Agents      []AgentStatus   `json:"agents"`
-	SlackOutbox []SlackDelivery `json:"slack_outbox"`
+	Feature         Feature           `json:"feature"`
+	Jobs            []JobView         `json:"jobs"`
+	Turns           []OwnerTurn       `json:"turns"`
+	Messages        []Delivery        `json:"messages"`
+	Audit           []AuditEvent      `json:"audit"`
+	Agents          []AgentStatus     `json:"agents"`
+	SlackOutbox     []SlackDelivery   `json:"slack_outbox"`
+	Dependencies    []Dependency      `json:"dependencies,omitempty"`
+	HumanRequests   []HumanProjection `json:"human_requests,omitempty"`
+	HumanSync       []HumanSyncStatus `json:"human_sync,omitempty"`
+	RecoveryBarrier string            `json:"recovery_barrier,omitempty"`
+}
+type HumanSyncStatus struct {
+	OperationID string `json:"operation_id"`
+	RequestID   string `json:"request_id"`
+	Kind        string `json:"kind"`
+	Status      string `json:"status"`
+	Attempts    int    `json:"attempts"`
+	NextAt      string `json:"next_at,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+}
+type Dependency struct {
+	ID                    string  `json:"id"`
+	FeatureID             string  `json:"feature_id"`
+	Kind                  string  `json:"kind"`
+	JobID                 string  `json:"job_id,omitempty"`
+	AttemptID             string  `json:"attempt_id,omitempty"`
+	StepKey               string  `json:"step_key,omitempty"`
+	BlockedWork           string  `json:"blocked_work,omitempty"`
+	OriginTurnID          string  `json:"origin_turn_id,omitempty"`
+	SourceMessageID       string  `json:"source_message_id"`
+	State                 string  `json:"state"`
+	Blocker               Blocker `json:"blocker"`
+	RequestID             string  `json:"request_id,omitempty"`
+	DecisionID            string  `json:"decision_id,omitempty"`
+	Resolution            string  `json:"resolution,omitempty"`
+	ContinuationAttemptID string  `json:"continuation_attempt_id,omitempty"`
+	CreatedAt             string  `json:"created_at"`
+	UpdatedAt             string  `json:"updated_at"`
+}
+type HumanProjection struct {
+	RequestID         string          `json:"request_id"`
+	DependencyID      string          `json:"dependency_id"`
+	BackendState      string          `json:"backend_state"`
+	Revision          int             `json:"revision"`
+	ApplicationStatus string          `json:"application_status"`
+	SuppressedReason  string          `json:"suppressed_reason,omitempty"`
+	View              json.RawMessage `json:"view,omitempty"`
 }
 type ReconcileRequest struct {
 	AgentID          string    `json:"agent_id"`

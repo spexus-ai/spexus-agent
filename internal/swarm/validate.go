@@ -115,6 +115,12 @@ func validateConfig(c Config) error {
 	if !uuid(c.TenantID) || !uuid(c.ProjectID) || len(c.Agents) != 3 || len(c.Profiles) == 0 {
 		return fmt.Errorf("invalid scope or three-agent configuration")
 	}
+	if c.WireVersion != 0 && c.WireVersion != 1 && c.WireVersion != 2 {
+		return fmt.Errorf("unsupported wire version")
+	}
+	if c.WireVersion == 2 && (c.Human == nil || !uuid(c.Human.EpicID) || c.Human.WorkspaceID == "" || c.Human.BaseURL == "" || c.Human.TokenFile == "") {
+		return fmt.Errorf("wire version 2 requires human backend configuration")
+	}
 	profiles := map[string]bool{}
 	for _, snap := range c.Profiles {
 		p, err := ValidateTextProfile(snap.Bytes)
@@ -215,8 +221,13 @@ func validateResult(r ResultPayload) error {
 	if !terminal(r.Outcome) || !safeText(r.Summary, 16*1024) || r.Origin != "worker" && r.Origin != "coordinator" {
 		return wireError(400, "invalid_result")
 	}
-	if r.Outcome == "succeeded" && r.Error != nil || r.Outcome != "succeeded" && r.Error == nil {
+	if r.Outcome == "succeeded" && r.Error != nil || r.Outcome == "failed" && r.Error == nil || r.Outcome == "blocked" && (r.Error != nil || r.Blocker == nil) || r.Outcome != "blocked" && r.Blocker != nil || (r.Outcome == "cancelled" || r.Outcome == "interrupted") && r.Error == nil {
 		return wireError(400, "invalid_error")
+	}
+	if r.Blocker != nil {
+		if err := validateBlocker(*r.Blocker); err != nil {
+			return err
+		}
 	}
 	if err := validateEvidence(r.Evidence); err != nil {
 		return err
@@ -226,11 +237,47 @@ func validateResult(r ResultPayload) error {
 	}
 	return validateObservation(r.Observation)
 }
+func validateBlocker(b Blocker) error {
+	if !safeText(b.Reason, 4096) || !safeText(b.Context, 16*1024) || !safeText(b.Question, 4096) || !safeText(b.Recommendation, 4096) || b.Options == nil || len(b.Options) > 8 {
+		return wireError(400, "invalid_blocker")
+	}
+	switch b.Kind {
+	case "clarification", "choice", "permission", "external_action", "blocker":
+	default:
+		return wireError(400, "invalid_blocker")
+	}
+	seen := map[string]bool{}
+	for _, o := range b.Options {
+		if len(o.ID) == 0 || len(o.ID) > 64 || o.ID == "text" || o.ID == "deny" || seen[o.ID] || !safeText(o.Label, 1024) {
+			return wireError(400, "invalid_option")
+		}
+		for i, r := range o.ID {
+			if r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || i > 0 && (r == '_' || r == '-') {
+				continue
+			}
+			return wireError(400, "invalid_option")
+		}
+		seen[o.ID] = true
+	}
+	return nil
+}
+func stepKey(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		if r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '.' || r == ':' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
 func validateEnvelope(e Envelope) error {
 	if len(mustJSON(e)) > MaxEnvelopeBytes {
 		return wireError(413, "envelope_too_large")
 	}
-	if e.ProtocolVersion != 1 {
+	if e.ProtocolVersion != 1 && e.ProtocolVersion != 2 {
 		return wireError(400, "unsupported_version")
 	}
 	if !uuid(e.MessageID) || !uuid(e.TenantID) || !uuid(e.ProjectID) || !uuid(e.FeatureID) || !utc(e.SentAt) || !safeText(e.FromAgentID, 128) || !safeText(e.ToAgentID, 128) {
@@ -240,13 +287,16 @@ func validateEnvelope(e Envelope) error {
 		return wireError(400, "invalid_causation")
 	}
 	task := strings.HasPrefix(e.Type, "task.")
+	if e.Type == "task.resume" {
+		task = true
+	}
 	if task && (!uuid(e.JobID) || !uuid(e.AttemptID)) {
 		return wireError(400, "invalid_attempt")
 	}
 	if !task && (e.JobID != "" || e.AttemptID != "") {
 		return wireError(400, "invalid_envelope")
 	}
-	action := e.Type == "task.dispatch" || e.Type == "task.review" || e.Type == "task.cancel"
+	action := e.Type == "task.dispatch" || e.Type == "task.review" || e.Type == "task.cancel" || e.Type == "human.request" || e.Type == "dependency.resolve" || e.Type == "task.resume" || e.Type == "step.complete"
 	if action && e.FromAgentID != "coordinator" || e.Type == "turn.cancel" {
 		if !uuid(e.OwnerTurnID) {
 			return wireError(400, "invalid_owner_turn")
@@ -254,10 +304,77 @@ func validateEnvelope(e Envelope) error {
 	} else if e.OwnerTurnID != "" {
 		return wireError(400, "unexpected_owner_turn")
 	}
-	if e.Type != "task.dispatch" && e.Type != "agent.input" && e.Type != "turn.cancel" && e.CausationID == nil {
+	if e.Type != "task.dispatch" && e.Type != "task.resume" && e.Type != "human.request" && e.Type != "dependency.resolve" && e.Type != "step.complete" && e.Type != "agent.input" && e.Type != "turn.cancel" && e.CausationID == nil {
 		return wireError(400, "missing_causation")
 	}
 	switch e.Type {
+	case "human.request":
+		if e.ProtocolVersion != 2 || e.JobID != "" || e.AttemptID != "" {
+			return wireError(400, "invalid_human_request")
+		}
+		var p HumanRequestPayload
+		if err := decode(e.Payload, &p); err != nil {
+			return err
+		}
+		if err := validateBlocker(p.Blocker); err != nil {
+			return err
+		}
+		if p.DependencyID == "" {
+			if !safeText(p.BlockedWork, 16*1024) || !stepKey(p.StepKey) {
+				return wireError(400, "invalid_owner_step")
+			}
+		} else if !uuid(p.DependencyID) || p.StepKey != "" || p.BlockedWork != "" {
+			return wireError(400, "invalid_dependency")
+		}
+	case "dependency.resolve":
+		if e.ProtocolVersion != 2 {
+			return wireError(400, "unsupported_version")
+		}
+		var p ResolveDependencyPayload
+		if err := decode(e.Payload, &p); err != nil {
+			return err
+		}
+		if !uuid(p.DependencyID) || !safeText(p.Resolution, 16*1024) {
+			return wireError(400, "invalid_resolution")
+		}
+		return validateEvidence(p.Evidence)
+	case "task.resume":
+		if e.ProtocolVersion != 2 {
+			return wireError(400, "unsupported_version")
+		}
+		var p ResumeTaskPayload
+		if err := decode(e.Payload, &p); err != nil {
+			return err
+		}
+		if !uuid(p.DependencyID) || p.DecisionID != "" && !uuid(p.DecisionID) || p.WorkerAgentID != e.ToAgentID {
+			return wireError(400, "invalid_resume")
+		}
+		dispatch := e
+		dispatch.Type = "task.dispatch"
+		dispatch.Payload = mustJSON(p.Dispatch)
+		return validateEnvelope(dispatch)
+	case "step.complete":
+		if e.ProtocolVersion != 2 {
+			return wireError(400, "unsupported_version")
+		}
+		var p CompleteStepPayload
+		if err := decode(e.Payload, &p); err != nil {
+			return err
+		}
+		if !uuid(p.DependencyID) || !uuid(p.DecisionID) || !safeText(p.Summary, 16*1024) {
+			return wireError(400, "invalid_step_completion")
+		}
+	case "human.decision":
+		if e.ProtocolVersion != 2 {
+			return wireError(400, "unsupported_version")
+		}
+		var p HumanDecisionPayload
+		if err := decode(e.Payload, &p); err != nil {
+			return err
+		}
+		if !uuid(p.RequestID) || !uuid(p.DependencyID) || !uuid(p.DecisionID) || p.Revision != 2 {
+			return wireError(400, "invalid_human_decision")
+		}
 	case "agent.input":
 		var p InputPayload
 		if err := decode(e.Payload, &p); err != nil {
@@ -316,6 +433,9 @@ func validateEnvelope(e Envelope) error {
 		}
 		if err := required(e.Payload, "outcome", "summary", "evidence", "error", "origin"); err != nil {
 			return err
+		}
+		if p.Outcome == "blocked" && e.ProtocolVersion != 2 {
+			return wireError(400, "unsupported_version")
 		}
 		return validateResult(p)
 	case "task.review":

@@ -40,6 +40,9 @@ func (s *Store) startOwner(ctx context.Context, p Principal, r OwnerStartRequest
 		if f.Stopped {
 			return wireError(409, "feature_stopped")
 		}
+		if err = barrier(ctx, tx, f.FeatureID); err != nil {
+			return err
+		}
 		var raw []byte
 		var superseded int
 		err = tx.QueryRowContext(ctx, "SELECT m.canonical,d.superseded FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row WHERE d.agent_id=? AND d.seq=?", p.AgentID, r.InputMailboxSeq).Scan(&raw, &superseded)
@@ -53,7 +56,7 @@ func (s *Store) startOwner(ctx context.Context, p Principal, r OwnerStartRequest
 		if err = json.Unmarshal(raw, &e); err != nil {
 			return err
 		}
-		if e.FeatureID != r.FeatureID || superseded != 0 || e.Type != "agent.input" && e.Type != "task.result" {
+		if e.FeatureID != r.FeatureID || superseded != 0 || e.Type != "agent.input" && e.Type != "task.result" && e.Type != "human.decision" {
 			return wireError(409, "invalid_trigger")
 		}
 		var count int
@@ -329,7 +332,7 @@ func (s *Store) cancelAttempt(ctx context.Context, tx *sql.Tx, f Feature, a atte
 	if terminal(a.State) || a.CancelRequested {
 		return nil
 	}
-	e := Envelope{ProtocolVersion: 1, MessageID: NewID(), Type: "task.cancel", TenantID: f.TenantID, ProjectID: f.ProjectID, FeatureID: f.FeatureID, FromAgentID: "coordinator", ToAgentID: a.AssignedAgentID, JobID: a.JobID, AttemptID: a.AttemptID, CausationID: cause(a.DispatchMessageID), SentAt: s.stamp(), Payload: mustJSON(CancelPayload{reason, actor})}
+	e := Envelope{ProtocolVersion: s.wireVersion(), MessageID: NewID(), Type: "task.cancel", TenantID: f.TenantID, ProjectID: f.ProjectID, FeatureID: f.FeatureID, FromAgentID: "coordinator", ToAgentID: a.AssignedAgentID, JobID: a.JobID, AttemptID: a.AttemptID, CausationID: cause(a.DispatchMessageID), SentAt: s.stamp(), Payload: mustJSON(CancelPayload{reason, actor})}
 	_, _, err := s.applyMessage(ctx, tx, Principal{AgentID: "coordinator"}, e, true)
 	return err
 }
@@ -341,7 +344,7 @@ func (s *Store) cancelTurn(ctx context.Context, tx *sql.Tx, f Feature, t turnRec
 	if err := saveTurn(ctx, tx, t); err != nil {
 		return err
 	}
-	e := Envelope{ProtocolVersion: 1, MessageID: NewID(), Type: "turn.cancel", TenantID: f.TenantID, ProjectID: f.ProjectID, FeatureID: f.FeatureID, FromAgentID: "coordinator", ToAgentID: f.OwnerAgentID, OwnerTurnID: t.TurnID, SentAt: s.stamp(), Payload: mustJSON(CancelPayload{reason, actor})}
+	e := Envelope{ProtocolVersion: s.wireVersion(), MessageID: NewID(), Type: "turn.cancel", TenantID: f.TenantID, ProjectID: f.ProjectID, FeatureID: f.FeatureID, FromAgentID: "coordinator", ToAgentID: f.OwnerAgentID, OwnerTurnID: t.TurnID, SentAt: s.stamp(), Payload: mustJSON(CancelPayload{reason, actor})}
 	_, _, err := s.applyMessage(ctx, tx, Principal{AgentID: "coordinator"}, e, true)
 	return err
 }
@@ -359,6 +362,9 @@ func (s *Store) StopFeature(ctx context.Context, id, actor, reason string) error
 		}
 		f.Stopped = true
 		if _, err = tx.ExecContext(ctx, "UPDATE features SET data=? WHERE id=?", mustJSON(f), id); err != nil {
+			return err
+		}
+		if err = s.cancelDependencies(ctx, tx, id, actor, reason); err != nil {
 			return err
 		}
 		attempts, turns, err := active(ctx, tx)
@@ -406,7 +412,7 @@ func (s *Store) ContinueFeature(ctx context.Context, id, actor string) error {
 			}
 		}
 		// Old pending inputs cannot become implicit replay after a human continue.
-		if _, err = tx.ExecContext(ctx, "UPDATE mailbox_delivery SET superseded=1 WHERE message_row IN (SELECT id FROM messages WHERE feature_id=? AND kind IN ('agent.input','task.result')) AND acked=0", id); err != nil {
+		if _, err = tx.ExecContext(ctx, "UPDATE mailbox_delivery SET superseded=1 WHERE message_row IN (SELECT id FROM messages WHERE feature_id=? AND kind IN ('agent.input','task.result','human.decision')) AND acked=0", id); err != nil {
 			return err
 		}
 		f.Stopped = false
@@ -419,7 +425,7 @@ func (s *Store) ContinueFeature(ctx context.Context, id, actor string) error {
 func active(ctx context.Context, tx *sql.Tx) ([]attemptRecord, []turnRecord, error) {
 	var attempts []attemptRecord
 	var turns []turnRecord
-	rows, err := tx.QueryContext(ctx, "SELECT data FROM attempts WHERE state NOT IN ('succeeded','failed','cancelled','interrupted')")
+	rows, err := tx.QueryContext(ctx, "SELECT data FROM attempts WHERE state NOT IN ('succeeded','failed','cancelled','interrupted','blocked')")
 	if err != nil {
 		return nil, nil, err
 	}

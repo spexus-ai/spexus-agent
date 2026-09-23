@@ -46,6 +46,18 @@ func (s *Store) job(ctx context.Context, p Principal, id string, limit int, curs
 			after = c.Seq
 		}
 		out, err = jobView(ctx, tx, id, filter, limit, after)
+		if err == nil && filter == "" {
+			var raw []byte
+			scan := tx.QueryRowContext(ctx, "SELECT data FROM dependencies WHERE feature_id=? AND job_id=? ORDER BY rowid DESC LIMIT 1", fid, id).Scan(&raw)
+			if scan == nil {
+				var d Dependency
+				if json.Unmarshal(raw, &d) == nil {
+					out.Dependency = &d
+				}
+			} else if scan != sql.ErrNoRows {
+				return scan
+			}
+		}
 		if err == nil && out.NextCursor != nil {
 			var last int64
 			_, _ = fmt.Sscan(*out.NextCursor, &last)
@@ -135,7 +147,7 @@ func history(ctx context.Context, db *sql.DB, id string, now time.Time) (History
 	if err = tx.QueryRowContext(ctx, "SELECT version FROM schema_version").Scan(&version); err != nil {
 		return out, err
 	}
-	if version != 1 {
+	if version != 1 && version != 2 {
 		return out, fmt.Errorf("unsupported schema version")
 	}
 	rows, err := tx.QueryContext(ctx, "SELECT id FROM jobs WHERE feature_id=? ORDER BY rowid", id)
@@ -275,5 +287,85 @@ func history(ctx context.Context, db *sql.DB, id string, now time.Time) (History
 		return out, err
 	}
 	rows.Close()
+	rows, err = tx.QueryContext(ctx, "SELECT data FROM dependencies WHERE feature_id=? ORDER BY rowid", id)
+	if err != nil {
+		return out, err
+	}
+	for rows.Next() {
+		var raw []byte
+		if err = rows.Scan(&raw); err != nil {
+			break
+		}
+		var d Dependency
+		if err = json.Unmarshal(raw, &d); err != nil {
+			break
+		}
+		out.Dependencies = append(out.Dependencies, d)
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return out, err
+	}
+	rows, err = tx.QueryContext(ctx, "SELECT p.data FROM human_projections p JOIN dependencies d ON d.id=p.dependency_id WHERE d.feature_id=? ORDER BY p.rowid", id)
+	if err != nil {
+		return out, err
+	}
+	for rows.Next() {
+		var raw []byte
+		if err = rows.Scan(&raw); err != nil {
+			break
+		}
+		var p HumanProjection
+		if err = json.Unmarshal(raw, &p); err != nil {
+			break
+		}
+		out.HumanRequests = append(out.HumanRequests, p)
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return out, err
+	}
+	if version == 1 {
+		return out, tx.Commit()
+	}
+	var barrierReason string
+	barrierErr := tx.QueryRowContext(ctx, "SELECT reason FROM recovery_barriers WHERE feature_id=?", id).Scan(&barrierReason)
+	if barrierErr == nil {
+		out.RecoveryBarrier = barrierReason
+	} else if barrierErr != sql.ErrNoRows {
+		return out, barrierErr
+	}
+	requestIDs := map[string]bool{}
+	for _, d := range out.Dependencies {
+		if d.RequestID != "" {
+			requestIDs[d.RequestID] = true
+		}
+	}
+	rows, err = tx.QueryContext(ctx, "SELECT operation_id,request_id,kind,status,attempts,next_at,reason FROM backend_sync_operations ORDER BY rowid")
+	if err != nil {
+		return out, err
+	}
+	for rows.Next() {
+		var v HumanSyncStatus
+		if err = rows.Scan(&v.OperationID, &v.RequestID, &v.Kind, &v.Status, &v.Attempts, &v.NextAt, &v.Reason); err != nil {
+			break
+		}
+		if requestIDs[v.RequestID] {
+			out.HumanSync = append(out.HumanSync, v)
+		}
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return out, err
+	}
 	return out, tx.Commit()
 }
