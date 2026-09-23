@@ -146,7 +146,7 @@ func (r *Runner) poll(ctx context.Context, lane string) error {
 		return e
 	}
 	for _, d := range response.Messages {
-		if d.MailboxSeq <= 0 || d.TenantID != r.cfg.TenantID || d.ProjectID != r.cfg.ProjectID || d.ToAgentID != r.cfg.AgentID {
+		if d.MailboxSeq <= 0 || d.ProtocolVersion != r.cfg.wireVersion() || d.TenantID != r.cfg.TenantID || d.ProjectID != r.cfg.ProjectID || d.ToAgentID != r.cfg.AgentID || swarm.ValidateEnvelope(d.Envelope) != nil {
 			return errors.New("invalid addressed delivery")
 		}
 		if (lane == "control") != (d.Type == "task.cancel" || d.Type == "turn.cancel") {
@@ -187,15 +187,18 @@ func (r *Runner) control(ctx context.Context) error {
 	return ctx.Err()
 }
 func (r *Runner) process(ctx context.Context, d swarm.Delivery) error {
+	if d.ProtocolVersion != r.cfg.wireVersion() || d.TenantID != r.cfg.TenantID || d.ProjectID != r.cfg.ProjectID || d.ToAgentID != r.cfg.AgentID || swarm.ValidateEnvelope(d.Envelope) != nil {
+		return errors.New("invalid addressed delivery")
+	}
 	switch d.Type {
 	case "task.accepted", "task.started", "task.review":
 		return r.journal.state(d.MailboxSeq, "applied", "")
-	case "task.dispatch":
+	case "task.dispatch", "task.resume":
 		if r.cfg.Role != "worker" {
 			return errors.New("dispatch addressed to owner")
 		}
 		return r.worker(ctx, d)
-	case "agent.input", "task.result":
+	case "agent.input", "task.result", "human.decision":
 		if r.cfg.Role != "owner" {
 			return errors.New("owner trigger addressed to worker")
 		}
@@ -219,6 +222,19 @@ func (r *Runner) job(ctx context.Context, id string) (swarm.JobView, error) {
 		v.NextCursor = page.NextCursor
 	}
 	return v, nil
+}
+func (r *Runner) dependency(ctx context.Context, id string) (swarm.Dependency, error) {
+	var d swarm.Dependency
+	if !uuid.MatchString(id) {
+		return d, errors.New("invalid dependency identity")
+	}
+	if err := r.client.call(ctx, "GET", "/dependencies/"+id, nil, &d); err != nil {
+		return d, err
+	}
+	if d.ID != id || d.FeatureID == "" {
+		return d, errors.New("invalid dependency response")
+	}
+	return d, nil
 }
 func (r *Runner) current(ctx context.Context, d swarm.Delivery) (swarm.Attempt, error) {
 	v, e := r.job(ctx, d.JobID)
@@ -261,7 +277,13 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 		return e
 	}
 	var dispatch swarm.DispatchPayload
-	if e := decode(d.Payload, &dispatch); e != nil {
+	if d.Type == "task.resume" {
+		var resume swarm.ResumeTaskPayload
+		if e := decode(d.Payload, &resume); e != nil {
+			return e
+		}
+		dispatch = resume.Dispatch
+	} else if e := decode(d.Payload, &dispatch); e != nil {
 		return e
 	}
 	currentProfile, e := loadProfile(r.cfg.ProfileFile)

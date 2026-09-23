@@ -101,6 +101,9 @@ func (j *Journal) bind(instance string) error {
 }
 func (j *Journal) identity(c Config) error {
 	value := c.TenantID + "/" + c.ProjectID + "/" + c.AgentID + "/" + c.Role
+	if c.WireVersion == 2 {
+		value += "/wire2"
+	}
 	_, e := j.db.Exec(`INSERT OR IGNORE INTO metadata(key,value) VALUES('identity',?)`, value)
 	if e != nil {
 		return e

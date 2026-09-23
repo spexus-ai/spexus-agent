@@ -21,6 +21,7 @@ type Target struct {
 	ProfileFile string `json:"profile_file"`
 }
 type Config struct {
+	WireVersion    int      `json:"wire_version,omitempty"`
 	CoordinatorURL string   `json:"coordinator_url"`
 	CAFile         string   `json:"ca_file"`
 	CredentialFile string   `json:"credential_file"`
@@ -73,6 +74,9 @@ func LoadConfig(path string) (Config, error) {
 	return c, c.validate()
 }
 func (c Config) validate() error {
+	if c.WireVersion != 0 && c.WireVersion != 1 && c.WireVersion != 2 {
+		return errors.New("unsupported wire version")
+	}
 	u, e := url.Parse(c.CoordinatorURL)
 	if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" {
 		return errors.New("coordinator_url must be an HTTPS origin")

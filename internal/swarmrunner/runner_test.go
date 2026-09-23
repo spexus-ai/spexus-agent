@@ -270,7 +270,20 @@ func TestBookkeepingAndSessionIsolation(t *testing.T) {
 		return "", false, errors.New("should not run")
 	})
 	for i, typ := range []string{"task.accepted", "task.started", "task.review"} {
-		d := swarm.Delivery{Envelope: swarm.Envelope{Type: typ}, MailboxSeq: int64(i + 1)}
+		d := dispatchFixture(r)
+		d.Type = typ
+		d.MailboxSeq = int64(i + 1)
+		d.CausationID = ptr(swarm.NewID())
+		switch typ {
+		case "task.accepted":
+			d.OwnerTurnID = ""
+			d.Payload, _ = json.Marshal(swarm.AcceptedPayload{DispatchMessageID: swarm.NewID(), ProfileRevision: r.profile.Revision})
+		case "task.started":
+			d.OwnerTurnID = ""
+			d.Payload, _ = json.Marshal(swarm.StartedPayload{AcceptedMessageID: swarm.NewID()})
+		case "task.review":
+			d.Payload, _ = json.Marshal(swarm.ReviewPayload{ResultMessageID: swarm.NewID(), Verdict: "accepted", Reason: "verified", Evidence: []swarm.Evidence{}})
+		}
 		storeInput(t, r, d)
 		if e := r.process(context.Background(), d); e != nil {
 			t.Fatal(e)
@@ -375,6 +388,8 @@ func TestInboxCommittedBeforeACKAndControlNotBlockedByACK(t *testing.T) {
 	r, _ = runnerFixture(t, handler)
 	d = dispatchFixture(r)
 	d.Type = "task.cancel"
+	d.CausationID = ptr(swarm.NewID())
+	d.Payload, _ = json.Marshal(swarm.CancelPayload{Reason: "stop", RequestedBy: "owner"})
 	r.active = d
 	r.cancel = func() { cancelled.Store(true) }
 	if e := r.poll(context.Background(), "control"); e != nil {
