@@ -252,13 +252,7 @@ func (s *promptStream) run(stdout io.ReadCloser, cleanup func()) {
 			}
 		case "message_end":
 			if r.Message.Role == "assistant" {
-				var last strings.Builder
-				for _, block := range r.Message.Content {
-					if block.Type == "text" {
-						last.WriteString(block.Text)
-					}
-				}
-				finalText = last.String()
+				finalText = finalAssistantText(r.Message.Content)
 				if r.Message.StopReason == "error" {
 					modelErr = fmt.Errorf("Pi model error: %s", r.Message.ErrorMessage)
 				} else {
@@ -346,12 +340,52 @@ type record struct {
 		Delta string `json:"delta"`
 	} `json:"assistantMessageEvent"`
 	Message struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-		Role         string `json:"role"`
-		StopReason   string `json:"stopReason"`
-		ErrorMessage string `json:"errorMessage"`
+		Content      []textBlock `json:"content"`
+		Role         string      `json:"role"`
+		StopReason   string      `json:"stopReason"`
+		ErrorMessage string      `json:"errorMessage"`
 	} `json:"message"`
+}
+
+// Pi TextContent.textSignature is either a legacy opaque message ID or encoded
+// TextSignatureV1 JSON. OpenAI Responses stores commentary and final_answer
+// blocks together in one assistant message; only final-answer data is executable.
+type textBlock struct {
+	Type          string `json:"type"`
+	Text          string `json:"text"`
+	TextSignature string `json:"textSignature"`
+}
+
+func finalAssistantText(content []textBlock) string {
+	var final, unphased strings.Builder
+	hasFinal := false
+	for _, block := range content {
+		if block.Type != "text" {
+			continue
+		}
+		phase := ""
+		if strings.HasPrefix(block.TextSignature, "{") {
+			var signature struct {
+				V     int    `json:"v"`
+				ID    string `json:"id"`
+				Phase string `json:"phase"`
+			}
+			if json.Unmarshal([]byte(block.TextSignature), &signature) != nil || signature.V != 1 || signature.ID == "" {
+				continue
+			}
+			phase = signature.Phase
+		}
+		switch phase {
+		case "final_answer":
+			hasFinal = true
+			final.WriteString(block.Text)
+		case "":
+			unphased.WriteString(block.Text)
+			// Commentary and unknown explicit phases must never become final data.
+		}
+	}
+	if hasFinal {
+		return final.String()
+	}
+	return unphased.String()
 }

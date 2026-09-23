@@ -1,0 +1,19 @@
+{
+  "type": "message_end",
+  "message": {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"actions\":[{\"kind\":\"dispatch\",\"data\":{\"worker_agent_id\":\"worker-a\",\"goal\":\"Вычислить сумму 17+25+38.\",\"scope\":\"Только арифметическая часть Worker A. Контрольный контекст: ALPHA-619.\",\"expected_result\":[\"Значение суммы\",\"Подтверждение контрольного контекста ALPHA-619\"],\"context\":{\"text\":\"Вычисли сумму 17+25+38. Контрольный контекст: ALPHA-619.\",\"refs\":[]},\"profile\":{\"id\":\"worker-a\",\"revision\":\"169a7e8ae17741b9da193760d9f059a259781a080687822b2ff3b0e142b409f3\",\"model\":\"openai-codex/gpt-6-luna\",\"reasoning\":\"minimal\"},\"run_timeout_seconds\":600}},{\"kind\":\"dispatch\",\"data\":{\"worker_agent_id\":\"worker-b\",\"goal\":\"Отсортировать слова pear, apple, plum по алфавиту.\",\"scope\":\"Только сортировка слов Worker B. Контрольный контекст: BETA-284.\",\"expected_result\":[\"Слова в алфавитном порядке\",\"Подтверждение контрольного контекста BETA-284\"],\"context\":{\"text\":\"Отсортируй по алфавиту слова pear, apple, plum. Контрольный контекст: BETA-284.\",\"refs\":[]},\"profile\":{\"id\":\"worker-b\",\"revision\":\"d2ec00661df2f83812fbb9f9f5fada73642b408fe396c5d5ea76ee8184eef346\",\"model\":\"openai-codex/gpt-6-luna\",\"reasoning\":\"minimal\"},\"run_timeout_seconds\":600}}],\"reply\":\"Обе части переданы разным исполнителям с соответствующими контрольными контекстами. Ожидаю результаты, затем проверю их и сообщу итог.\"}os",
+        "textSignature": "{\"v\":1,\"id\":\"msg_01052b271fa5629e016ab39824b4bc87d280b267deb1e0b14f\",\"phase\":\"commentary\"}"
+      },
+      {
+        "type": "text",
+        "text": "{\"actions\":[],\"reply\":\"Ожидаю результаты обоих исполнителей; после получения проверю каждую часть и сообщу общий итог.\"}",
+        "textSignature": "{\"v\":1,\"id\":\"msg_01052b271fa5629e016ab3982c171087d2a50de75a6ea01e2d\",\"phase\":\"final_answer\"}"
+      }
+    ],
+    "stopReason": "stop"
+  }
+}

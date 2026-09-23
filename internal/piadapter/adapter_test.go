@@ -189,6 +189,19 @@ func TestPiHelperProcess(t *testing.T) {
 			emit(map[string]any{"type": "agent_settled"})
 			continue
 		}
+		if r.Message == "phased-final" {
+			data, err := os.ReadFile(os.Getenv("SPEXUS_PI_PHASED_FIXTURE"))
+			if err != nil {
+				os.Exit(4)
+			}
+			var event any
+			if json.Unmarshal(data, &event) != nil {
+				os.Exit(5)
+			}
+			emit(event)
+			emit(map[string]any{"type": "agent_settled"})
+			continue
+		}
 		if r.Message == "provider-error" {
 			emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "test provider rejected request"}})
 			emit(map[string]any{"type": "agent_settled"})
@@ -220,5 +233,60 @@ func TestFinalMessageIsNotDraftDeltaConcatenation(t *testing.T) {
 		if final != tc.want {
 			t.Fatalf("final=%q want=%q", final, tc.want)
 		}
+	}
+}
+
+func TestActualPiPhasesExcludeCommentaryActions(t *testing.T) {
+	path, err := filepath.Abs("testdata/phased-final.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPEXUS_PI_PHASED_FIXTURE", path)
+	a := helperAdapter(t)
+	events, err := prompt(t, a, "phases", "phased-final")
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := ""
+	for _, event := range events {
+		if event.Kind == harness.EventAssistantMessageFinal {
+			final = event.Text
+		}
+	}
+	var output struct {
+		Actions []json.RawMessage `json:"actions"`
+		Reply   string            `json:"reply"`
+	}
+	if err := json.Unmarshal([]byte(final), &output); err != nil {
+		t.Fatalf("commentary contaminated final JSON: %v", err)
+	}
+	if len(output.Actions) != 0 || !strings.Contains(output.Reply, "Ожидаю результаты") {
+		t.Fatalf("executed commentary instead of actual final: %s", final)
+	}
+}
+func TestFinalPhaseSelection(t *testing.T) {
+	signature := func(phase string) string {
+		b, _ := json.Marshal(map[string]any{"v": 1, "id": "message-id", "phase": phase})
+		return string(b)
+	}
+	for _, tc := range []struct {
+		name   string
+		blocks []textBlock
+		want   string
+	}{
+		{"legacy plain IDs", []textBlock{{Type: "text", Text: "one", TextSignature: "msg_legacy"}, {Type: "text", Text: "two"}}, "onetwo"},
+		{"unphased v1", []textBlock{{Type: "text", Text: "plain", TextSignature: `{"v":1,"id":"msg"}`}}, "plain"},
+		{"commentary only", []textBlock{{Type: "text", Text: `{"actions":["unsafe"]}`, TextSignature: signature("commentary")}}, ""},
+		{"final beats unphased", []textBlock{{Type: "text", Text: "draft"}, {Type: "text", Text: "final", TextSignature: signature("final_answer")}}, "final"},
+		{"multiple final blocks", []textBlock{{Type: "text", Text: "A", TextSignature: signature("final_answer")}, {Type: "text", Text: "ignored", TextSignature: signature("commentary")}, {Type: "text", Text: "B", TextSignature: signature("final_answer")}}, "AB"},
+		{"empty final is not commentary fallback", []textBlock{{Type: "text", Text: "draft"}, {Type: "text", Text: "", TextSignature: signature("final_answer")}}, ""},
+		{"unknown phase", []textBlock{{Type: "text", Text: "not final", TextSignature: signature("future")}}, ""},
+		{"broken phase metadata", []textBlock{{Type: "text", Text: "do not promote", TextSignature: `{"v":1,"phase":"commentary"`}}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := finalAssistantText(tc.blocks); got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
 	}
 }
