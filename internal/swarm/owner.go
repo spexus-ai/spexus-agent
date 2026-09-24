@@ -174,6 +174,16 @@ func (s *Store) finishOwner(ctx context.Context, p Principal, id string, r Owner
 		if t.State != "running" {
 			return wireError(409, "already_terminal")
 		}
+		var triggerKind, triggerText string
+		if err = tx.QueryRowContext(ctx, `SELECT m.kind,coalesce(json_extract(m.canonical,'$.payload.text'),'')
+			FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row
+			WHERE d.agent_id=? AND d.seq=?`, t.AgentID, t.InputMailboxSeq).Scan(&triggerKind, &triggerText); err != nil {
+			return err
+		}
+		// A stop is already acknowledged by the deterministic Slack notice.
+		// It reaches the owner only after !continue, so its generated reply is
+		// stale even if the model sees it before the continue input.
+		stopControl := triggerKind == "agent.input" && triggerText == "!stop"
 		if t.CancelRequested {
 			if r.Outcome == "succeeded" || r.Outcome == "failed" {
 				return wireError(409, "cancel_requested")
@@ -264,7 +274,10 @@ func (s *Store) finishOwner(ctx context.Context, p Principal, id string, r Owner
 		t.Error = r.Error
 		t.Finish = &r
 		t.ReplyStatus = "none"
-		if r.Reply != "" && replyReady {
+		if stopControl && r.Reply != "" {
+			t.ReplyStatus = "suppressed"
+		}
+		if r.Reply != "" && replyReady && !stopControl {
 			f, err := feature(ctx, tx, t.FeatureID)
 			if err != nil {
 				return err
@@ -278,7 +291,7 @@ func (s *Store) finishOwner(ctx context.Context, p Principal, id string, r Owner
 		if err = saveTurn(ctx, tx, t); err != nil {
 			return err
 		}
-		if r.Outcome == "succeeded" && (r.Reply == "" || !replyReady) {
+		if r.Outcome == "succeeded" && !stopControl && (r.Reply == "" || !replyReady) {
 			if err = s.queueFinalSummary(ctx, tx, t, r.Actions); err != nil {
 				return err
 			}

@@ -148,6 +148,51 @@ func TestStopSuppressesQueuedFinalReplyButPreservesStopNotice(t *testing.T) {
 	}
 }
 
+func TestDeferredStopTurnCannotReplyAfterContinue(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	if err := f.s.StopFeature(ctx, f.feature.FeatureID, "human", "Slack stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.ContinueFeature(ctx, f.feature.FeatureID, "human"); err != nil {
+		t.Fatal(err)
+	}
+	start := func(text string) string {
+		t.Helper()
+		receipt, _, err := f.s.IngestUrgent(ctx, f.feature.FeatureID, InputPayload{Text: text, Source: Source{Kind: "slack", EventID: NewID(), ChannelID: f.feature.ChannelID, ThreadTS: f.feature.ThreadTS, ActorID: "human"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		turnID := NewID()
+		f.call("orchestrator", "POST", "/owner-turns/start", OwnerStartRequest{TurnID: turnID, FeatureID: f.feature.FeatureID, InputMailboxSeq: receipt.MailboxSeq}, 201)
+		return turnID
+	}
+	stopTurn := start("!stop")
+	finish := OwnerFinishRequest{Outcome: "succeeded", Reply: "Остановлено. Новые действия не предпринимаю.", Actions: []ActionReceipt{}, Observation: json.RawMessage("null")}
+	var stopped OwnerFinishReceipt
+	if err := json.Unmarshal(f.call("orchestrator", "POST", "/owner-turns/"+stopTurn+"/finish", finish, 201), &stopped); err != nil {
+		t.Fatal(err)
+	}
+	if stopped.ReplyStatus != "suppressed" || len(f.history().SlackOutbox) != 0 {
+		t.Fatalf("stale stop reply escaped after continue: %+v", stopped)
+	}
+	var repeated OwnerFinishReceipt
+	if err := json.Unmarshal(f.call("orchestrator", "POST", "/owner-turns/"+stopTurn+"/finish", finish, 200), &repeated); err != nil {
+		t.Fatal(err)
+	}
+	if repeated.ReplyStatus != "suppressed" || len(f.history().SlackOutbox) != 0 {
+		t.Fatalf("duplicate stop finish published a reply: %+v", repeated)
+	}
+	continueTurn := start("!continue")
+	var resumed OwnerFinishReceipt
+	if err := json.Unmarshal(f.call("orchestrator", "POST", "/owner-turns/"+continueTurn+"/finish", OwnerFinishRequest{Outcome: "succeeded", Reply: "Работа продолжается.", Actions: []ActionReceipt{}, Observation: json.RawMessage("null")}, 201), &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.ReplyStatus != "queued" || len(f.history().SlackOutbox) != 1 || f.history().SlackOutbox[0].Text != "Работа продолжается." {
+		t.Fatalf("continue reply lost after stop suppression: %+v", resumed)
+	}
+}
+
 func TestDeniedEarlierJobDoesNotBlockNewIndependentFinalReply(t *testing.T) {
 	f := newHumanFixture(t)
 	initial := f.ownerTurn()
