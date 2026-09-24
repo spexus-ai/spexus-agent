@@ -57,13 +57,15 @@ func TestRealPiConversation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "pi-home", "models.json"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	a, err := New(config.AgentProfile{ID: "prototype", Provider: "prototype-test", Model: "test-model", Thinking: "off", SystemPrompt: "SPECIFIC_AGENT_INSTRUCTION", Workspace: dir, SessionDirectory: filepath.Join(dir, "sessions"), Tools: []string{}}, binary)
+	a, err := NewResident(config.AgentProfile{ID: "prototype", Provider: "prototype-test", Model: "test-model", Thinking: "off", SystemPrompt: "SPECIFIC_AGENT_INSTRUCTION", Workspace: dir, SessionDirectory: filepath.Join(dir, "sessions"), Tools: []string{}}, binary)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer a.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	for _, turn := range []struct{ thread, prompt string }{{"1", "FIRST_THREAD_SECRET"}, {"2", "SECOND_THREAD_SECRET"}, {"1", "continue"}} {
+	firstPID := 0
+	for i, turn := range []struct{ thread, prompt string }{{"1", "FIRST_THREAD_SECRET"}, {"1", "continue"}, {"2", "SECOND_THREAD_SECRET"}, {"1", "again"}} {
 		s, err := a.StartPrompt(ctx, harness.SessionRequest{ChannelID: "C1", ProjectPath: dir, ThreadTS: turn.thread, Prompt: turn.prompt})
 		if err != nil {
 			t.Fatal(err)
@@ -81,10 +83,20 @@ func TestRealPiConversation(t *testing.T) {
 		if final != "ACK" {
 			t.Fatalf("unexpected model text %q", final)
 		}
+		if a.idle == nil {
+			t.Fatal("resident process was not retained")
+		}
+		if i == 0 {
+			firstPID = a.idle.cmd.Process.Pid
+		} else if i == 1 && a.idle.cmd.Process.Pid != firstPID {
+			t.Fatal("consecutive turns restarted Pi")
+		} else if i == 2 && a.idle.cmd.Process.Pid == firstPID {
+			t.Fatal("another thread reused the first thread's process")
+		}
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(requests) != 3 {
+	if len(requests) != 4 {
 		t.Fatalf("model requests=%d", len(requests))
 	}
 	for i, r := range requests {
@@ -93,10 +105,10 @@ func TestRealPiConversation(t *testing.T) {
 		if !strings.Contains(body, "SPECIFIC_AGENT_INSTRUCTION") || r["model"] != "test-model" {
 			t.Fatalf("profile not applied on turn %d", i)
 		}
-		if i == 1 && strings.Contains(body, "FIRST_THREAD_SECRET") {
+		if i == 2 && strings.Contains(body, "FIRST_THREAD_SECRET") {
 			t.Fatal("thread 1 leaked into thread 2")
 		}
-		if i == 2 && (!strings.Contains(body, "FIRST_THREAD_SECRET") || strings.Contains(body, "SECOND_THREAD_SECRET")) {
+		if i == 3 && (!strings.Contains(body, "FIRST_THREAD_SECRET") || strings.Contains(body, "SECOND_THREAD_SECRET")) {
 			t.Fatal("thread history lost or mixed")
 		}
 	}

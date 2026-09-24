@@ -30,14 +30,26 @@ import (
 func fixtureHumanPi() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
-	if !scanner.Scan() {
-		return
+	for scanner.Scan() {
+		fixtureHumanPiTurn(scanner.Bytes())
 	}
+}
+func fixtureHumanPiTurn(line []byte) {
 	var prompt struct {
+		Type    string `json:"type"`
 		Message string `json:"message"`
 	}
-	if json.Unmarshal(scanner.Bytes(), &prompt) != nil {
+	if json.Unmarshal(line, &prompt) != nil {
 		panic("invalid Pi prompt")
+	}
+	if prompt.Type == "abort" {
+		enc := json.NewEncoder(os.Stdout)
+		_ = enc.Encode(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "aborted"}})
+		_ = enc.Encode(map[string]any{"type": "agent_settled"})
+		return
+	}
+	if prompt.Type != "prompt" {
+		return
 	}
 	// Wire v2 adds owner guidance after the JSON input. Select the actual
 	// machine-readable line instead of assuming it is the final prompt line.

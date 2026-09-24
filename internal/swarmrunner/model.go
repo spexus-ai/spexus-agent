@@ -22,18 +22,23 @@ type ActivityModel interface {
 	RunWithActivity(context.Context, string, string, func(string)) (string, bool, error)
 }
 type piModel struct {
-	adapter   harness.Adapter
+	adapter   *piadapter.Adapter
 	workspace string
 }
 
 func newModel(c Config, p profile) (Model, error) {
 	provider, model, _ := strings.Cut(p.Model, "/")
-	a, e := piadapter.New(config.AgentProfile{ID: p.ID, Provider: provider, Model: model, Thinking: p.Reasoning, SystemPrompt: p.Prompt + "\n\n" + modelInstructions(c), Workspace: c.Workspace, SessionDirectory: filepath.Join(c.StateDirectory, "sessions"), Tools: []string{}, Extensions: []string{}}, c.PiBinary)
+	constructor := piadapter.New
+	if c.Role == "owner" {
+		constructor = piadapter.NewResident
+	}
+	a, e := constructor(config.AgentProfile{ID: p.ID, Provider: provider, Model: model, Thinking: p.Reasoning, SystemPrompt: p.Prompt + "\n\n" + modelInstructions(c), Workspace: c.Workspace, SessionDirectory: filepath.Join(c.StateDirectory, "sessions"), Tools: []string{}, Extensions: []string{}}, c.PiBinary)
 	if e != nil {
 		return nil, e
 	}
 	return &piModel{a, c.Workspace}, nil
 }
+func (m *piModel) Close() error { return m.adapter.Close() }
 func (m *piModel) Run(ctx context.Context, key, input string) (string, bool, error) {
 	return m.RunWithActivity(ctx, key, input, nil)
 }

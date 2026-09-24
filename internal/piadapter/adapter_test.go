@@ -66,6 +66,49 @@ func TestPiSessionsPersistAndIsolateThreads(t *testing.T) {
 	}
 }
 
+func TestResidentPiReusesProcessAndIsolatesSessions(t *testing.T) {
+	base := helperAdapter(t)
+	a, err := NewResident(base.profile, base.binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	pid := func(thread, message, want string) string {
+		t.Helper()
+		events, err := prompt(t, a, thread, message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range events {
+			if e.Kind == harness.EventAssistantMessageFinal {
+				if !strings.Contains(e.Text, want) {
+					t.Fatalf("wrong session history %q", e.Text)
+				}
+				_, after, ok := strings.Cut(e.Text, " pid=")
+				if !ok || after == "" {
+					t.Fatalf("missing process identity %q", e.Text)
+				}
+				return after
+			}
+		}
+		t.Fatal("missing final event")
+		return ""
+	}
+	first := pid("1", "alpha", "history=alpha")
+	second := pid("1", "continue", "history=alpha|continue")
+	if first != second {
+		t.Fatalf("same session started a new process: %s != %s", first, second)
+	}
+	other := pid("2", "beta", "history=beta")
+	if other == first {
+		t.Fatal("different sessions shared the same process")
+	}
+	returning := pid("1", "again", "history=alpha|continue|again")
+	if returning == other {
+		t.Fatal("process retained the other thread's history")
+	}
+}
+
 func TestPiAbortPreservesConversation(t *testing.T) {
 	a := helperAdapter(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -103,6 +146,55 @@ func TestPiAbortPreservesConversation(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("conversation lost after abort")
+	}
+}
+
+func TestResidentPiAbortDiscardsProcessAndPreservesConversation(t *testing.T) {
+	base := helperAdapter(t)
+	a, err := NewResident(base.profile, base.binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, err := a.StartPrompt(ctx, harness.SessionRequest{ProjectPath: a.profile.Workspace, ChannelID: "C1", ThreadTS: "1", Prompt: "wait"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPID := s.(*promptStream).cmd.Process.Pid
+	for e := range s.Events() {
+		if e.Kind == harness.EventAssistantMessageChunk {
+			break
+		}
+	}
+	if err := a.Cancel(ctx, "1"); err != nil {
+		t.Fatal(err)
+	}
+	events, err := harness.CollectPromptStream(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled := false
+	for _, e := range events {
+		cancelled = cancelled || e.Kind == harness.EventSessionCancelled
+	}
+	if !cancelled || a.idle != nil {
+		t.Fatal("cancelled process was retained")
+	}
+	events, err = prompt(t, a, "1", "continue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.idle == nil || a.idle.cmd.Process.Pid == firstPID {
+		t.Fatal("resume did not start a fresh process")
+	}
+	found := false
+	for _, e := range events {
+		found = found || strings.Contains(e.Text, "history=wait|continue")
+	}
+	if !found {
+		t.Fatal("durable session history was lost after cancellation")
 	}
 }
 
@@ -217,9 +309,9 @@ func TestPiHelperProcess(t *testing.T) {
 			emit(map[string]any{"type": "agent_settled"})
 			continue
 		}
-		emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": fmt.Sprintf("history=%s model=%s system=%s cwd=%s", history, arg("--model"), arg("--system-prompt"), cwd)}})
+		emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": fmt.Sprintf("history=%s model=%s system=%s cwd=%s pid=%d", history, arg("--model"), arg("--system-prompt"), cwd, os.Getpid())}})
 		if r.Message != "wait" {
-			emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "stop", "content": []map[string]any{{"type": "text", "text": fmt.Sprintf("history=%s model=%s system=%s cwd=%s", history, arg("--model"), arg("--system-prompt"), cwd)}}}})
+			emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "stop", "content": []map[string]any{{"type": "text", "text": fmt.Sprintf("history=%s model=%s system=%s cwd=%s pid=%d", history, arg("--model"), arg("--system-prompt"), cwd, os.Getpid())}}}})
 			emit(map[string]any{"type": "agent_end"})
 			emit(map[string]any{"type": "agent_settled"})
 		}

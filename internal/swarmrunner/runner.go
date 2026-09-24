@@ -67,7 +67,12 @@ func New(c Config) (*Runner, error) {
 	}
 	return r, nil
 }
-func (r *Runner) Close() error { return r.journal.Close() }
+func (r *Runner) Close() error {
+	if m, ok := r.model.(interface{ Close() error }); ok {
+		_ = m.Close()
+	}
+	return r.journal.Close()
+}
 func (r *Runner) Run(ctx context.Context) error {
 	if e := r.journal.bind(r.cfg.InstanceID); e != nil {
 		return e

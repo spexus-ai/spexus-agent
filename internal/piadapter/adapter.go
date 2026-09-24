@@ -1,5 +1,5 @@
-// Package piadapter runs Pi's JSONL RPC protocol. Each active turn owns a child
-// process; a stable session file carries conversation history between turns.
+// Package piadapter runs Pi's JSONL RPC protocol. A stable session file carries
+// conversation history between turns; owner runners may keep one idle process.
 package piadapter
 
 import (
@@ -23,10 +23,21 @@ import (
 )
 
 type Adapter struct {
-	profile config.AgentProfile
-	binary  string
-	mu      sync.Mutex
-	active  map[string]*promptStream
+	profile  config.AgentProfile
+	binary   string
+	mu       sync.Mutex
+	active   map[string]*promptStream
+	resident bool
+	idle     *piProcess
+	closed   bool
+}
+
+type piProcess struct {
+	key     string
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	stdout  io.ReadCloser
+	scanner *bufio.Scanner
 }
 
 func New(profile config.AgentProfile, binary string) (*Adapter, error) {
@@ -47,6 +58,17 @@ func New(profile config.AgentProfile, binary string) (*Adapter, error) {
 		return nil, err
 	}
 	return &Adapter{profile: profile, binary: path, active: make(map[string]*promptStream)}, nil
+}
+
+// NewResident keeps one completed RPC process for the next prompt in the same
+// session. Other sessions and interrupted turns start from their durable file.
+func NewResident(profile config.AgentProfile, binary string) (*Adapter, error) {
+	a, err := New(profile, binary)
+	if err != nil {
+		return nil, err
+	}
+	a.resident = true
+	return a, nil
 }
 
 func (a *Adapter) sessionFile(req harness.SessionRequest) string {
@@ -78,9 +100,76 @@ func (a *Adapter) StartPrompt(ctx context.Context, req harness.SessionRequest) (
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.closed {
+		return nil, errors.New("Pi adapter is closed")
+	}
 	if a.active[req.ThreadTS] != nil {
 		return nil, errors.New("Pi thread already has an active turn")
 	}
+	if a.resident && len(a.active) != 0 {
+		return nil, errors.New("resident Pi already has an active turn")
+	}
+	key := a.sessionFile(req)
+	var process *piProcess
+	reused := false
+	if a.resident && a.idle != nil {
+		old := a.idle
+		a.idle = nil
+		if old.key == key {
+			process = old
+			reused = true
+		} else {
+			stopProcess(old)
+		}
+	}
+	if process == nil {
+		var err error
+		process, err = a.startProcess(ctx, req, key)
+		if err != nil {
+			return nil, err
+		}
+	}
+	newStream := func(p *piProcess) *promptStream {
+		return &promptStream{name: harness.SessionName(req.ThreadTS), cmd: p.cmd, stdin: p.stdin, scanner: p.scanner, resident: a.resident, events: make(chan harness.Event, 64), done: make(chan struct{}), released: make(chan struct{}), ctx: ctx}
+	}
+	s := newStream(process)
+	if err := s.send(map[string]any{"id": "prompt", "type": "prompt", "message": req.Prompt}); err != nil {
+		stopProcess(process)
+		if !reused || ctx.Err() != nil {
+			return nil, fmt.Errorf("send Pi prompt: %w", err)
+		}
+		// An idle child may have exited between turns. The session file is the
+		// authority, so restart it once before reporting a failed owner turn.
+		process, err = a.startProcess(ctx, req, key)
+		if err != nil {
+			return nil, err
+		}
+		s = newStream(process)
+		if err = s.send(map[string]any{"id": "prompt", "type": "prompt", "message": req.Prompt}); err != nil {
+			stopProcess(process)
+			return nil, fmt.Errorf("send Pi prompt after restart: %w", err)
+		}
+	}
+	a.active[req.ThreadTS] = s
+	go s.run(func(keep bool) {
+		a.mu.Lock()
+		delete(a.active, req.ThreadTS)
+		closed := a.closed
+		if keep && !closed {
+			a.idle = process
+		}
+		a.mu.Unlock()
+		if keep && closed {
+			stopProcess(process)
+		}
+	})
+	if a.resident {
+		go s.watchCancellation()
+	}
+	return s, nil
+}
+
+func (a *Adapter) startProcess(ctx context.Context, req harness.SessionRequest, key string) (*piProcess, error) {
 	args := []string{"--mode", "rpc", "--provider", a.profile.Provider, "--model", a.profile.Model, "--thinking", a.profile.Thinking, "--system-prompt", a.profile.SystemPrompt, "--session", a.sessionFile(req), "--name", a.profile.ID + " / " + req.ThreadTS, "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--offline"}
 	if a.profile.Tools != nil {
 		if len(a.profile.Tools) == 0 {
@@ -92,7 +181,12 @@ func (a *Adapter) StartPrompt(ctx context.Context, req harness.SessionRequest) (
 	for _, extension := range a.profile.Extensions {
 		args = append(args, "--extension", extension)
 	}
-	cmd := exec.CommandContext(ctx, a.binary, args...)
+	var cmd *exec.Cmd
+	if a.resident {
+		cmd = exec.Command(a.binary, args...)
+	} else {
+		cmd = exec.CommandContext(ctx, a.binary, args...)
+	}
 	cmd.Dir = a.profile.Workspace
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -111,14 +205,39 @@ func (a *Adapter) StartPrompt(ctx context.Context, req harness.SessionRequest) (
 		_ = stdout.Close()
 		return nil, fmt.Errorf("start Pi: %w", err)
 	}
-	s := &promptStream{name: harness.SessionName(req.ThreadTS), cmd: cmd, stdin: stdin, events: make(chan harness.Event, 64), done: make(chan struct{}), released: make(chan struct{}), ctx: ctx}
-	a.active[req.ThreadTS] = s
-	go s.run(stdout, func() { a.mu.Lock(); delete(a.active, req.ThreadTS); a.mu.Unlock() })
-	if err := s.send(map[string]any{"id": "prompt", "type": "prompt", "message": req.Prompt}); err != nil {
-		_ = s.Close()
-		return nil, fmt.Errorf("send Pi prompt: %w", err)
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 4096), 16*1024*1024)
+	return &piProcess{key: key, cmd: cmd, stdin: stdin, stdout: stdout, scanner: scanner}, nil
+}
+
+func stopProcess(p *piProcess) {
+	_ = p.stdin.Close()
+	timer := time.AfterFunc(5*time.Second, func() { _ = p.cmd.Process.Kill() })
+	_ = p.cmd.Wait()
+	timer.Stop()
+	_ = p.stdout.Close()
+}
+
+func (a *Adapter) Close() error {
+	a.mu.Lock()
+	a.closed = true
+	idle := a.idle
+	a.idle = nil
+	active := make([]*promptStream, 0, len(a.active))
+	for _, s := range a.active {
+		active = append(active, s)
 	}
-	return s, nil
+	a.mu.Unlock()
+	for _, s := range active {
+		_ = s.abort()
+	}
+	if idle != nil {
+		stopProcess(idle)
+	}
+	for _, s := range active {
+		<-s.done
+	}
+	return nil
 }
 
 func (a *Adapter) Cancel(ctx context.Context, threadTS string) error {
@@ -163,6 +282,8 @@ type promptStream struct {
 	name        string
 	cmd         *exec.Cmd
 	stdin       io.WriteCloser
+	scanner     *bufio.Scanner
+	resident    bool
 	ctx         context.Context
 	events      chan harness.Event
 	done        chan struct{}
@@ -173,6 +294,21 @@ type promptStream struct {
 	err         error
 	cancelled   bool
 	completed   bool
+	settled     bool
+}
+
+func (s *promptStream) watchCancellation() {
+	select {
+	case <-s.done:
+		return
+	case <-s.ctx.Done():
+		s.mu.Lock()
+		settled := s.settled
+		s.mu.Unlock()
+		if !settled {
+			_ = s.abort()
+		}
+	}
 }
 
 func (s *promptStream) SessionName() string          { return s.name }
@@ -194,6 +330,10 @@ func (s *promptStream) send(v any) error {
 }
 func (s *promptStream) abort() error {
 	s.mu.Lock()
+	if s.settled {
+		s.mu.Unlock()
+		return nil
+	}
 	s.cancelled = true
 	s.mu.Unlock()
 	err := s.send(map[string]any{"id": "abort", "type": "abort"})
@@ -224,13 +364,13 @@ func (s *promptStream) emit(e harness.Event) {
 	}
 }
 
-func (s *promptStream) run(stdout io.ReadCloser, cleanup func()) {
+func (s *promptStream) run(cleanup func(bool)) {
+	keep := false
 	defer close(s.done)
 	defer close(s.events)
-	defer cleanup()
+	defer func() { cleanup(keep) }()
 	s.emit(harness.Event{Kind: harness.EventSessionStarted, SessionName: s.name})
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 4096), 16*1024*1024)
+	scanner := s.scanner
 	settled := false
 	var runErr error
 	var modelErr error
@@ -292,16 +432,23 @@ func (s *promptStream) run(stdout io.ReadCloser, cleanup func()) {
 	if err := scanner.Err(); err != nil && runErr == nil {
 		runErr = fmt.Errorf("read Pi output: %w", err)
 	}
-	s.writeMu.Lock()
-	_ = s.stdin.Close()
-	s.writeMu.Unlock()
-	// Bound shutdown even if an extension retains handles after stdin closes.
-	timer := time.AfterFunc(5*time.Second, func() { _ = s.cmd.Process.Kill() })
-	processErr := s.cmd.Wait()
-	timer.Stop()
 	s.mu.Lock()
+	// This latch prevents a late context cancellation from sending abort into
+	// the idle process after the model has already settled.
+	s.settled = settled
 	cancelled := s.cancelled
 	s.mu.Unlock()
+	keep = s.resident && settled && !cancelled && runErr == nil && modelErr == nil && s.ctx.Err() == nil
+	var processErr error
+	if !keep {
+		s.writeMu.Lock()
+		_ = s.stdin.Close()
+		s.writeMu.Unlock()
+		// Bound shutdown even if an extension retains handles after stdin closes.
+		timer := time.AfterFunc(5*time.Second, func() { _ = s.cmd.Process.Kill() })
+		processErr = s.cmd.Wait()
+		timer.Stop()
+	}
 	if cancelled {
 		s.emit(harness.Event{Kind: harness.EventSessionCancelled, Text: "cancelled"})
 		runErr = nil

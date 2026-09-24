@@ -62,14 +62,26 @@ func fixturePi() {
 	}
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
-	if !scanner.Scan() {
-		return
+	for scanner.Scan() {
+		fixturePiTurn(scanner.Bytes())
 	}
+}
+func fixturePiTurn(line []byte) {
 	var req struct {
+		Type    string `json:"type"`
 		Message string `json:"message"`
 	}
-	if json.Unmarshal(scanner.Bytes(), &req) != nil {
+	if json.Unmarshal(line, &req) != nil {
 		panic("prompt JSON")
+	}
+	if req.Type == "abort" {
+		enc := json.NewEncoder(os.Stdout)
+		_ = enc.Encode(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "aborted"}})
+		_ = enc.Encode(map[string]any{"type": "agent_settled"})
+		return
+	}
+	if req.Type != "prompt" {
+		return
 	}
 	input := req.Message[strings.LastIndex(req.Message, "\n")+1:]
 	var v struct {
