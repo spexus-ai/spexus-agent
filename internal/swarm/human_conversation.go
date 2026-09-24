@@ -54,6 +54,7 @@ func activeHumanRequestTx(ctx context.Context, tx *sql.Tx, featureID string) (*H
 	}
 	return &HumanRequestContext{
 		RequestID: requestID, Question: dependency.Blocker.Question,
+		Reason: dependency.Blocker.Reason, Context: dependency.Blocker.Context,
 		Options: options, Recommendation: dependency.Blocker.Recommendation,
 		BlockedWork: dependency.BlockedWork, Kind: dependency.Blocker.Kind,
 	}, delivery, nil

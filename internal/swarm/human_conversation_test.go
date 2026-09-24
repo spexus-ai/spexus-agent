@@ -39,8 +39,14 @@ func TestSlackQuestionSnapshotIsImmutableAcrossDuplicateAndQueueAdvance(t *testi
 		t.Fatalf("commit: duplicate=%t err=%v", duplicate, err)
 	}
 	committed, err := f.s.CommittedSlackSource(ctx, source.WorkspaceID, source.ChannelID, source.MessageTS)
-	if err != nil || committed.ActiveHumanRequest == nil || committed.ActiveHumanRequest.RequestID != first {
+	if err != nil || committed.ActiveHumanRequest == nil || committed.ActiveHumanRequest.RequestID != first || committed.ActiveHumanRequest.Reason != "Decision needed" || committed.ActiveHumanRequest.Context != "test" {
 		t.Fatalf("missing immutable first-question context: %+v, %v", committed, err)
+	}
+	changed := f.history().Dependencies[0]
+	changed.Blocker.Reason = "Changed after the Slack message"
+	changed.Blocker.Context = "Changed context after the Slack message"
+	if _, err := f.s.db.ExecContext(ctx, "UPDATE dependencies SET data=? WHERE id=?", mustJSON(changed), changed.ID); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := f.s.db.ExecContext(ctx, "UPDATE human_projections SET state='answered' WHERE request_id=?", first); err != nil {
 		t.Fatal(err)
@@ -50,7 +56,7 @@ func TestSlackQuestionSnapshotIsImmutableAcrossDuplicateAndQueueAdvance(t *testi
 		t.Fatalf("redelivery changed source: duplicate=%t err=%v", duplicate, err)
 	}
 	replayed, err := f.s.CommittedSlackSource(ctx, source.WorkspaceID, source.ChannelID, source.MessageTS)
-	if err != nil || replayed.ActiveHumanRequest == nil || replayed.ActiveHumanRequest.RequestID != first {
+	if err != nil || replayed.ActiveHumanRequest == nil || replayed.ActiveHumanRequest.RequestID != first || replayed.ActiveHumanRequest.Reason != committed.ActiveHumanRequest.Reason || replayed.ActiveHumanRequest.Context != committed.ActiveHumanRequest.Context {
 		t.Fatalf("replay rebound to a later question: %+v, %v", replayed, err)
 	}
 }

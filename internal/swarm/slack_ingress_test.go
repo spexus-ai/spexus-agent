@@ -146,7 +146,7 @@ func TestDetailsControlRequiresActiveQuestionAndDedupsAfterClose(t *testing.T) {
 		t.Fatalf("active details control duplicate=%t err=%v", duplicate, err)
 	}
 	committed, err := f.s.CommittedSlackSource(ctx, in.WorkspaceID, in.ChannelID, in.MessageTS)
-	if err != nil || committed.ActiveHumanRequest == nil || committed.ActiveHumanRequest.RequestID != requestID {
+	if err != nil || committed.ActiveHumanRequest == nil || committed.ActiveHumanRequest.RequestID != requestID || committed.ActiveHumanRequest.Reason != "Decision needed" || committed.ActiveHumanRequest.Context != "test" {
 		t.Fatalf("details context=%+v err=%v", committed.ActiveHumanRequest, err)
 	}
 	if _, err := f.s.db.ExecContext(ctx, `UPDATE human_projections SET state='answered' WHERE request_id=?`, requestID); err != nil {

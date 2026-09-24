@@ -232,6 +232,8 @@ type HumanActionInput struct {
 type HumanRequestContext struct {
 	RequestID      string        `json:"request_id"`
 	Question       string        `json:"question"`
+	Reason         string        `json:"reason"`
+	Context        string        `json:"context"`
 	Options        []HumanOption `json:"options"`
 	Recommendation string        `json:"recommendation"`
 	BlockedWork    string        `json:"blocked_work"`
