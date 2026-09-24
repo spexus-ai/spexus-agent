@@ -150,6 +150,71 @@ func TestOfflineOwnerResultRedeliveryIsScopedAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestOfflineOwnerSummaryFailureRedeliversAcceptedResultOnce(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	initial := f.ownerTurn()
+	d := f.dispatch(initial, "worker-a")
+	d.ProtocolVersion = 2
+	f.post("orchestrator", d, 201)
+	f.finish(initial, "", []ActionReceipt{{MessageID: d.MessageID, Status: "stored"}}, 201)
+	accepted := f.event(d, "task.accepted", AcceptedPayload{DispatchMessageID: d.MessageID, ProfileRevision: f.s.profiles[d.ToAgentID].Revision}, d.MessageID)
+	accepted.ProtocolVersion = 2
+	f.post("worker-a", accepted, 201)
+	started := f.event(d, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)
+	started.ProtocolVersion = 2
+	f.post("worker-a", started, 201)
+	result := f.event(d, "task.result", resultPayload(), started.MessageID)
+	result.ProtocolVersion = 2
+	rcpt := f.post("worker-a", result, 201)
+	f.call("orchestrator", "POST", "/acks", AckRequest{MailboxSeqs: []int64{rcpt.MailboxSeq}}, 200)
+	reviewTurn := NewID()
+	f.call("orchestrator", "POST", "/owner-turns/start", OwnerStartRequest{TurnID: reviewTurn, FeatureID: f.feature.FeatureID, InputMailboxSeq: rcpt.MailboxSeq}, 201)
+	review := Envelope{ProtocolVersion: 2, MessageID: NewID(), Type: "task.review", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: "worker-a", OwnerTurnID: reviewTurn, JobID: d.JobID, AttemptID: d.AttemptID, CausationID: cause(result.MessageID), SentAt: f.s.stamp(), Payload: mustJSON(ReviewPayload{ResultMessageID: result.MessageID, Verdict: "accepted", Reason: "Checked", Evidence: []Evidence{}})}
+	f.post("orchestrator", review, 201)
+	f.finish(reviewTurn, "", []ActionReceipt{{MessageID: review.MessageID, Status: "stored"}}, 201)
+	var summary MailboxResponse
+	if err := json.Unmarshal(f.call("orchestrator", "GET", "/mailbox?wait_seconds=0", nil, 200), &summary); err != nil {
+		t.Fatal(err)
+	}
+	var summarySeq int64
+	for _, item := range summary.Messages {
+		if item.MessageID == result.MessageID && item.MailboxSeq != rcpt.MailboxSeq {
+			summarySeq = item.MailboxSeq
+		}
+	}
+	if summarySeq == 0 {
+		t.Fatal("missing summary delivery")
+	}
+	f.call("orchestrator", "POST", "/acks", AckRequest{MailboxSeqs: []int64{summarySeq}}, 200)
+	failedTurn := NewID()
+	f.call("orchestrator", "POST", "/owner-turns/start", OwnerStartRequest{TurnID: failedTurn, FeatureID: f.feature.FeatureID, InputMailboxSeq: summarySeq}, 201)
+	f.call("orchestrator", "POST", "/owner-turns/"+failedTurn+"/finish", OwnerFinishRequest{Outcome: "failed", Reply: "Pi returned invalid structured output; no actions were published.", Actions: []ActionReceipt{}, Error: &TaskError{Code: "model_output_invalid", Message: "model_output_invalid", Retryable: false}, Observation: json.RawMessage("null")}, 201)
+	var pending MailboxResponse
+	if err := json.Unmarshal(f.call("orchestrator", "GET", "/mailbox?wait_seconds=0", nil, 200), &pending); err != nil {
+		t.Fatal(err)
+	}
+	seqs := make([]int64, 0, len(pending.Messages))
+	for _, item := range pending.Messages {
+		seqs = append(seqs, item.MailboxSeq)
+	}
+	if len(seqs) > 0 {
+		f.call("orchestrator", "POST", "/acks", AckRequest{MailboxSeqs: seqs}, 200)
+	}
+	r := OwnerRedeliveryRequest{FeatureID: f.feature.FeatureID, FailedTurnID: failedTurn, OriginalSeq: summarySeq, ResultMessageID: result.MessageID, ReviewMessageID: review.MessageID, Actor: "operator-test", Reason: "Recover final summary after malformed model output"}
+	receipt, err := f.s.redeliverOwnerResult(ctx, r)
+	if err != nil || receipt.NewSeq <= summarySeq {
+		t.Fatalf("redelivery: %+v %v", receipt, err)
+	}
+	again, err := f.s.redeliverOwnerResult(ctx, r)
+	if err != nil || again != receipt {
+		t.Fatalf("duplicate redelivery: %+v %v", again, err)
+	}
+	if got := f.history(); len(got.Jobs) != 1 || len(got.Jobs[0].Attempts) != 1 || got.Jobs[0].Attempts[0].Review != "accepted" {
+		t.Fatal("redelivery changed the accepted worker result")
+	}
+}
+
 func TestOfflineOpenPreservesRecoveryBarrierAndExclusiveLock(t *testing.T) {
 	f := newHumanFixture(t)
 	ctx := context.Background()

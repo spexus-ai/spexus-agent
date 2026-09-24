@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spexus-ai/spexus-agent/internal/config"
 	"github.com/spexus-ai/spexus-agent/internal/harness"
@@ -97,6 +98,15 @@ type ownerOutput struct {
 	Actions []action `json:"actions"`
 	Reply   string   `json:"reply"`
 }
+
+func plainSummary(raw string) (string, bool) {
+	reply := strings.TrimSpace(raw)
+	if reply == "" || len(reply) > 16*1024 || !utf8.ValidString(reply) || strings.HasPrefix(reply, "{") || strings.HasPrefix(reply, "[") || strings.HasPrefix(reply, "```") {
+		return "", false
+	}
+	return reply, true
+}
+
 type action struct {
 	Kind string          `json:"kind"`
 	Data json.RawMessage `json:"data"`

@@ -513,6 +513,21 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 	var outputErr error
 	if !cancelled && runErr == nil {
 		ownerResult, messages, outputErr = r.ownerActions(d, turn, raw)
+		// An already accepted result permits only a public summary. Pi can
+		// occasionally return that summary as prose despite the JSON contract.
+		// Accept prose only in this action-free state; never parse actions from it.
+		if outputErr != nil && d.Type == "task.result" {
+			job, jobErr := r.job(ctx, d.JobID)
+			if jobErr != nil {
+				return jobErr
+			}
+			if reviewedTrigger(d, job) {
+				if reply, ok := plainSummary(raw); ok {
+					ownerResult = ownerOutput{Actions: []action{}, Reply: reply}
+					messages, outputErr = nil, nil
+				}
+			}
+		}
 		var reviewErr *reviewPreflightError
 		summaryMissing := false
 		if outputErr == nil && d.Type == "task.result" && len(messages) == 0 && strings.TrimSpace(ownerResult.Reply) == "" {
@@ -541,6 +556,18 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 			}
 			if !cancelled && runErr == nil {
 				ownerResult, messages, outputErr = r.ownerActions(d, turn, corrected)
+				if outputErr != nil && d.Type == "task.result" {
+					job, jobErr := r.job(ctx, d.JobID)
+					if jobErr != nil {
+						return jobErr
+					}
+					if reviewedTrigger(d, job) {
+						if reply, ok := plainSummary(corrected); ok {
+							ownerResult = ownerOutput{Actions: []action{}, Reply: reply}
+							messages, outputErr = nil, nil
+						}
+					}
+				}
 				if summaryMissing && outputErr == nil && strings.TrimSpace(ownerResult.Reply) == "" {
 					outputErr = errors.New("empty final summary")
 				}

@@ -31,3 +31,20 @@ func TestOwnerPublicReplyKeepsAnswersButHidesActionChatter(t *testing.T) {
 		})
 	}
 }
+
+func TestPlainSummaryOnlyAcceptsBoundedProse(t *testing.T) {
+	for _, test := range []struct {
+		raw string
+		ok  bool
+	}{
+		{"Фрагмент A готов.\nПроверка B прошла.", true},
+		{"   ", false},
+		{`{"actions":[{"kind":"dispatch"}]}`, false},
+		{"```json\n{}\n```", false},
+	} {
+		_, ok := plainSummary(test.raw)
+		if ok != test.ok {
+			t.Errorf("plainSummary(%q) accepted=%v", test.raw, ok)
+		}
+	}
+}

@@ -78,7 +78,11 @@ func (s *Store) redeliverOwnerResult(ctx context.Context, r OwnerRedeliveryReque
 		if err != nil {
 			return err
 		}
-		if t.FeatureID != r.FeatureID || t.AgentID != f.OwnerAgentID || t.InputMailboxSeq != r.OriginalSeq || t.State != "failed" || t.Finish == nil || t.Finish.Outcome != "failed" || t.Error == nil || t.Error.Code != "action_rejected" {
+		if t.FeatureID != r.FeatureID || t.AgentID != f.OwnerAgentID || t.InputMailboxSeq != r.OriginalSeq || t.State != "failed" || t.Finish == nil || t.Finish.Outcome != "failed" || t.Error == nil {
+			return wireError(409, "wrong_failed_turn")
+		}
+		summaryFailure := t.Error.Code == "model_output_invalid" && len(t.Finish.Actions) == 0
+		if !summaryFailure && t.Error.Code != "action_rejected" {
 			return wireError(409, "wrong_failed_turn")
 		}
 		var rejectedTransition, acceptedReview bool
@@ -90,7 +94,7 @@ func (s *Store) redeliverOwnerResult(ctx context.Context, r OwnerRedeliveryReque
 				acceptedReview = true
 			}
 		}
-		if len(t.Finish.Actions) != 2 || !rejectedTransition || !acceptedReview {
+		if !summaryFailure && (len(t.Finish.Actions) != 2 || !rejectedTransition || !acceptedReview) {
 			return wireError(409, "wrong_failure_reason")
 		}
 		var running int
@@ -124,7 +128,12 @@ func (s *Store) redeliverOwnerResult(ctx context.Context, r OwnerRedeliveryReque
 		if a.FeatureID != r.FeatureID || a.JobID != result.JobID || a.ResultMessageID != result.MessageID || a.State != "succeeded" || a.Review != "accepted" {
 			return wireError(409, "result_not_reviewed")
 		}
-		err = tx.QueryRowContext(ctx, `SELECT canonical FROM messages WHERE sender=? AND message_id=? AND feature_id=? AND turn_id=? AND kind='task.review' AND attempt_id=?`, f.OwnerAgentID, r.ReviewMessageID, r.FeatureID, r.FailedTurnID, result.AttemptID).Scan(&reviewRaw)
+		reviewTurnID := r.FailedTurnID
+		if summaryFailure {
+			err = tx.QueryRowContext(ctx, `SELECT canonical,turn_id FROM messages WHERE sender=? AND message_id=? AND feature_id=? AND kind='task.review' AND attempt_id=?`, f.OwnerAgentID, r.ReviewMessageID, r.FeatureID, result.AttemptID).Scan(&reviewRaw, &reviewTurnID)
+		} else {
+			err = tx.QueryRowContext(ctx, `SELECT canonical FROM messages WHERE sender=? AND message_id=? AND feature_id=? AND turn_id=? AND kind='task.review' AND attempt_id=?`, f.OwnerAgentID, r.ReviewMessageID, r.FeatureID, r.FailedTurnID, result.AttemptID).Scan(&reviewRaw)
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return wireError(409, "review_not_in_failed_turn")
 		}
@@ -142,11 +151,21 @@ func (s *Store) redeliverOwnerResult(ctx context.Context, r OwnerRedeliveryReque
 		if review.JobID != result.JobID || review.CausationID == nil || *review.CausationID != result.MessageID || reviewPayload.ResultMessageID != result.MessageID || reviewPayload.Verdict != "accepted" {
 			return wireError(409, "wrong_result_review")
 		}
+		if summaryFailure {
+			prior, err := turn(ctx, tx, reviewTurnID)
+			if err != nil || prior.FeatureID != r.FeatureID || prior.AgentID != f.OwnerAgentID || prior.State != "succeeded" {
+				return wireError(409, "review_not_in_prior_successful_turn")
+			}
+			var priorResultID string
+			if err = tx.QueryRowContext(ctx, `SELECT m.message_id FROM mailbox_delivery d JOIN messages m ON m.id=d.message_row WHERE d.agent_id=? AND d.seq=? AND m.kind='task.result'`, f.OwnerAgentID, prior.InputMailboxSeq).Scan(&priorResultID); err != nil || priorResultID != result.MessageID {
+				return wireError(409, "review_not_in_prior_successful_turn")
+			}
+		}
 		var storedActions, otherActions int
 		if err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(CASE WHEN kind!='task.review' OR message_id!=? THEN 1 ELSE 0 END),0) FROM messages WHERE sender=? AND turn_id=?`, r.ReviewMessageID, f.OwnerAgentID, r.FailedTurnID).Scan(&storedActions, &otherActions); err != nil {
 			return err
 		}
-		if storedActions != 1 || otherActions != 0 {
+		if (summaryFailure && storedActions != 0) || (!summaryFailure && storedActions != 1) || otherActions != 0 {
 			return wireError(409, "unsafe_owner_actions")
 		}
 		var pending int
