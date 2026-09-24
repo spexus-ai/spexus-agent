@@ -47,11 +47,14 @@ func TestHumanBlockedWorkerAndFreshResume(t *testing.T) {
 	})
 	r, _ = runnerFixture(t, handler)
 	r.cfg.WireVersion = 2
+	if !strings.Contains(modelInstructions(r.cfg), `outcome "blocked"`) {
+		t.Fatal("worker system instructions omit blocked outcome")
+	}
 	r.model = modelFunc(func(_ context.Context, key, input string) (string, bool, error) {
 		keys = append(keys, key)
 		if len(keys) == 1 {
-			if !strings.Contains(input, `"blocked"`) {
-				t.Error("worker was not instructed to report a blocker")
+			if strings.Contains(input, `outcome "blocked"`) {
+				t.Error("static worker instructions were repeated in turn input")
 			}
 			b, _ := json.Marshal(map[string]any{"outcome": "blocked", "summary": "waiting for approval", "evidence": []any{}, "error": nil, "blocker": blockerFixture()})
 			return string(b), false, nil
