@@ -116,3 +116,33 @@ func TestNewHumanInputSuppressesStaleReviewReply(t *testing.T) {
 		t.Fatalf("newer human input did not suppress stale final reply: %+v", finished)
 	}
 }
+
+func TestStopSuppressesQueuedFinalReplyButPreservesStopNotice(t *testing.T) {
+	f := newHumanFixture(t)
+	initial := f.ownerTurn()
+	d := f.dispatch(initial, "worker-a")
+	d.ProtocolVersion = 2
+	f.post("orchestrator", d, 201)
+	f.finish(initial, "", []ActionReceipt{{MessageID: d.MessageID, Status: "stored"}}, 201)
+	_, _, finished := finishReviewedResult(t, f, d, "accepted", "Все готово.")
+	if finished.ReplyStatus != "queued" {
+		t.Fatalf("expected final reply to be queued: %+v", finished)
+	}
+	if err := f.s.StopFeature(context.Background(), f.feature.FeatureID, "human", "Stop before Slack delivery"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.QueueSlackNotice(context.Background(), f.feature.FeatureID, "stop-notice", "Работа остановлена."); err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := f.s.ClaimSlack(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivery == nil || delivery.Text != "Работа остановлена." {
+		t.Fatalf("stale final reply escaped or stop notice was lost: %+v", delivery)
+	}
+	h := f.history()
+	if len(h.SlackOutbox) != 2 || h.SlackOutbox[0].Status != "suppressed" || h.Turns[len(h.Turns)-1].ReplyStatus != "suppressed" {
+		t.Fatalf("queued reply not suppressed after stop: outbox=%+v turns=%+v", h.SlackOutbox, h.Turns)
+	}
+}

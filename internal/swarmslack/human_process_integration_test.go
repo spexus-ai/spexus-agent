@@ -424,6 +424,11 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 	if questionCount != 1 {
 		t.Fatalf("question count=%d", questionCount)
 	}
+	for _, post := range h.SlackOutbox {
+		if post.Text == "B completed" {
+			t.Fatal("independent B review published a premature final reply while A waited for a human")
+		}
+	}
 	eventually(t, "human question published once", func() bool {
 		api.mu.Lock()
 		defer api.mu.Unlock()
@@ -481,6 +486,23 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 		}
 		return false
 	}, true)
+	finalReplies, extraSummaries := 0, 0
+	for _, post := range h.SlackOutbox {
+		if post.Text == "A completed" {
+			finalReplies++
+		}
+		if post.Text == "B completed" {
+			t.Fatal("premature B completion reply appeared after A continued")
+		}
+	}
+	for _, event := range h.Audit {
+		if event.Event == "owner_summary_queued" {
+			extraSummaries++
+		}
+	}
+	if finalReplies != 1 || extraSummaries != 0 {
+		t.Fatalf("final review/reply handover: replies=%d extra_summary_turns=%d", finalReplies, extraSummaries)
+	}
 	decisionID := h.Dependencies[0].DecisionID
 	if decisionID == "" {
 		t.Fatal("canonical decision missing")

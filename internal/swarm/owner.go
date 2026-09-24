@@ -428,6 +428,30 @@ func (s *Store) ClaimSlack(ctx context.Context) (*SlackDelivery, error) {
 		var d SlackDelivery
 		found := false
 		for _, candidate := range queued {
+			if candidate.TurnID != "" {
+				f, err := feature(ctx, tx, candidate.FeatureID)
+				if err != nil {
+					return err
+				}
+				if f.Stopped {
+					candidate.Status = "suppressed"
+					if _, err = tx.ExecContext(ctx, "UPDATE slack_outbox SET status='suppressed',data=? WHERE id=? AND status='queued'", mustJSON(candidate), candidate.ID); err != nil {
+						return err
+					}
+					t, err := turn(ctx, tx, candidate.TurnID)
+					if err != nil {
+						return err
+					}
+					t.ReplyStatus = "suppressed"
+					if err = saveTurn(ctx, tx, t); err != nil {
+						return err
+					}
+					if err = s.audit(ctx, tx, Principal{AgentID: "coordinator"}, Envelope{FeatureID: candidate.FeatureID, OwnerTurnID: candidate.TurnID}, "slack_delivery", "suppressed_after_stop"); err != nil {
+						return err
+					}
+					continue
+				}
+			}
 			if candidate.Question != nil {
 				var state string
 				if err = tx.QueryRowContext(ctx, "SELECT state FROM human_projections WHERE request_id=?", candidate.ID).Scan(&state); err != nil {
