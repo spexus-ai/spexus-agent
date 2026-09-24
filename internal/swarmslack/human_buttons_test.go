@@ -145,7 +145,7 @@ func TestHumanQuestionShowsCompactContextWithoutInternalIdentifiers(t *testing.T
 		t.Fatalf("question not compact and actionable: %q", got)
 	}
 	closed := humanReadableQuestionText(message, []swarm.HumanOption{{ID: "short", Label: "Коротко"}}, 0, false)
-	if strings.Contains(closed, "Выберите кнопку") || strings.Contains(closed, "Ответьте своими словами") {
+	if closed != "Вопрос: Какой формат выбрать?" {
 		t.Fatalf("closed question still invites an answer: %q", closed)
 	}
 }
