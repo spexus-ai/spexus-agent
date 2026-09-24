@@ -2,6 +2,7 @@ package swarm
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"testing"
 )
@@ -144,5 +145,40 @@ func TestStopSuppressesQueuedFinalReplyButPreservesStopNotice(t *testing.T) {
 	h := f.history()
 	if len(h.SlackOutbox) != 2 || h.SlackOutbox[0].Status != "suppressed" || h.Turns[len(h.Turns)-1].ReplyStatus != "suppressed" {
 		t.Fatalf("queued reply not suppressed after stop: outbox=%+v turns=%+v", h.SlackOutbox, h.Turns)
+	}
+}
+
+func TestDeniedEarlierJobDoesNotBlockNewIndependentFinalReply(t *testing.T) {
+	f := newHumanFixture(t)
+	initial := f.ownerTurn()
+	blocked := f.dispatch(initial, "worker-a")
+	blocked.ProtocolVersion = 2
+	f.post("orchestrator", blocked, 201)
+	f.finish(initial, "", []ActionReceipt{{MessageID: blocked.MessageID, Status: "stored"}}, 201)
+	accepted := f.event(blocked, "task.accepted", AcceptedPayload{DispatchMessageID: blocked.MessageID, ProfileRevision: f.s.profiles[blocked.ToAgentID].Revision}, blocked.MessageID)
+	accepted.ProtocolVersion = 2
+	f.post(blocked.ToAgentID, accepted, 201)
+	started := f.event(blocked, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)
+	started.ProtocolVersion = 2
+	f.post(blocked.ToAgentID, started, 201)
+	result := f.event(blocked, "task.result", ResultPayload{Outcome: "blocked", Summary: "Needs a human choice", Evidence: []Evidence{}, Origin: "worker", Blocker: ptrBlocker(humanBlocker())}, started.MessageID)
+	result.ProtocolVersion = 2
+	f.post(blocked.ToAgentID, result, 201)
+	dep := f.history().Dependencies[0]
+	dep.State = "denied"
+	if err := f.s.transaction(context.Background(), func(tx *sql.Tx) error {
+		return saveDependency(context.Background(), tx, dep)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	next := f.ownerTurn()
+	independent := f.dispatch(next, "worker-b")
+	independent.ProtocolVersion = 2
+	f.post("orchestrator", independent, 201)
+	f.finish(next, "", []ActionReceipt{{MessageID: independent.MessageID, Status: "stored"}}, 201)
+	_, _, finished := finishReviewedResult(t, f, independent, "accepted", "Новая работа завершена.")
+	if finished.ReplyStatus != "queued" {
+		t.Fatalf("terminal denial of earlier work blocked an independent final reply: %+v", finished)
 	}
 }

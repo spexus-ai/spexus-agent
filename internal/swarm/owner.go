@@ -346,7 +346,11 @@ func (s *Store) finalReviewReady(ctx context.Context, tx *sql.Tx, t turnRecord, 
 		return nil, nil
 	}
 	var total, unfinished, openQuestions int
-	if err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(CASE WHEN a.state IN ('succeeded','failed') AND json_extract(a.data,'$.review')='accepted' THEN 0 ELSE 1 END),0) FROM jobs j JOIN attempts a ON a.id=j.current_attempt_id WHERE j.feature_id=?`, t.FeatureID).Scan(&total, &unfinished); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(CASE
+		WHEN a.state IN ('succeeded','failed') AND json_extract(a.data,'$.review')='accepted' THEN 0
+		WHEN a.state='blocked' AND EXISTS (SELECT 1 FROM dependencies d WHERE d.job_id=j.id AND d.state IN ('denied','cancelled')) THEN 0
+		ELSE 1 END),0)
+		FROM jobs j JOIN attempts a ON a.id=j.current_attempt_id WHERE j.feature_id=?`, t.FeatureID).Scan(&total, &unfinished); err != nil {
 		return nil, err
 	}
 	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM human_projections h JOIN dependencies d ON d.id=h.dependency_id WHERE d.feature_id=? AND h.state='open'`, t.FeatureID).Scan(&openQuestions); err != nil {
