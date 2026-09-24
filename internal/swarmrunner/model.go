@@ -32,7 +32,7 @@ func newModel(c Config, p profile) (Model, error) {
 	if c.Role == "owner" {
 		constructor = piadapter.NewResident
 	}
-	a, e := constructor(config.AgentProfile{ID: p.ID, Provider: provider, Model: model, Thinking: p.Reasoning, SystemPrompt: p.Prompt + "\n\n" + modelInstructions(c), Workspace: c.Workspace, SessionDirectory: filepath.Join(c.StateDirectory, "sessions"), Tools: []string{}, Extensions: []string{}}, c.PiBinary)
+	a, e := constructor(config.AgentProfile{ID: p.ID, Provider: provider, Model: model, Thinking: p.Reasoning, SystemPrompt: p.Prompt + "\n\n" + modelInstructions(c), Workspace: c.Workspace, SessionDirectory: filepath.Join(c.StateDirectory, "sessions"), Tools: p.Tools, Extensions: p.Extensions}, c.PiBinary)
 	if e != nil {
 		return nil, e
 	}
@@ -285,7 +285,7 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 	if o.Actions == nil || len(o.Actions) > 8 || len(o.Reply) > 16*1024 {
 		return o, nil, errors.New("invalid owner output bounds")
 	}
-	if d.Type == "task.result" && len(o.Actions) != 0 {
+	if d.Type == "task.result" {
 		// Reject malformed review evidence before any dependent read, as with
 		// ordinary owner action validation.
 		for _, a := range o.Actions {
@@ -302,8 +302,22 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 		if err != nil {
 			return o, nil, err
 		}
-		if reviewedTrigger(d, v) {
+		if reviewedTrigger(d, v) && len(o.Actions) != 0 {
 			return o, nil, &reviewPreflightError{reason: "this task.result was already accepted; return actions:[] and only summarize the recorded outcome"}
+		}
+		if !reviewedTrigger(d, v) {
+			for _, attempt := range v.Attempts {
+				if attempt.AttemptID != d.AttemptID || attempt.ResultMessageID != d.MessageID || attempt.Result == nil || attempt.Result.Outcome != "succeeded" || attempt.Review != "pending" {
+					continue
+				}
+				containsReview := false
+				for _, a := range o.Actions {
+					containsReview = containsReview || a.Kind == "review"
+				}
+				if !containsReview {
+					return o, nil, &reviewPreflightError{reason: "a successful task.result needs an explicit review action before a reply or further dispatch"}
+				}
+			}
 		}
 	}
 	result := make([]swarm.Envelope, 0, len(o.Actions))

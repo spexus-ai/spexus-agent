@@ -51,7 +51,13 @@ func TestFinalReviewWithoutReplyQueuesOneSummaryOnlyTurn(t *testing.T) {
 	}
 	turnID := NewID()
 	f.call("orchestrator", "POST", "/owner-turns/start", OwnerStartRequest{TurnID: turnID, FeatureID: f.feature.FeatureID, InputMailboxSeq: summarySeq}, 201)
-	f.call("orchestrator", "POST", "/owner-turns/"+turnID+"/finish", OwnerFinishRequest{Outcome: "succeeded", Reply: "Оба результата проверены.", Actions: []ActionReceipt{}, Observation: json.RawMessage("null")}, 201)
+	var summaryFinish OwnerFinishReceipt
+	if err := json.Unmarshal(f.call("orchestrator", "POST", "/owner-turns/"+turnID+"/finish", OwnerFinishRequest{Outcome: "succeeded", Reply: "Оба результата проверены.", Actions: []ActionReceipt{}, Observation: json.RawMessage("null")}, 201), &summaryFinish); err != nil {
+		t.Fatal(err)
+	}
+	if summaryFinish.ReplyStatus != "queued" || len(f.history().SlackOutbox) != 1 || f.history().SlackOutbox[0].Text != "Оба результата проверены." {
+		t.Fatalf("reviewed summary reply was suppressed: %+v", summaryFinish)
+	}
 	if err := f.s.db.QueryRow(`SELECT count(*) FROM audit WHERE event='owner_summary_queued'`).Scan(&queued); err != nil || queued != 1 {
 		t.Fatalf("summary loop: count=%d err=%v", queued, err)
 	}

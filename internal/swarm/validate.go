@@ -154,7 +154,8 @@ func validateConfig(c Config) error {
 	return nil
 }
 
-// ValidateTextProfile is shared by the trusted runner: P2 has no model tools or extensions.
+// ValidateTextProfile is shared by the coordinator and runner. Container mounts,
+// rather than the tool list, define which files a worker can change.
 func ValidateTextProfile(snapshot []byte) (TextProfile, error) {
 	var p TextProfile
 	if len(snapshot) > 128*1024 {
@@ -166,8 +167,16 @@ func ValidateTextProfile(snapshot []byte) (TextProfile, error) {
 	if err := required(snapshot, "id", "model", "reasoning", "prompt", "tools", "extensions"); err != nil {
 		return p, err
 	}
-	if !safeText(p.ID, 128) || !safeText(p.Model, 256) || !strings.Contains(p.Model, "/") || !safeText(p.Reasoning, 32) || !safeText(p.Prompt, 64*1024) || p.Tools == nil || p.Extensions == nil || len(p.Tools) != 0 || len(p.Extensions) != 0 {
+	if !safeText(p.ID, 128) || !safeText(p.Model, 256) || !strings.Contains(p.Model, "/") || !safeText(p.Reasoning, 32) || !safeText(p.Prompt, 64*1024) || p.Tools == nil || p.Extensions == nil || len(p.Extensions) != 0 || len(p.Tools) > 4 {
 		return p, wireError(400, "unsafe_profile")
+	}
+	allowed := map[string]bool{"read": true, "write": true, "edit": true, "bash": true}
+	seen := map[string]bool{}
+	for _, tool := range p.Tools {
+		if !allowed[tool] || seen[tool] {
+			return p, wireError(400, "unsafe_profile")
+		}
+		seen[tool] = true
 	}
 	return p, nil
 }

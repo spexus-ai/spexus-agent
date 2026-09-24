@@ -400,7 +400,7 @@ func TestProfileAndOutputValidation(t *testing.T) {
 			t.Fatalf("bad worker output accepted: %s", s)
 		}
 	}
-	for _, tools := range []any{nil, []string{"bash"}} {
+	for _, tools := range []any{nil, []string{"network"}, []string{"read", "read"}} {
 		p := r.profile.TextProfile
 		b, _ := json.Marshal(p)
 		var v map[string]any
@@ -615,6 +615,19 @@ func TestOwnerReviewEvidenceRequiresObjects(t *testing.T) {
 	h, _ := r.journal.History()
 	if h.Pending != 0 {
 		t.Fatal("validation had publish side effect")
+	}
+}
+
+func TestOwnerCannotSkipSuccessfulResultReview(t *testing.T) {
+	resultID := swarm.NewID()
+	r, _ := runnerFixture(t, http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		writeJSON(w, swarm.JobView{JobID: job, FeatureID: feature, CurrentAttemptID: attempt, Attempts: []swarm.Attempt{{AttemptID: attempt, AssignedAgentID: "worker-a", State: "succeeded", Review: "pending", ResultMessageID: resultID, Result: &swarm.ResultPayload{Outcome: "succeeded", Summary: "file changed", Evidence: []swarm.Evidence{}}}}})
+	}))
+	r.cfg.Role, r.cfg.AgentID = "owner", "owner"
+	d := dispatchFixture(r)
+	d.Type, d.MessageID = "task.result", resultID
+	if _, actions, err := r.ownerActions(d, swarm.NewID(), `{"actions":[],"reply":"Done."}`); err == nil || actions != nil {
+		t.Fatal("action-free reply skipped a successful result's review")
 	}
 }
 

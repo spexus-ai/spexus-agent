@@ -263,7 +263,7 @@ func (s *Store) finishOwner(ctx context.Context, p Principal, id string, r Owner
 		// Keep the requested reply in the immutable finish for replay, but only
 		// publish it when this transaction proves the review is truly final.
 		replyReady := true
-		if s.wireVersion() == 2 && r.Outcome == "succeeded" && r.Reply != "" && len(r.Actions) != 0 {
+		if s.wireVersion() == 2 && r.Outcome == "succeeded" && r.Reply != "" && (len(r.Actions) != 0 || triggerKind == "task.result") {
 			ready, err := s.finalReviewReady(ctx, tx, t, r.Actions)
 			if err != nil {
 				return err
@@ -320,7 +320,7 @@ type finalReviewState struct {
 // every job is accepted, no human question remains, and no newer owner input
 // is waiting. The check runs in the same transaction as owner finish.
 func (s *Store) finalReviewReady(ctx context.Context, tx *sql.Tx, t turnRecord, actions []ActionReceipt) (*finalReviewState, error) {
-	if s.wireVersion() != 2 || len(actions) != 1 || actions[0].Status != "stored" {
+	if s.wireVersion() != 2 || len(actions) > 1 {
 		return nil, nil
 	}
 	var row, size int64
@@ -339,24 +339,48 @@ func (s *Store) finalReviewReady(ctx context.Context, tx *sql.Tx, t turnRecord, 
 	if result.FeatureID != t.FeatureID {
 		return nil, wireError(409, "foreign_result")
 	}
-	var reviewRaw []byte
-	err = tx.QueryRowContext(ctx, `SELECT canonical FROM messages WHERE sender=? AND message_id=? AND turn_id=? AND kind='task.review' AND attempt_id=?`, t.AgentID, actions[0].MessageID, t.TurnID, result.AttemptID).Scan(&reviewRaw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var review Envelope
-	if err = json.Unmarshal(reviewRaw, &review); err != nil {
-		return nil, err
-	}
-	var payload ReviewPayload
-	if err = json.Unmarshal(review.Payload, &payload); err != nil {
-		return nil, err
-	}
-	if review.JobID != result.JobID || review.CausationID == nil || *review.CausationID != result.MessageID || payload.ResultMessageID != result.MessageID || payload.Verdict != "accepted" {
-		return nil, nil
+	if len(actions) == 0 {
+		// A summary-only turn reuses an already reviewed task.result. The
+		// coordinator must prove that review from durable attempt state; an
+		// action-free reply to a fresh result is not a final answer.
+		var attemptRaw []byte
+		err = tx.QueryRowContext(ctx, `SELECT data FROM attempts WHERE id=? AND job_id=?`, result.AttemptID, result.JobID).Scan(&attemptRaw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		var attempt Attempt
+		if err = json.Unmarshal(attemptRaw, &attempt); err != nil {
+			return nil, err
+		}
+		if attempt.ResultMessageID != result.MessageID || attempt.Review != "accepted" {
+			return nil, nil
+		}
+	} else {
+		if actions[0].Status != "stored" {
+			return nil, nil
+		}
+		var reviewRaw []byte
+		err = tx.QueryRowContext(ctx, `SELECT canonical FROM messages WHERE sender=? AND message_id=? AND turn_id=? AND kind='task.review' AND attempt_id=?`, t.AgentID, actions[0].MessageID, t.TurnID, result.AttemptID).Scan(&reviewRaw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		var review Envelope
+		if err = json.Unmarshal(reviewRaw, &review); err != nil {
+			return nil, err
+		}
+		var payload ReviewPayload
+		if err = json.Unmarshal(review.Payload, &payload); err != nil {
+			return nil, err
+		}
+		if review.JobID != result.JobID || review.CausationID == nil || *review.CausationID != result.MessageID || payload.ResultMessageID != result.MessageID || payload.Verdict != "accepted" {
+			return nil, nil
+		}
 	}
 	var total, unfinished, openQuestions int
 	if err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(CASE

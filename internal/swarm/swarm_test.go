@@ -417,7 +417,7 @@ func TestProfileAndProtocolStrictness(t *testing.T) {
 	raw["causation_id"] = nil
 	raw["payload"] = map[string]any{"goal": strings.Repeat("a", MaxEnvelopeBytes)}
 	f.call("orchestrator", "POST", "/messages", raw, 413)
-	unsafe := TextProfile{ID: "bad", Model: "provider/model", Reasoning: "minimal", Prompt: "Text", Tools: []string{"bash"}, Extensions: []string{}}
+	unsafe := TextProfile{ID: "bad", Model: "provider/model", Reasoning: "minimal", Prompt: "Text", Tools: []string{"network"}, Extensions: []string{}}
 	if _, err := ValidateTextProfile(mustJSON(unsafe)); err == nil {
 		t.Fatal("tool-enabled profile accepted")
 	}

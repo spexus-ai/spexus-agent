@@ -68,6 +68,34 @@ func TestFinalReviewReplyRequiresFeatureCompletionAndIsIdempotent(t *testing.T) 
 	}
 }
 
+func TestActionFreeReplyCannotCompleteUnreviewedResult(t *testing.T) {
+	f := newHumanFixture(t)
+	initial := f.ownerTurn()
+	dispatch := f.dispatch(initial, "worker-a")
+	dispatch.ProtocolVersion = f.s.wireVersion()
+	f.post("orchestrator", dispatch, 201)
+	f.finish(initial, "", []ActionReceipt{{MessageID: dispatch.MessageID, Status: "stored"}}, 201)
+	accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.s.profiles[dispatch.ToAgentID].Revision}, dispatch.MessageID)
+	accepted.ProtocolVersion = f.s.wireVersion()
+	f.post(dispatch.ToAgentID, accepted, 201)
+	started := f.event(dispatch, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)
+	started.ProtocolVersion = f.s.wireVersion()
+	f.post(dispatch.ToAgentID, started, 201)
+	result := f.event(dispatch, "task.result", resultPayload(), started.MessageID)
+	result.ProtocolVersion = f.s.wireVersion()
+	receipt := f.post(dispatch.ToAgentID, result, 201)
+	turnID := NewID()
+	f.call("orchestrator", "POST", "/owner-turns/start", OwnerStartRequest{TurnID: turnID, FeatureID: f.feature.FeatureID, InputMailboxSeq: receipt.MailboxSeq}, 201)
+	request := OwnerFinishRequest{Outcome: "succeeded", Reply: "Everything is done.", Actions: []ActionReceipt{}, Observation: json.RawMessage("null")}
+	var finished OwnerFinishReceipt
+	if err := json.Unmarshal(f.call("orchestrator", "POST", "/owner-turns/"+turnID+"/finish", request, 201), &finished); err != nil {
+		t.Fatal(err)
+	}
+	if finished.ReplyStatus != "none" || len(f.history().SlackOutbox) != 0 || f.history().Jobs[0].Attempts[0].Review != "pending" {
+		t.Fatalf("unreviewed result escaped as final reply: %+v", finished)
+	}
+}
+
 func TestReviewRevisionCannotPublishFinalReply(t *testing.T) {
 	f := newHumanFixture(t)
 	initial := f.ownerTurn()
