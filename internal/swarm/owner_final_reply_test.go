@@ -1,0 +1,118 @@
+package swarm
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+)
+
+func finishReviewedResult(t *testing.T, f *fixture, dispatch Envelope, verdict, reply string, beforeFinish ...func()) (string, OwnerFinishRequest, OwnerFinishReceipt) {
+	t.Helper()
+	accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.s.profiles[dispatch.ToAgentID].Revision}, dispatch.MessageID)
+	accepted.ProtocolVersion = 2
+	f.post(dispatch.ToAgentID, accepted, 201)
+	started := f.event(dispatch, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)
+	started.ProtocolVersion = 2
+	f.post(dispatch.ToAgentID, started, 201)
+	result := f.event(dispatch, "task.result", resultPayload(), started.MessageID)
+	result.ProtocolVersion = 2
+	receipt := f.post(dispatch.ToAgentID, result, 201)
+	turnID := NewID()
+	f.call("orchestrator", "POST", "/owner-turns/start", OwnerStartRequest{TurnID: turnID, FeatureID: f.feature.FeatureID, InputMailboxSeq: receipt.MailboxSeq}, 201)
+	review := Envelope{ProtocolVersion: 2, MessageID: NewID(), Type: "task.review", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: dispatch.ToAgentID, OwnerTurnID: turnID, JobID: dispatch.JobID, AttemptID: dispatch.AttemptID, CausationID: cause(result.MessageID), SentAt: f.s.stamp(), Payload: mustJSON(ReviewPayload{ResultMessageID: result.MessageID, Verdict: verdict, Reason: "Checked", Evidence: []Evidence{}})}
+	f.post("orchestrator", review, 201)
+	for _, hook := range beforeFinish {
+		hook()
+	}
+	request := OwnerFinishRequest{Outcome: "succeeded", Reply: reply, Actions: []ActionReceipt{{MessageID: review.MessageID, Status: "stored"}}, Observation: json.RawMessage("null")}
+	var finished OwnerFinishReceipt
+	if err := json.Unmarshal(f.call("orchestrator", "POST", "/owner-turns/"+turnID+"/finish", request, 201), &finished); err != nil {
+		t.Fatal(err)
+	}
+	return turnID, request, finished
+}
+
+func TestFinalReviewReplyRequiresFeatureCompletionAndIsIdempotent(t *testing.T) {
+	f := newHumanFixture(t)
+	initial := f.ownerTurn()
+	a := f.dispatch(initial, "worker-a")
+	b := f.dispatch(initial, "worker-b")
+	a.ProtocolVersion, b.ProtocolVersion = 2, 2
+	f.post("orchestrator", a, 201)
+	f.post("orchestrator", b, 201)
+	f.finish(initial, "", []ActionReceipt{{MessageID: a.MessageID, Status: "stored"}, {MessageID: b.MessageID, Status: "stored"}}, 201)
+
+	firstTurn, firstRequest, first := finishReviewedResult(t, f, a, "accepted", "Both results are complete.")
+	if first.ReplyStatus != "none" || len(f.history().SlackOutbox) != 0 {
+		t.Fatalf("premature reply escaped: receipt=%+v outbox=%+v", first, f.history().SlackOutbox)
+	}
+	var repeated OwnerFinishReceipt
+	if err := json.Unmarshal(f.call("orchestrator", "POST", "/owner-turns/"+firstTurn+"/finish", firstRequest, 200), &repeated); err != nil {
+		t.Fatal(err)
+	}
+	if repeated.ReplyStatus != "none" || len(f.history().SlackOutbox) != 0 {
+		t.Fatalf("duplicate finish invented a reply: %+v", repeated)
+	}
+	_, _, last := finishReviewedResult(t, f, b, "accepted", "Both results are complete.")
+	if last.ReplyStatus != "queued" {
+		t.Fatalf("final review did not queue its reply: %+v", last)
+	}
+	h := f.history()
+	if len(h.SlackOutbox) != 1 || h.SlackOutbox[0].Text != "Both results are complete." {
+		t.Fatalf("final reply outbox=%+v", h.SlackOutbox)
+	}
+	var summaries int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM audit WHERE event='owner_summary_queued'`).Scan(&summaries); err != nil || summaries != 0 {
+		t.Fatalf("extra summary after final reply: count=%d err=%v", summaries, err)
+	}
+}
+
+func TestReviewRevisionCannotPublishFinalReply(t *testing.T) {
+	f := newHumanFixture(t)
+	initial := f.ownerTurn()
+	d := f.dispatch(initial, "worker-a")
+	d.ProtocolVersion = 2
+	f.post("orchestrator", d, 201)
+	f.finish(initial, "", []ActionReceipt{{MessageID: d.MessageID, Status: "stored"}}, 201)
+	_, _, finished := finishReviewedResult(t, f, d, "revise", "Done.")
+	if finished.ReplyStatus != "none" || len(f.history().SlackOutbox) != 0 {
+		t.Fatalf("revise review published a final reply: %+v", finished)
+	}
+}
+
+func TestOpenHumanQuestionSuppressesReviewReply(t *testing.T) {
+	f := newHumanFixture(t)
+	initial := f.ownerTurn()
+	d := f.dispatch(initial, "worker-a")
+	d.ProtocolVersion = 2
+	f.post("orchestrator", d, 201)
+	f.finish(initial, "", []ActionReceipt{{MessageID: d.MessageID, Status: "stored"}}, 201)
+	requestID := publishedHumanRequest(t, f, []HumanOption{{ID: "approve", Label: "Разрешить"}}, "sent")
+	_, _, finished := finishReviewedResult(t, f, d, "accepted", "Все готово.")
+	if finished.ReplyStatus != "none" {
+		t.Fatalf("open human question did not suppress final reply: %+v", finished)
+	}
+	for _, outbox := range f.history().SlackOutbox {
+		if outbox.ID != requestID {
+			t.Fatalf("review reply appeared beside open question: %+v", outbox)
+		}
+	}
+}
+
+func TestNewHumanInputSuppressesStaleReviewReply(t *testing.T) {
+	f := newHumanFixture(t)
+	initial := f.ownerTurn()
+	d := f.dispatch(initial, "worker-a")
+	d.ProtocolVersion = 2
+	f.post("orchestrator", d, 201)
+	f.finish(initial, "", []ActionReceipt{{MessageID: d.MessageID, Status: "stored"}}, 201)
+	_, _, finished := finishReviewedResult(t, f, d, "accepted", "Все готово.", func() {
+		_, _, err := f.s.Ingest(context.Background(), f.feature.FeatureID, InputPayload{Text: "Подожди, у меня ещё вопрос.", Source: Source{Kind: "slack", EventID: NewID(), ChannelID: f.feature.ChannelID, ThreadTS: f.feature.ThreadTS, ActorID: "human"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if finished.ReplyStatus != "none" || len(f.history().SlackOutbox) != 0 {
+		t.Fatalf("newer human input did not suppress stale final reply: %+v", finished)
+	}
+}
