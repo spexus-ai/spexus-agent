@@ -13,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spexus-ai/spexus-agent/internal/config"
+	"github.com/spexus-ai/spexus-agent/internal/harness"
+	"github.com/spexus-ai/spexus-agent/internal/piadapter"
 	"github.com/spexus-ai/spexus-agent/internal/swarm"
 )
 
@@ -85,12 +88,35 @@ func TestRealPiOwnerContractDoesNotAccumulateInTurnHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// An existing Pi session created by the previous layout must pick up the
+	// new system instructions without deleting its retained history.
+	legacy, err := piadapter.New(config.AgentProfile{
+		ID: p.ID, Provider: "prototype-test", Model: "test-model", Thinking: "off",
+		SystemPrompt: p.Prompt, Workspace: dir,
+		SessionDirectory: filepath.Join(c.StateDirectory, "sessions"), Tools: []string{},
+	}, binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := legacy.StartPrompt(ctx, harness.SessionRequest{
+		ProjectPath: dir, ChannelID: "swarm", ThreadTS: "legacy",
+		Prompt: modelInstructions(c) + "\nLEGACY_EVENT",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.CollectPromptStream(stream); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.Run(ctx, "legacy", "NEW_EVENT"); err != nil {
+		t.Fatal(err)
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(requests) != 2 {
-		t.Fatalf("model requests=%d, want 2", len(requests))
+	if len(requests) != 4 {
+		t.Fatalf("model requests=%d, want 4", len(requests))
 	}
-	for i, req := range requests {
+	for i, req := range requests[:2] {
 		messages, ok := req["messages"].([]any)
 		if !ok {
 			t.Fatalf("request %d omitted messages", i)
@@ -119,5 +145,30 @@ func TestRealPiOwnerContractDoesNotAccumulateInTurnHistory(t *testing.T) {
 		if systemCount != 1 || userCount != i+1 {
 			t.Fatalf("request %d has %d system and %d user messages", i, systemCount, userCount)
 		}
+	}
+	messages, ok := requests[3]["messages"].([]any)
+	if !ok {
+		t.Fatal("resumed legacy request omitted messages")
+	}
+	var system, oldUser, newUser string
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, _ := json.Marshal(message["content"])
+		switch message["role"] {
+		case "system":
+			system = string(content)
+		case "user":
+			if oldUser == "" {
+				oldUser = string(content)
+			} else {
+				newUser = string(content)
+			}
+		}
+	}
+	if !strings.Contains(system, "Wire v2 human requests:") || !strings.Contains(oldUser, "LEGACY_EVENT") || !strings.Contains(oldUser, "Wire v2 human requests:") || !strings.Contains(newUser, "NEW_EVENT") || strings.Contains(newUser, "Wire v2 human requests:") {
+		t.Fatal("resumed session did not apply the new system contract while preserving old history")
 	}
 }
