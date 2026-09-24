@@ -14,6 +14,7 @@ import (
 
 type GlobalConfig struct {
 	BaseWorkspacePath string         `json:"baseWorkspacePath,omitempty"`
+	Agent             AgentProfile   `json:"agent,omitempty"`
 	Slack             SlackAuth      `json:"slack,omitempty"`
 	Runtime           RuntimeOptions `json:"runtime,omitempty"`
 }
@@ -61,6 +62,12 @@ func NewFileStore(path string) *FileStore {
 }
 
 func DefaultPath() (string, error) {
+	if directory := strings.TrimSpace(os.Getenv("SPEXUS_AGENT_HOME")); directory != "" {
+		if !filepath.IsAbs(directory) {
+			return "", errors.New("SPEXUS_AGENT_HOME must be an absolute directory")
+		}
+		return filepath.Join(directory, configFileName), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)

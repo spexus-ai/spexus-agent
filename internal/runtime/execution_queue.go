@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/spexus-ai/spexus-agent/internal/acpxadapter"
+	"github.com/spexus-ai/spexus-agent/internal/harness"
 	"github.com/spexus-ai/spexus-agent/internal/registry"
 	"github.com/spexus-ai/spexus-agent/internal/slack"
 )
@@ -55,7 +55,7 @@ func NewSlashExecutionRequest(prepared PreparedSlackInvocation) ExecutionRequest
 
 func (r ExecutionRequest) WithThread(threadTS string) ExecutionRequest {
 	r.ThreadTS = threadTS
-	r.SessionName = acpxadapter.SessionName(threadTS)
+	r.SessionName = harness.SessionName(threadTS)
 	return r
 }
 
@@ -64,7 +64,7 @@ func (r ExecutionRequest) SessionKey() string {
 		return r.SessionName
 	}
 	if r.ThreadTS != "" {
-		return acpxadapter.SessionName(r.ThreadTS)
+		return harness.SessionName(r.ThreadTS)
 	}
 	return fmt.Sprintf("%s/%s", r.SourceType, r.DeliveryID)
 }

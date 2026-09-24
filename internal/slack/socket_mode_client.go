@@ -326,10 +326,15 @@ type socketModeEnvelope struct {
 }
 
 type socketModeEventsPayload struct {
-	EventID string `json:"event_id,omitempty"`
-	Type    string `json:"type,omitempty"`
-	Event   struct {
+	EventID        string `json:"event_id,omitempty"`
+	Type           string `json:"type,omitempty"`
+	TeamID         string `json:"team_id,omitempty"`
+	Authorizations []struct {
+		TeamID string `json:"team_id,omitempty"`
+	} `json:"authorizations,omitempty"`
+	Event struct {
 		Type      string `json:"type,omitempty"`
+		TeamID    string `json:"team,omitempty"`
 		ChannelID string `json:"channel,omitempty"`
 		ThreadTS  string `json:"thread_ts,omitempty"`
 		Timestamp string `json:"ts,omitempty"`
@@ -350,6 +355,9 @@ func decodeSocketModeEnvelope(data []byte) (socketModeEnvelope, error) {
 }
 
 func eventFromSocketModeEnvelope(envelope socketModeEnvelope) (Event, bool, error) {
+	if strings.TrimSpace(envelope.Type) == "interactive" {
+		return humanActionFromSocketModeEnvelope(envelope)
+	}
 	if strings.TrimSpace(envelope.Type) != SocketModeEnvelopeEventsAPI {
 		return Event{}, false, nil
 	}
@@ -381,6 +389,22 @@ func eventFromSocketModeEnvelope(envelope socketModeEnvelope) (Event, bool, erro
 	event, err := message.Normalize()
 	if err != nil {
 		return Event{}, false, err
+	}
+	for _, team := range []string{payload.TeamID, payload.Event.TeamID} {
+		if team != "" {
+			if event.WorkspaceID != "" && event.WorkspaceID != team {
+				return Event{}, false, fmt.Errorf("Slack event workspace mismatch")
+			}
+			event.WorkspaceID = team
+		}
+	}
+	for _, auth := range payload.Authorizations {
+		if auth.TeamID != "" {
+			if event.WorkspaceID != "" && event.WorkspaceID != auth.TeamID {
+				return Event{}, false, fmt.Errorf("Slack authorization workspace mismatch")
+			}
+			event.WorkspaceID = auth.TeamID
+		}
 	}
 	return event, true, nil
 }

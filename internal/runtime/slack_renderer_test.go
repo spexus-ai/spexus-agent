@@ -72,12 +72,12 @@ func TestSlackThreadRendererBatchesProgressAndFinalUpdates(t *testing.T) {
 		ChannelID:   "C12345678",
 		ThreadTS:    "1713686400.000100",
 		SessionName: "slack-1713686400.000100",
-	}, []ACPXTurnEvent{
-		{Kind: ACPXEventSessionStarted, Text: "slack-1713686400.000100"},
-		{Kind: ACPXEventAssistantThinking, Text: "analyzing"},
-		{Kind: ACPXEventToolStarted, ToolName: "grep", Text: "searching"},
-		{Kind: ACPXEventAssistantMessageChunk, Text: "partial answer"},
-		{Kind: ACPXEventAssistantMessageFinal, Text: "final answer"},
+	}, []AgentTurnEvent{
+		{Kind: AgentEventSessionStarted, Text: "slack-1713686400.000100"},
+		{Kind: AgentEventAssistantThinking, Text: "analyzing"},
+		{Kind: AgentEventToolStarted, ToolName: "grep", Text: "searching"},
+		{Kind: AgentEventAssistantMessageChunk, Text: "partial answer"},
+		{Kind: AgentEventAssistantMessageFinal, Text: "final answer"},
 	})
 	if err != nil {
 		t.Fatalf("Render() error = %v", err)
@@ -97,7 +97,7 @@ func TestSlackThreadRendererBatchesProgressAndFinalUpdates(t *testing.T) {
 	}
 }
 
-// Test: terminal ACPX errors are rendered after any pending progress batch and use the same Slack thread context.
+// Test: terminal Agent errors are rendered after any pending progress batch and use the same Slack thread context.
 // Validates: AC-1795 (REQ-1156 - cancel requests cancellation without corrupting session mapping)
 func TestSlackThreadRendererRendersTerminalError(t *testing.T) {
 	t.Parallel()
@@ -109,9 +109,9 @@ func TestSlackThreadRendererRendersTerminalError(t *testing.T) {
 		ChannelID:   "C12345678",
 		ThreadTS:    "1713686400.000100",
 		SessionName: "slack-1713686400.000100",
-	}, []ACPXTurnEvent{
-		{Kind: ACPXEventAssistantMessageChunk, Text: "working"},
-		{Kind: ACPXEventSessionError, Text: "acpx crashed"},
+	}, []AgentTurnEvent{
+		{Kind: AgentEventAssistantMessageChunk, Text: "working"},
+		{Kind: AgentEventSessionError, Text: "agent crashed"},
 	})
 	if err != nil {
 		t.Fatalf("Render() error = %v", err)
@@ -123,7 +123,7 @@ func TestSlackThreadRendererRendersTerminalError(t *testing.T) {
 	if client.messages[0].Text != "working" {
 		t.Fatalf("progress render text = %q", client.messages[0].Text)
 	}
-	if client.messages[1].Text != "Session error: acpx crashed" {
+	if client.messages[1].Text != "Session error: agent crashed" {
 		t.Fatalf("terminal render text = %q", client.messages[1].Text)
 	}
 }
@@ -140,9 +140,9 @@ func TestSlackThreadRendererRendersCancel(t *testing.T) {
 		ChannelID:   "C12345678",
 		ThreadTS:    "1713686400.000100",
 		SessionName: "slack-1713686400.000100",
-	}, []ACPXTurnEvent{
-		{Kind: ACPXEventAssistantMessageChunk, Text: "working"},
-		{Kind: ACPXEventSessionCancelled, Text: "cancelled by operator"},
+	}, []AgentTurnEvent{
+		{Kind: AgentEventAssistantMessageChunk, Text: "working"},
+		{Kind: AgentEventSessionCancelled, Text: "cancelled by operator"},
 	})
 	if err != nil {
 		t.Fatalf("Render() error = %v", err)
@@ -175,13 +175,13 @@ func TestSlackThreadProgressPublisherFlushesBatchedProgressByCount(t *testing.T)
 		t.Fatalf("NewProgressPublisher() error = %v", err)
 	}
 
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventSessionStarted, Text: "slack-1713686400.000100"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventSessionStarted, Text: "slack-1713686400.000100"}); err != nil {
 		t.Fatalf("Consume(session started) error = %v", err)
 	}
 	if publisher.ShouldFlushByCount() {
 		t.Fatal("ShouldFlushByCount() = true after one event, want false")
 	}
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantThinking, Text: "searching"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventAssistantThinking, Text: "searching"}); err != nil {
 		t.Fatalf("Consume(thinking) error = %v", err)
 	}
 	if !publisher.ShouldFlushByCount() {
@@ -190,7 +190,7 @@ func TestSlackThreadProgressPublisherFlushesBatchedProgressByCount(t *testing.T)
 	if err := publisher.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush() error = %v", err)
 	}
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageFinal, Text: "final answer"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventAssistantMessageFinal, Text: "final answer"}); err != nil {
 		t.Fatalf("Consume(final) error = %v", err)
 	}
 	if err := publisher.Finish(context.Background(), nil); err != nil {
@@ -209,7 +209,7 @@ func TestSlackThreadProgressPublisherFlushesBatchedProgressByCount(t *testing.T)
 }
 
 // Test: progress stays buffered until a flush boundary is reached, then the final assistant output is posted separately.
-// Validates: AC-1978 (REQ-1425 - intermediate ACPX events publish before completion), AC-1979 (REQ-1426 - Slack progress publishing batches updates), AC-1980 (REQ-1427 - terminal success publishes the final answer)
+// Validates: AC-1978 (REQ-1425 - intermediate Agent events publish before completion), AC-1979 (REQ-1426 - Slack progress publishing batches updates), AC-1980 (REQ-1427 - terminal success publishes the final answer)
 func TestSlackThreadProgressPublisherBuffersProgressUntilFinalOutput(t *testing.T) {
 	t.Parallel()
 
@@ -226,17 +226,17 @@ func TestSlackThreadProgressPublisherBuffersProgressUntilFinalOutput(t *testing.
 		t.Fatalf("NewProgressPublisher() error = %v", err)
 	}
 
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventSessionStarted, Text: "slack-1713686400.000100"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventSessionStarted, Text: "slack-1713686400.000100"}); err != nil {
 		t.Fatalf("Consume(session started) error = %v", err)
 	}
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventToolStarted, ToolName: "grep", Text: "searching"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventToolStarted, ToolName: "grep", Text: "searching"}); err != nil {
 		t.Fatalf("Consume(tool started) error = %v", err)
 	}
 	if got := len(client.messages); got != 0 {
 		t.Fatalf("message count before flush boundary = %d, want 0", got)
 	}
 
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageFinal, Text: "final answer"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventAssistantMessageFinal, Text: "final answer"}); err != nil {
 		t.Fatalf("Consume(final) error = %v", err)
 	}
 	if err := publisher.Flush(context.Background()); err != nil {
@@ -274,13 +274,13 @@ func TestSlackThreadProgressPublisherStreamsAssistantChunksAppendOnly(t *testing
 		t.Fatalf("NewProgressPublisher() error = %v", err)
 	}
 
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageChunk, Text: "Need\n"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventAssistantMessageChunk, Text: "Need\n"}); err != nil {
 		t.Fatalf("Consume(first chunk) error = %v", err)
 	}
 	if err := publisher.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush(first chunk) error = %v", err)
 	}
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageChunk, Text: " the epic ID"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventAssistantMessageChunk, Text: " the epic ID"}); err != nil {
 		t.Fatalf("Consume(second chunk) error = %v", err)
 	}
 	if err := publisher.Flush(context.Background()); err != nil {
@@ -318,16 +318,16 @@ func TestSlackThreadProgressPublisherSkipsDuplicateFinalAssistantMessage(t *test
 		t.Fatalf("NewProgressPublisher() error = %v", err)
 	}
 
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageChunk, Text: "pong"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventAssistantMessageChunk, Text: "pong"}); err != nil {
 		t.Fatalf("Consume(chunk) error = %v", err)
 	}
 	if err := publisher.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush() error = %v", err)
 	}
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageFinal, Text: "pong"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventAssistantMessageFinal, Text: "pong"}); err != nil {
 		t.Fatalf("Consume(final) error = %v", err)
 	}
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventSessionDone}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventSessionDone}); err != nil {
 		t.Fatalf("Consume(done) error = %v", err)
 	}
 	if err := publisher.Finish(context.Background(), nil); err != nil {
@@ -356,10 +356,10 @@ func TestSlackThreadProgressPublisherFinishesWithTerminalError(t *testing.T) {
 		t.Fatalf("NewProgressPublisher() error = %v", err)
 	}
 
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageChunk, Text: "working"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventAssistantMessageChunk, Text: "working"}); err != nil {
 		t.Fatalf("Consume(chunk) error = %v", err)
 	}
-	if err := publisher.Finish(context.Background(), errors.New("acpx crashed")); err != nil {
+	if err := publisher.Finish(context.Background(), errors.New("agent crashed")); err != nil {
 		t.Fatalf("Finish() error = %v", err)
 	}
 
@@ -369,7 +369,7 @@ func TestSlackThreadProgressPublisherFinishesWithTerminalError(t *testing.T) {
 	if client.messages[0].Text != "working" {
 		t.Fatalf("progress message = %q", client.messages[0].Text)
 	}
-	if client.messages[1].Text != "Session error: acpx crashed" {
+	if client.messages[1].Text != "Session error: agent crashed" {
 		t.Fatalf("terminal message = %q, want session error", client.messages[1].Text)
 	}
 }
@@ -390,10 +390,10 @@ func TestSlackThreadProgressPublisherFinishesWithTerminalCancellation(t *testing
 		t.Fatalf("NewProgressPublisher() error = %v", err)
 	}
 
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventAssistantMessageChunk, Text: "working"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventAssistantMessageChunk, Text: "working"}); err != nil {
 		t.Fatalf("Consume(chunk) error = %v", err)
 	}
-	if err := publisher.Consume(context.Background(), ACPXTurnEvent{Kind: ACPXEventSessionCancelled, Text: "cancelled by operator"}); err != nil {
+	if err := publisher.Consume(context.Background(), AgentTurnEvent{Kind: AgentEventSessionCancelled, Text: "cancelled by operator"}); err != nil {
 		t.Fatalf("Consume(cancelled) error = %v", err)
 	}
 	if err := publisher.Finish(context.Background(), nil); err != nil {

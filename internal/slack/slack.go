@@ -44,12 +44,30 @@ type MessageUpdater interface {
 }
 
 type Event struct {
-	ID        string
-	ChannelID string
-	ThreadTS  string
-	Timestamp string
-	UserID    string
-	Text      string
+	ID             string
+	WorkspaceID    string
+	ChannelID      string
+	ThreadTS       string
+	Timestamp      string
+	UserID         string
+	Text           string
+	HumanAction    *HumanAction
+	FeatureControl *FeatureControl
+}
+
+// HumanAction is transport metadata from a Block Kit click, never model text.
+type HumanAction struct {
+	RequestID  string
+	OptionID   string
+	ControlID  string
+	QuestionTS string
+}
+
+// FeatureControl is a button on the feature's root Slack message.
+type FeatureControl struct {
+	FeatureID string
+	AnchorTS  string
+	ControlID string
 }
 
 const (
@@ -94,6 +112,13 @@ type ResponseURLClient interface {
 
 type EventSource interface {
 	Events(context.Context) (<-chan Event, error)
+	Close() error
+}
+
+// DurableEventSource acknowledges each Socket Mode envelope only after its
+// consumer has committed it. Connection callbacks gate work during catchup.
+type DurableEventSource interface {
+	RunDurable(context.Context, func(context.Context) error, func(context.Context) error, func(context.Context, Event) error) error
 	Close() error
 }
 

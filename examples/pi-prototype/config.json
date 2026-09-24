@@ -1,0 +1,12 @@
+{
+  "baseWorkspacePath": "/absolute/path/to/workspaces",
+  "agent": {
+    "id": "prototype",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "thinking": "minimal",
+    "promptFile": "agent.md",
+    "workspace": "/absolute/path/to/workspaces/project",
+    "tools": []
+  }
+}

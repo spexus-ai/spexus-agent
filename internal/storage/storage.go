@@ -12,6 +12,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
+	"github.com/spexus-ai/spexus-agent/internal/config"
 	"github.com/spexus-ai/spexus-agent/internal/registry"
 	runtimemodel "github.com/spexus-ai/spexus-agent/internal/runtime"
 )
@@ -40,6 +41,13 @@ type RuntimeRepository struct {
 type ThreadLock = runtimemodel.ThreadLock
 
 func DefaultPath() (string, error) {
+	if strings.TrimSpace(os.Getenv("SPEXUS_AGENT_HOME")) != "" {
+		configPath, err := config.DefaultPath()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(filepath.Dir(configPath), defaultDBName), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)

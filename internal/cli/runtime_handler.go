@@ -13,8 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spexus-ai/spexus-agent/internal/acpxadapter"
 	"github.com/spexus-ai/spexus-agent/internal/config"
+	"github.com/spexus-ai/spexus-agent/internal/harness"
+	"github.com/spexus-ai/spexus-agent/internal/piadapter"
 	"github.com/spexus-ai/spexus-agent/internal/registry"
 	"github.com/spexus-ai/spexus-agent/internal/runtime"
 	"github.com/spexus-ai/spexus-agent/internal/slack"
@@ -23,10 +24,11 @@ import (
 
 type runtimeCommandHandler struct {
 	configStore *config.FileStore
-	adapter     acpxadapter.Adapter
+	adapter     harness.Adapter
 	starter     runtimeStarter
 	runtimeRepo runtime.Store
 	out         io.Writer
+	debugMu     sync.Mutex
 	mu          sync.Mutex
 	loaded      bool
 	snapshot    runtimeSnapshot
@@ -47,7 +49,7 @@ type renderedPromptStreamError struct {
 
 type promptExecutionResult struct {
 	sessionName string
-	events      []runtime.ACPXTurnEvent
+	events      []runtime.AgentTurnEvent
 	cancelled   bool
 	checkpoint  runtime.ExecutionCheckpoint
 }
@@ -80,7 +82,6 @@ func newRuntimeCommandHandler(out io.Writer) RuntimeHandler {
 	}
 	return &runtimeCommandHandler{
 		configStore: config.NewFileStore(""),
-		adapter:     acpxadapter.NewCLIAdapter("", nil),
 		out:         out,
 	}
 }
@@ -326,6 +327,21 @@ func (h *runtimeCommandHandler) loadValidatedConfig(ctx context.Context) (config
 }
 
 func (h *runtimeCommandHandler) newForegroundRuntimeStarter(ctx context.Context, cfg config.GlobalConfig, opts runtimeStartOptions) (runtimeStarter, error) {
+	if h.adapter == nil {
+		configPath, err := storePath(h.configStore)
+		if err != nil {
+			return nil, err
+		}
+		profile, err := cfg.Agent.Resolve(configPath)
+		if err != nil {
+			return nil, err
+		}
+		adapter, err := piadapter.New(profile, "")
+		if err != nil {
+			return nil, err
+		}
+		h.adapter = adapter
+	}
 	store, err := storage.OpenDefault(ctx)
 	if err != nil {
 		return nil, err
@@ -395,6 +411,8 @@ func (h *runtimeCommandHandler) debugf(format string, args ...any) {
 	if h == nil || h.out == nil {
 		return
 	}
+	h.debugMu.Lock()
+	defer h.debugMu.Unlock()
 	fmt.Fprintf(h.out, format+"\n", args...)
 }
 
@@ -402,12 +420,13 @@ type foregroundRuntimeStarter struct {
 	source           slack.InboundInvocationSource
 	client           slack.Client
 	renderer         runtime.SlackThreadRenderer
-	adapter          acpxadapter.Adapter
+	adapter          harness.Adapter
 	projectRepo      runtime.ProjectContextResolver
 	runtimeRepo      runtime.Store
 	executionTracker *runtime.ExecutionLifecycleTracker
 	store            interface{ Close() error }
 	debugf           func(string, ...any)
+	debugMu          sync.Mutex
 }
 
 func (s *foregroundRuntimeStarter) Start(ctx context.Context, _ runtime.Status) error {
@@ -421,7 +440,7 @@ func (s *foregroundRuntimeStarter) Start(ctx context.Context, _ runtime.Status) 
 		return errors.New("slack client is required")
 	}
 	if s.adapter == nil {
-		return errors.New("acpx adapter is required")
+		return errors.New("agent adapter is required")
 	}
 	if s.projectRepo == nil {
 		return errors.New("project repository is required")
@@ -582,6 +601,14 @@ func (s *foregroundRuntimeStarter) handleMessageInvocation(ctx context.Context, 
 	if err != nil {
 		return s.handleInvocationRejection(ctx, invocation, err)
 	}
+	// Control messages bypass the per-session execution queue so a running turn
+	// can be stopped immediately. Other replies remain ordinary prompts.
+	if strings.HasPrefix(strings.TrimSpace(invocation.CommandText), "!") {
+		command := runtime.ParseSlackCommand(strings.TrimPrefix(strings.TrimSpace(invocation.CommandText), "!"))
+		if command.Kind == runtime.SlackCommandClose || command.Kind == runtime.SlackCommandStatus || command.Kind == runtime.SlackCommandHelp {
+			return s.handleLocalMentionCommand(ctx, coordinator, prepared, command)
+		}
+	}
 	request := runtime.NewMentionExecutionRequest(prepared)
 	result, err := coordinator.ClaimExecution(ctx, request)
 	if err != nil {
@@ -715,7 +742,7 @@ func (s *foregroundRuntimeStarter) executeMentionRequest(ctx context.Context, co
 			return nil
 		}
 
-		promptResult, err := s.collectPromptEvents(ctx, prepared, request, command.ACPXPrompt(), command.Kind == runtime.SlackCommandAsk)
+		promptResult, err := s.collectPromptEvents(ctx, prepared, request, command.AgentPrompt())
 		if err != nil {
 			if tracker != nil {
 				_ = tracker.RecordFailed(ctx, request, err)
@@ -737,14 +764,14 @@ func (s *foregroundRuntimeStarter) executeMentionRequest(ctx context.Context, co
 		}
 
 		s.logf(
-			"runtime.loop: acpx completed session=%s event_count=%d",
+			"runtime.loop: agent completed session=%s event_count=%d",
 			promptResult.sessionName,
 			len(promptResult.events),
 		)
 		s.logf(
-			"runtime.loop: acpx events session=%s payload=%s",
+			"runtime.loop: agent events session=%s payload=%s",
 			promptResult.sessionName,
-			summarizeACPXEvents(promptResult.events, 12),
+			summarizeAgentEvents(promptResult.events, 12),
 		)
 
 		s.logf("runtime.loop: rendered slack reply thread=%s session=%s", prepared.ThreadTS, promptResult.sessionName)
@@ -815,7 +842,7 @@ func (s *foregroundRuntimeStarter) executeMessageRequest(ctx context.Context, co
 			return nil
 		}
 
-		promptResult, err := s.collectPromptEvents(ctx, prepared, request, prompt, false)
+		promptResult, err := s.collectPromptEvents(ctx, prepared, request, prompt)
 		if err != nil {
 			if tracker != nil {
 				_ = tracker.RecordFailed(ctx, request, err)
@@ -837,14 +864,14 @@ func (s *foregroundRuntimeStarter) executeMessageRequest(ctx context.Context, co
 		}
 
 		s.logf(
-			"runtime.loop: acpx completed session=%s event_count=%d",
+			"runtime.loop: agent completed session=%s event_count=%d",
 			promptResult.sessionName,
 			len(promptResult.events),
 		)
 		s.logf(
-			"runtime.loop: acpx events session=%s payload=%s",
+			"runtime.loop: agent events session=%s payload=%s",
 			promptResult.sessionName,
-			summarizeACPXEvents(promptResult.events, 12),
+			summarizeAgentEvents(promptResult.events, 12),
 		)
 		s.logf("runtime.loop: rendered message reply thread=%s session=%s", prepared.ThreadTS, promptResult.sessionName)
 		return nil
@@ -921,7 +948,7 @@ func (s *foregroundRuntimeStarter) handleMentionCancelInvocation(ctx context.Con
 
 	messageText := strings.TrimSpace(report.Message)
 	if messageText == "" {
-		messageText = "active ACPX execution cancelled"
+		messageText = "active Agent execution cancelled"
 	}
 	if err := s.client.PostThreadMessage(ctx, slack.Message{
 		ChannelID: prepared.Project.SlackChannelID,
@@ -1093,7 +1120,7 @@ func (s *foregroundRuntimeStarter) executeSlashRequest(ctx context.Context, coor
 			return nil
 		}
 
-		promptResult, err := s.collectPromptEvents(ctx, prepared, request, command.ACPXPrompt(), command.Kind == runtime.SlackCommandAsk)
+		promptResult, err := s.collectPromptEvents(ctx, prepared, request, command.AgentPrompt())
 		if err != nil {
 			if tracker != nil {
 				_ = tracker.RecordFailed(ctx, request, err)
@@ -1115,14 +1142,14 @@ func (s *foregroundRuntimeStarter) executeSlashRequest(ctx context.Context, coor
 		}
 
 		s.logf(
-			"runtime.loop: acpx completed session=%s event_count=%d",
+			"runtime.loop: agent completed session=%s event_count=%d",
 			promptResult.sessionName,
 			len(promptResult.events),
 		)
 		s.logf(
-			"runtime.loop: acpx events session=%s payload=%s",
+			"runtime.loop: agent events session=%s payload=%s",
 			promptResult.sessionName,
-			summarizeACPXEvents(promptResult.events, 12),
+			summarizeAgentEvents(promptResult.events, 12),
 		)
 
 		s.logf("runtime.loop: rendered slash reply thread=%s session=%s", prepared.ThreadTS, promptResult.sessionName)
@@ -1151,12 +1178,12 @@ func (s *foregroundRuntimeStarter) executeSlashRequest(ctx context.Context, coor
 	s.logf("runtime.loop: slash processed delivery=%s session=%s", request.DeliveryID, preparedEvent.SessionName)
 }
 
-func (s *foregroundRuntimeStarter) collectPromptEvents(ctx context.Context, prepared runtime.PreparedSlackEvent, request runtime.ExecutionRequest, prompt string, forceNew bool) (promptExecutionResult, error) {
-	stream, err := s.adapter.StartPrompt(ctx, acpxadapter.SessionRequest{
+func (s *foregroundRuntimeStarter) collectPromptEvents(ctx context.Context, prepared runtime.PreparedSlackEvent, request runtime.ExecutionRequest, prompt string) (promptExecutionResult, error) {
+	stream, err := s.adapter.StartPrompt(ctx, harness.SessionRequest{
 		ProjectPath: prepared.Project.LocalPath,
+		ChannelID:   prepared.Project.SlackChannelID,
 		ThreadTS:    prepared.ThreadTS,
 		Prompt:      prompt,
-		ForceNew:    forceNew,
 	})
 	if err != nil {
 		return promptExecutionResult{}, err
@@ -1176,7 +1203,7 @@ func (s *foregroundRuntimeStarter) collectPromptEvents(ctx context.Context, prep
 
 	request.SessionName = stream.SessionName()
 
-	events := make([]runtime.ACPXTurnEvent, 0, 16)
+	events := make([]runtime.AgentTurnEvent, 0, 16)
 	eventCh := stream.Events()
 	timer := time.NewTimer(time.Hour)
 	stopTimer(timer)
@@ -1228,7 +1255,7 @@ func (s *foregroundRuntimeStarter) collectPromptEvents(ctx context.Context, prep
 				return promptExecutionResult{}, err
 			}
 			checkpoint = executionCheckpointFromEvent(event)
-			if event.Kind == runtime.ACPXEventSessionCancelled {
+			if event.Kind == runtime.AgentEventSessionCancelled {
 				cancelled = true
 			}
 			if tracker != nil {
@@ -1314,6 +1341,8 @@ func (s *foregroundRuntimeStarter) postSlashBootstrapError(ctx context.Context, 
 
 func (s *foregroundRuntimeStarter) logf(format string, args ...any) {
 	if s != nil && s.debugf != nil {
+		s.debugMu.Lock()
+		defer s.debugMu.Unlock()
 		s.debugf(format, args...)
 	}
 }
@@ -1488,13 +1517,13 @@ func (s *foregroundRuntimeStarter) markDeliveryCompleted(ctx context.Context, so
 	_ = s.runtimeRepo.SaveEventDedupe(ctx, dedupe)
 }
 
-func executionCheckpointFromEvent(event runtime.ACPXTurnEvent) runtime.ExecutionCheckpoint {
+func executionCheckpointFromEvent(event runtime.AgentTurnEvent) runtime.ExecutionCheckpoint {
 	checkpoint := runtime.ExecutionCheckpoint{
 		Kind: string(event.Kind),
 	}
 
 	switch event.Kind {
-	case runtime.ACPXEventToolStarted, runtime.ACPXEventToolFinished:
+	case runtime.AgentEventToolStarted, runtime.AgentEventToolFinished:
 		checkpoint.Summary = strings.TrimSpace(event.ToolName)
 		if text := strings.TrimSpace(event.Text); text != "" {
 			if checkpoint.Summary != "" {
@@ -1509,7 +1538,7 @@ func executionCheckpointFromEvent(event runtime.ACPXTurnEvent) runtime.Execution
 	return checkpoint
 }
 
-func summarizeACPXEvents(events []runtime.ACPXTurnEvent, limit int) string {
+func summarizeAgentEvents(events []runtime.AgentTurnEvent, limit int) string {
 	if len(events) == 0 {
 		return ""
 	}
@@ -1550,13 +1579,13 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-func shouldFlushProgressForTerminalEvent(event runtime.ACPXTurnEvent, publisher *runtime.SlackThreadProgressPublisher) bool {
+func shouldFlushProgressForTerminalEvent(event runtime.AgentTurnEvent, publisher *runtime.SlackThreadProgressPublisher) bool {
 	switch event.Kind {
-	case runtime.ACPXEventAssistantMessageFinal,
-		runtime.ACPXEventSessionDone:
+	case runtime.AgentEventAssistantMessageFinal,
+		runtime.AgentEventSessionDone:
 		return publisher != nil && publisher.HasNonAssistantProgress()
-	case runtime.ACPXEventSessionError,
-		runtime.ACPXEventSessionCancelled:
+	case runtime.AgentEventSessionError,
+		runtime.AgentEventSessionCancelled:
 		return true
 	default:
 		return false
@@ -1712,7 +1741,7 @@ func (h *runtimeCommandHandler) cancelExecution(ctx context.Context, runtimeRepo
 		return h.writeCancelNoOp(ctx, "", execution.SessionName, "thread is inactive")
 	}
 	if h.adapter == nil {
-		return errors.New("acpx adapter is required")
+		return errors.New("agent adapter is required")
 	}
 	if err := h.adapter.Cancel(ctx, execution.ThreadTS); err != nil {
 		return err
@@ -1755,7 +1784,7 @@ func (h *runtimeCommandHandler) cancelExecution(ctx context.Context, runtimeRepo
 		SessionName: execution.SessionName,
 		Result:      "cancelled",
 		NoOp:        false,
-		Message:     "active ACPX execution cancelled",
+		Message:     "active Agent execution cancelled",
 		Status:      snapshot.statusCopy(),
 	}
 	report.Status.Message = report.Message

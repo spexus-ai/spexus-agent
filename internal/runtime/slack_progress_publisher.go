@@ -67,32 +67,32 @@ func (r SlackThreadRenderer) NewProgressPublisher(req SlackThreadRenderRequest, 
 	}, nil
 }
 
-func (p *SlackThreadProgressPublisher) Consume(ctx context.Context, event ACPXTurnEvent) error {
+func (p *SlackThreadProgressPublisher) Consume(ctx context.Context, event AgentTurnEvent) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	switch event.Kind {
-	case ACPXEventSessionStarted:
+	case AgentEventSessionStarted:
 		p.appendProgress("Session started"+suffixWithText(event.Text), true)
-	case ACPXEventAssistantThinking:
+	case AgentEventAssistantThinking:
 		p.appendProgress("Thinking"+suffixWithText(event.Text), true)
-	case ACPXEventToolStarted:
+	case AgentEventToolStarted:
 		return nil
-	case ACPXEventToolFinished:
+	case AgentEventToolFinished:
 		return nil
-	case ACPXEventAssistantMessageChunk:
+	case AgentEventAssistantMessageChunk:
 		p.appendAssistantChunk(event.Text)
-	case ACPXEventAssistantMessageFinal:
+	case AgentEventAssistantMessageFinal:
 		if text := strings.TrimSpace(event.Text); text != "" {
 			p.finalParts = append(p.finalParts, text)
 		}
-	case ACPXEventSessionDone:
+	case AgentEventSessionDone:
 		p.sessionDone = true
-	case ACPXEventSessionError:
+	case AgentEventSessionError:
 		p.finalParts = p.finalParts[:0]
 		p.terminal = "Session error" + suffixWithText(event.Text)
-	case ACPXEventSessionCancelled:
+	case AgentEventSessionCancelled:
 		p.finalParts = p.finalParts[:0]
 		p.terminal = "Session cancelled" + suffixWithText(event.Text)
 	}

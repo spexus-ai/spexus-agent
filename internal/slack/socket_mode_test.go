@@ -3,7 +3,7 @@ package slack
 import "testing"
 
 // Test: Socket Mode message events normalize into the internal Slack event shape for root messages and thread replies.
-// Validates: AC-1789 (REQ-1150 - runtime resolves project context from the active registered channel binding), AC-1790 (REQ-1151 - unregistered channels do not invoke ACPX)
+// Validates: AC-1789 (REQ-1150 - runtime resolves project context from the active registered channel binding), AC-1790 (REQ-1151 - unregistered channels do not invoke Agent)
 func TestSocketModeMessageNormalize(t *testing.T) {
 	t.Parallel()
 

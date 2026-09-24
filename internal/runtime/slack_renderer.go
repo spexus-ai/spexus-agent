@@ -21,15 +21,15 @@ type SlackThreadRenderer struct {
 	Client slack.Client
 }
 
-func RenderACPXTurnOutput(ctx context.Context, renderer SlackThreadRenderer, req SlackThreadRenderRequest, output string) error {
-	events, err := TranslateACPXTurnOutput(output)
+func RenderAgentTurnOutput(ctx context.Context, renderer SlackThreadRenderer, req SlackThreadRenderRequest, output string) error {
+	events, err := TranslateAgentTurnOutput(output)
 	if err != nil {
 		return err
 	}
 	return renderer.Render(ctx, req, events)
 }
 
-func (r SlackThreadRenderer) Render(ctx context.Context, req SlackThreadRenderRequest, events []ACPXTurnEvent) error {
+func (r SlackThreadRenderer) Render(ctx context.Context, req SlackThreadRenderRequest, events []AgentTurnEvent) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -63,7 +63,7 @@ func validateSlackThreadRenderRequest(client slack.Client, req SlackThreadRender
 	return nil
 }
 
-func buildSlackThreadMessages(req SlackThreadRenderRequest, events []ACPXTurnEvent) []slack.Message {
+func buildSlackThreadMessages(req SlackThreadRenderRequest, events []AgentTurnEvent) []slack.Message {
 	progress := make([]string, 0, len(events))
 	var assistantProgress strings.Builder
 	finalParts := make([]string, 0, len(events))
@@ -119,33 +119,33 @@ func buildSlackThreadMessages(req SlackThreadRenderRequest, events []ACPXTurnEve
 
 	for _, event := range events {
 		switch event.Kind {
-		case ACPXEventSessionStarted:
+		case AgentEventSessionStarted:
 			appendProgress("Session started" + suffixWithText(event.Text))
-		case ACPXEventAssistantThinking:
+		case AgentEventAssistantThinking:
 			appendProgress("Thinking" + suffixWithText(event.Text))
-		case ACPXEventToolStarted:
+		case AgentEventToolStarted:
 			continue
-		case ACPXEventToolFinished:
+		case AgentEventToolFinished:
 			continue
-		case ACPXEventAssistantMessageChunk:
+		case AgentEventAssistantMessageChunk:
 			appendAssistantChunk(event.Text)
-		case ACPXEventAssistantMessageFinal:
+		case AgentEventAssistantMessageFinal:
 			if len(progress) > 0 {
 				flushProgress(false)
 			}
 			if text := strings.TrimSpace(event.Text); text != "" {
 				finalParts = append(finalParts, text)
 			}
-		case ACPXEventSessionDone:
+		case AgentEventSessionDone:
 			if len(progress) > 0 {
 				flushProgress(false)
 			}
 			sessionDone = true
-		case ACPXEventSessionError:
+		case AgentEventSessionError:
 			flushProgress(true)
 			finalParts = finalParts[:0]
 			terminal = "Session error" + suffixWithText(event.Text)
-		case ACPXEventSessionCancelled:
+		case AgentEventSessionCancelled:
 			flushProgress(true)
 			finalParts = finalParts[:0]
 			terminal = "Session cancelled" + suffixWithText(event.Text)
@@ -190,7 +190,7 @@ func appendProgressLine(lines *[]string, text string) {
 	*lines = append(*lines, text)
 }
 
-func formatToolLine(action string, event ACPXTurnEvent) string {
+func formatToolLine(action string, event AgentTurnEvent) string {
 	label := "Tool " + action
 	if event.ToolName != "" {
 		label += ": " + event.ToolName

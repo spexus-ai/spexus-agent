@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/spexus-ai/spexus-agent/internal/acpxadapter"
+	"github.com/spexus-ai/spexus-agent/internal/harness"
 	"github.com/spexus-ai/spexus-agent/internal/registry"
 	"github.com/spexus-ai/spexus-agent/internal/slack"
 )
@@ -103,7 +103,7 @@ func PrepareSlackInvocation(ctx context.Context, resolver ProjectContextResolver
 			return PreparedSlackInvocation{}, ErrSlackEventThreadContextMissing
 		}
 
-		sessionName := acpxadapter.SessionName(threadTS)
+		sessionName := harness.SessionName(threadTS)
 		prepared.ThreadTS = threadTS
 		prepared.SessionName = sessionName
 		prepared.ThreadState = ThreadState{
