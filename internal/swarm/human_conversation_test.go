@@ -122,6 +122,42 @@ func TestOwnerHumanRespondRequiresDeliveredTrustedSlackSource(t *testing.T) {
 	}
 }
 
+func TestDetailsButtonCannotBecomeHumanDecision(t *testing.T) {
+	f := newHumanFixture(t)
+	ctx := context.Background()
+	requestID := publishedHumanRequest(t, f, nil, "sent")
+	source := contextualSlackSource(f, "124.000001", HumanDetailsControlText)
+	source.SourceKind = "button_control"
+	source.RequestID = requestID
+	source.QuestionTS = "123.000005"
+	source.OptionID = "details"
+	if _, err := f.s.CommitSlackSource(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := f.s.CommittedSlackSource(ctx, source.WorkspaceID, source.ChannelID, source.MessageTS)
+	if err != nil || committed.ActiveHumanRequest == nil || committed.ActiveHumanRequest.RequestID != requestID {
+		t.Fatalf("details source lost its active question: %+v %v", committed, err)
+	}
+	input := InputPayload{Text: committed.Text, Source: Source{Kind: "slack", EventID: "slack:" + committed.ChannelID + ":" + committed.MessageTS, ChannelID: committed.ChannelID, ThreadTS: committed.ThreadTS, ActorID: committed.ActorID, MessageTS: committed.MessageTS}, ActiveHumanRequest: committed.ActiveHumanRequest}
+	receipt, _, err := f.s.Ingest(ctx, f.feature.FeatureID, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.call("orchestrator", "POST", "/acks", AckRequest{[]int64{receipt.MailboxSeq}}, 200)
+	turnID := NewID()
+	f.call("orchestrator", "POST", "/owner-turns/start", OwnerStartRequest{TurnID: turnID, FeatureID: f.feature.FeatureID, InputMailboxSeq: receipt.MailboxSeq}, 201)
+	response := Envelope{ProtocolVersion: 2, MessageID: NewID(), Type: "human.respond", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: "coordinator", OwnerTurnID: turnID, CausationID: cause(receipt.MessageID), SentAt: f.s.stamp(), Payload: mustJSON(HumanRespondPayload{RequestID: requestID, SourceMessageTS: source.MessageTS, Kind: "answer", Text: "да"})}
+	f.post("orchestrator", response, 409)
+	var operations int
+	if err := f.s.db.QueryRowContext(ctx, "SELECT count(*) FROM backend_sync_operations WHERE request_id=? AND kind='decision'", requestID).Scan(&operations); err != nil || operations != 0 {
+		t.Fatalf("details click became decision: operations=%d err=%v", operations, err)
+	}
+	active, err := f.s.ActiveHumanRequest(ctx, f.feature.FeatureID)
+	if err != nil || active == nil || active.RequestID != requestID {
+		t.Fatalf("details click closed the question: %+v %v", active, err)
+	}
+}
+
 func TestSourceBeforePublishedQuestionHasNoActiveSnapshot(t *testing.T) {
 	f := newHumanFixture(t)
 	ctx := context.Background()

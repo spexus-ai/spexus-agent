@@ -95,6 +95,12 @@ func (s *Store) decideHumanTx(ctx context.Context, tx *sql.Tx, e Envelope, p Hum
 	if source.FeatureID != f.FeatureID || source.ThreadTS != f.ThreadTS || source.ChannelID != f.ChannelID || source.WorkspaceID != s.cfg.Human.WorkspaceID || !allowedActor(f, source.ActorID) {
 		return wireError(403, "untrusted_human_source")
 	}
+	// Details and stop buttons are controls, never an answer. The owner model
+	// may explain a question after a details click, but cannot turn that click
+	// into a human decision even if it emits human.respond by mistake.
+	if source.SourceKind != "" && source.SourceKind != "block_action" {
+		return wireError(409, "control_is_not_human_answer")
+	}
 	if source.SourceKind == "block_action" && (source.RequestID != p.RequestID || p.Kind != "answer" || p.OptionID != source.OptionID || p.Text != "") {
 		return wireError(409, "human_action_mismatch")
 	}
