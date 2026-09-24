@@ -30,6 +30,10 @@ func (s *Store) postMessage(ctx context.Context, p Principal, e Envelope) (Recei
 	}
 	if err != nil {
 		s.reject(ctx, p, e, err)
+	} else if !duplicate && e.Type == "human.request" {
+		// The durable operation is committed; wake backend sync without waiting
+		// for its periodic recovery sweep.
+		wake(s.humanWake)
 	}
 	return r, duplicate, err
 }

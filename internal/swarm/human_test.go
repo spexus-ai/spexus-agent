@@ -98,7 +98,17 @@ func TestHumanGateAndSingleContinuation(t *testing.T) {
 	f.call("orchestrator", "POST", "/owner-turns/start", OwnerStartRequest{TurnID: ownerTurn, FeatureID: f.feature.FeatureID, InputMailboxSeq: resultReceipt.MailboxSeq}, 201)
 	request := Envelope{ProtocolVersion: 2, MessageID: NewID(), Type: "human.request", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: "coordinator", OwnerTurnID: ownerTurn, SentAt: f.s.stamp(), Payload: mustJSON(HumanRequestPayload{DependencyID: d.ID, Blocker: humanBlocker()})}
 	f.post("orchestrator", request, 201)
+	select {
+	case <-f.s.HumanWake():
+	default:
+		t.Fatal("durable human request did not wake backend sync")
+	}
 	f.post("orchestrator", request, 200)
+	select {
+	case <-f.s.HumanWake():
+		t.Fatal("duplicate human request woke backend sync")
+	default:
+	}
 	h = f.history()
 	d = h.Dependencies[0]
 	if d.State != "human_pending" || d.RequestID == "" {
@@ -118,6 +128,11 @@ func TestHumanGateAndSingleContinuation(t *testing.T) {
 	open.Slack.ThreadTS = f.feature.ThreadTS
 	if err := f.s.acceptHumanEnvelope(ctx, d.RequestID, mustJSON(humanEnvelope{SchemaVersion: 1, Data: mustJSON(open)})); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-f.s.SlackWake():
+	default:
+		t.Fatal("committed question did not wake Slack publication")
 	}
 	if len(f.history().SlackOutbox) != 1 || f.history().Dependencies[0].State != "human_waiting" {
 		t.Fatal("question was not queued after provider create")

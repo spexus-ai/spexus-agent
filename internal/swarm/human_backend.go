@@ -552,7 +552,7 @@ func (s *Store) acceptHumanEnvelope(ctx context.Context, requestID string, b []b
 	if v.ID != requestID || v.TenantID != s.cfg.TenantID || v.ProjectID != s.cfg.ProjectID || !uuid(v.Dependency.ID) || v.Revision < 1 || v.Revision > 2 {
 		return errors.New("human backend scope/revision mismatch")
 	}
-	return s.transaction(ctx, func(tx *sql.Tx) error {
+	err := s.transaction(ctx, func(tx *sql.Tx) error {
 		d, err := dependency(ctx, tx, v.Dependency.ID)
 		if err != nil {
 			return err
@@ -604,6 +604,11 @@ func (s *Store) acceptHumanEnvelope(ctx context.Context, requestID string, b []b
 		}
 		return s.applyHumanTerminal(ctx, tx, d, p, v)
 	})
+	if err == nil && v.State == "open" {
+		// The canonical question and its Slack outbox row are durable now.
+		wake(s.slackWake)
+	}
+	return err
 }
 
 // ApplyPendingHuman retries local application after source history catchup.

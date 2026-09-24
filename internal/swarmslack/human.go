@@ -71,6 +71,10 @@ func (b *Bridge) RunHuman(ctx context.Context, source slack.DurableEventSource, 
 		return err
 	}
 	h := &humanIngress{bridge: b, store: store, history: history, workspace: workspace, questionUpdates: map[string]string{}, statusUpdates: map[string]threadStatusMark{}, anchorStates: map[string]bool{}}
+	var questionWake <-chan struct{}
+	if waker, ok := b.Store.(interface{ SlackWake() <-chan struct{} }); ok {
+		questionWake = waker.SlackWake()
+	}
 	defer h.clearThreadStatuses(context.Background())
 	for _, f := range b.Features {
 		if _, err := store.SlackWatermark(ctx, f.FeatureID); err != nil {
@@ -95,22 +99,9 @@ func (b *Bridge) RunHuman(ctx context.Context, source slack.DurableEventSource, 
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				h.mu.Lock()
-				for _, f := range b.Features {
-					if err := h.processPending(ctx, f, false); err != nil {
-						b.log("Slack source retained for retry: %v", err)
-					}
-				}
-				h.mu.Unlock()
-				if err := h.syncQuestionMessages(ctx); err != nil {
-					b.log("Slack question update pending: %v", err)
-				}
-				if err := h.syncFeatureAnchors(ctx); err != nil {
-					b.log("Slack anchor update pending: %v", err)
-				}
-				if err := b.DeliverOne(ctx); err != nil {
-					b.log("Slack publication pending: %v", err)
-				}
+				h.processCycle(ctx)
+			case <-questionWake:
+				h.processCycle(ctx)
 			case <-reconcile.C:
 				if err := b.Reconcile(ctx); err != nil {
 					b.log("Slack publication reconciliation pending: %v", err)
@@ -124,6 +115,27 @@ func (b *Bridge) RunHuman(ctx context.Context, source slack.DurableEventSource, 
 		return nil
 	}
 	return err
+}
+
+func (h *humanIngress) processCycle(ctx context.Context) {
+	h.mu.Lock()
+	for _, f := range h.bridge.Features {
+		if err := h.processPending(ctx, f, false); err != nil {
+			h.bridge.log("Slack source retained for retry: %v", err)
+		}
+	}
+	h.mu.Unlock()
+	// Once urgent human input is applied, publish a durable question before
+	// slower cosmetic updates (thread status and anchors).
+	if err := h.bridge.DeliverOne(ctx); err != nil {
+		h.bridge.log("Slack publication pending: %v", err)
+	}
+	if err := h.syncQuestionMessages(ctx); err != nil {
+		h.bridge.log("Slack question update pending: %v", err)
+	}
+	if err := h.syncFeatureAnchors(ctx); err != nil {
+		h.bridge.log("Slack anchor update pending: %v", err)
+	}
 }
 
 type questionUpdater interface {

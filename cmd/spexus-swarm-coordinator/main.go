@@ -204,12 +204,13 @@ func run(args []string) error {
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				if e := store.SyncHuman(ctx); e != nil {
-					log.Printf("human sync: %v", e)
-				}
-				if e := store.ApplyPendingHuman(ctx); e != nil {
-					log.Printf("human application: %v", e)
-				}
+			case <-store.HumanWake():
+			}
+			if e := store.SyncHuman(ctx); e != nil {
+				log.Printf("human sync: %v", e)
+			}
+			if e := store.ApplyPendingHuman(ctx); e != nil {
+				log.Printf("human application: %v", e)
 			}
 		}
 	}()

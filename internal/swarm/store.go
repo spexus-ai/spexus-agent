@@ -27,6 +27,8 @@ type Store struct {
 	mailboxBytes   int
 	mailboxReserve int
 	humanPollAfter string
+	humanWake      chan struct{}
+	slackWake      chan struct{}
 }
 
 type attemptRecord struct {
@@ -117,7 +119,7 @@ func openStore(ctx context.Context, path string, cfg Config, serviceStart bool) 
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{db: db, lock: lock, cfg: cfg, profiles: map[string]Profile{}, now: time.Now, mailboxLimit: 1000, mailboxBytes: 10 * 1024 * 1024, mailboxReserve: 40}
+	s := &Store{db: db, lock: lock, cfg: cfg, profiles: map[string]Profile{}, now: time.Now, mailboxLimit: 1000, mailboxBytes: 10 * 1024 * 1024, mailboxReserve: 40, humanWake: make(chan struct{}, 1), slackWake: make(chan struct{}, 1)}
 	if err = s.bootstrapMode(ctx, serviceStart); err != nil {
 		s.Close()
 		return nil, err
@@ -139,7 +141,15 @@ func (s *Store) Close() error {
 	}
 	return err
 }
-func (s *Store) stamp() string { return s.now().UTC().Format(time.RFC3339Nano) }
+func (s *Store) stamp() string              { return s.now().UTC().Format(time.RFC3339Nano) }
+func (s *Store) HumanWake() <-chan struct{} { return s.humanWake }
+func (s *Store) SlackWake() <-chan struct{} { return s.slackWake }
+func wake(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
 func (s *Store) wireVersion() int {
 	if s.cfg.WireVersion == 2 {
 		return 2
