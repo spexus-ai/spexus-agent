@@ -708,6 +708,23 @@ func (h *humanIngress) processStops(ctx context.Context, featureID string) error
 }
 
 func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, recovering bool) error {
+	if in.SourceKind == "button_control" && in.OptionID == "details" {
+		active, err := h.store.ActiveHumanRequest(ctx, in.FeatureID)
+		if err != nil {
+			return err
+		}
+		message := "Этот вопрос уже закрыт. Если нужно уточнение, напишите его в треде."
+		if active != nil && active.RequestID == in.RequestID {
+			if in.ActiveHumanRequest == nil || in.ActiveHumanRequest.RequestID != in.RequestID {
+				return errors.New("details source lost its committed question")
+			}
+			message = humanDetails(*in.ActiveHumanRequest)
+		}
+		if err := h.notice(ctx, in, message); err != nil {
+			return err
+		}
+		return h.store.SettleSlackSource(ctx, in)
+	}
 	if in.Text == "!continue" {
 		if recovering || in.DuringCatchup {
 			if err := h.notice(ctx, in, "После сверки истории отправьте новую команду !continue, если хотите продолжить работу."); err != nil {
@@ -774,6 +791,42 @@ func (h *humanIngress) processOne(ctx context.Context, in swarm.SlackSource, rec
 		return h.rejection(ctx, in, err)
 	}
 	return h.store.SettleSlackSource(ctx, in)
+}
+
+func humanDetails(q swarm.HumanRequestContext) string {
+	parts := []string{"Подробнее о вопросе: " + compactHumanText(q.Question, 250)}
+	if q.Reason != "" {
+		parts = append(parts, "Почему спрашиваю: "+compactHumanText(q.Reason, 350))
+	}
+	context := strings.TrimSpace(strings.SplitN(q.Context, "\nBlocked work:", 2)[0])
+	if context != "" {
+		parts = append(parts, "Контекст: "+compactHumanText(context, 900))
+	}
+	if len(q.Options) != 0 {
+		labels := make([]string, 0, len(q.Options))
+		for _, option := range q.Options {
+			labels = append(labels, compactHumanText(option.Label, 100))
+		}
+		parts = append(parts, "Варианты: "+strings.Join(labels, " · "))
+	}
+	if q.Recommendation != "" {
+		parts = append(parts, "Рекомендация: "+compactHumanText(q.Recommendation, 350))
+	}
+	goal := strings.TrimSpace(strings.SplitN(strings.TrimPrefix(q.BlockedWork, "Goal:"), "\nScope:", 2)[0])
+	if goal != "" {
+		parts = append(parts, "Ждёт решения: "+compactHumanText(goal, 350))
+	}
+	parts = append(parts, "Можно выбрать кнопку или ответить своими словами. Для другого уточнения напишите в треде.")
+	return strings.Join(parts, "\n")
+}
+
+func compactHumanText(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return strings.TrimSpace(string(runes[:limit])) + "…"
 }
 
 func (h *humanIngress) ownerInput(ctx context.Context, in swarm.SlackSource) (swarm.InputPayload, error) {

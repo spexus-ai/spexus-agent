@@ -2,6 +2,7 @@ package swarmslack
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/spexus-ai/spexus-agent/internal/slack"
@@ -18,6 +19,7 @@ type conversationRouteStore struct {
 	order      []string
 	stopped    bool
 	committed  swarm.SlackSource
+	notices    []string
 }
 
 func (s *conversationRouteStore) CommitSlackSource(_ context.Context, in swarm.SlackSource) (bool, error) {
@@ -51,6 +53,10 @@ func (s *conversationRouteStore) InterruptOwnerTurn(context.Context, string, str
 }
 func (s *conversationRouteStore) SettleSlackSource(context.Context, swarm.SlackSource) error {
 	s.settled++
+	return nil
+}
+func (s *conversationRouteStore) QueueSlackNotice(_ context.Context, _, _, message string) error {
+	s.notices = append(s.notices, message)
 	return nil
 }
 
@@ -89,7 +95,7 @@ func TestButtonIsStructuredOwnerInputNotDirectDecision(t *testing.T) {
 	}
 }
 
-func TestDetailsControlIsOwnerQuestionNotDecision(t *testing.T) {
+func TestDetailsControlUsesCommittedQuestionWithoutOwnerTurn(t *testing.T) {
 	store := &conversationRouteStore{}
 	h := &humanIngress{store: store, workspace: "W"}
 	requestID := swarm.NewID()
@@ -102,12 +108,28 @@ func TestDetailsControlIsOwnerQuestionNotDecision(t *testing.T) {
 	if store.committed.SourceKind != "button_control" || store.committed.RequestID != requestID || store.committed.OptionID != "details" || store.committed.Text != swarm.HumanDetailsControlText || store.interrupts != 0 {
 		t.Fatalf("details button source=%+v interrupts=%d", store.committed, store.interrupts)
 	}
+	store.active = request
 	store.committed.ActiveHumanRequest = request
 	if err := h.processOne(context.Background(), store.committed, false); err != nil {
 		t.Fatal(err)
 	}
-	if len(store.inputs) != 1 || store.inputs[0].Text != swarm.HumanDetailsControlText || store.inputs[0].HumanAction != nil || store.inputs[0].ActiveHumanRequest == nil || store.inputs[0].ActiveHumanRequest.Reason != request.Reason || store.inputs[0].ActiveHumanRequest.Context != request.Context {
-		t.Fatalf("details button was treated as decision: %+v", store.inputs)
+	if len(store.inputs) != 0 || len(store.notices) != 1 || store.settled != 1 || store.interrupts != 0 {
+		t.Fatalf("details was not handled locally: inputs=%+v notices=%+v settled=%d interrupts=%d", store.inputs, store.notices, store.settled, store.interrupts)
+	}
+	if got := store.notices[0]; !strings.Contains(got, request.Reason) || !strings.Contains(got, request.Context) || !strings.Contains(got, request.Recommendation) {
+		t.Fatalf("details omitted committed context: %q", got)
+	}
+}
+
+func TestDetailsControlAfterQuestionClosedDoesNotCreateOwnerTurn(t *testing.T) {
+	store := &conversationRouteStore{}
+	h := &humanIngress{store: store}
+	source := swarm.SlackSource{ChannelID: "C", MessageTS: "2.000001", FeatureID: swarm.NewID(), SourceKind: "button_control", RequestID: swarm.NewID(), OptionID: "details", ActiveHumanRequest: &swarm.HumanRequestContext{RequestID: swarm.NewID()}}
+	if err := h.processOne(context.Background(), source, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.inputs) != 0 || len(store.notices) != 1 || store.settled != 1 || !strings.Contains(store.notices[0], "закрыт") {
+		t.Fatalf("closed question details: inputs=%+v notices=%+v settled=%d", store.inputs, store.notices, store.settled)
 	}
 }
 
