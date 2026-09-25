@@ -15,12 +15,6 @@ import (
 	"github.com/spexus-ai/spexus-agent/internal/swarm"
 )
 
-type Model interface {
-	Run(context.Context, string, string) (string, bool, error)
-}
-type ActivityModel interface {
-	RunWithActivity(context.Context, string, string, func(string)) (string, bool, error)
-}
 type LaunchModel interface {
 	RunWithLaunch(context.Context, string, string, func(string), func() error) (string, bool, error)
 }
@@ -29,7 +23,7 @@ type piModel struct {
 	workspace string
 }
 
-func newModel(c Config, p profile) (Model, error) {
+func newModel(c Config, p profile) (LaunchModel, error) {
 	provider, model, _ := strings.Cut(p.Model, "/")
 	constructor := piadapter.New
 	if c.Role == "owner" {
@@ -42,22 +36,14 @@ func newModel(c Config, p profile) (Model, error) {
 	return &piModel{a, c.Workspace}, nil
 }
 func (m *piModel) Close() error { return m.adapter.Close() }
-func (m *piModel) Run(ctx context.Context, key, input string) (string, bool, error) {
-	return m.RunWithActivity(ctx, key, input, nil)
-}
-func (m *piModel) RunWithActivity(ctx context.Context, key, input string, report func(string)) (string, bool, error) {
-	return m.RunWithLaunch(ctx, key, input, report, nil)
-}
 func (m *piModel) RunWithLaunch(ctx context.Context, key, input string, report func(string), launched func() error) (string, bool, error) {
 	s, e := m.adapter.StartPrompt(ctx, harness.SessionRequest{ProjectPath: m.workspace, ChannelID: "swarm", ThreadTS: key, Prompt: input})
 	if e != nil {
 		return "", false, e
 	}
 	defer s.Close()
-	if launched != nil {
-		if err := launched(); err != nil {
-			return "", false, err
-		}
+	if err := launched(); err != nil {
+		return "", false, err
 	}
 	var final string
 	cancelled := false

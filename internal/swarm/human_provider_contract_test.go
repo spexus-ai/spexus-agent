@@ -47,16 +47,18 @@ func TestHumanActualProviderContract(t *testing.T) {
 	const thread = "1790000000.000001"
 	cfg := Config{TenantID: fixture.TenantID, ProjectID: fixture.ProjectID, WireVersion: 2,
 		Human:    &HumanConfig{BaseURL: fixture.BackendHTTPSURL, CAFile: fixture.CACertPath, TokenFile: fixture.TokenFilePath, EpicID: fixture.EpicID, WriterID: fixture.GatewayWriterID, WorkspaceID: workspace},
-		Features: []Feature{{FeatureID: featureID, TenantID: fixture.TenantID, ProjectID: fixture.ProjectID, OwnerAgentID: "owner", ChannelID: channel, ThreadTS: thread, AllowedActorIDs: []string{actor}}},
+		Features: []Feature{{FeatureID: featureID, TenantID: fixture.TenantID, ProjectID: fixture.ProjectID, OwnerAgentID: "orchestrator", ChannelID: channel, ThreadTS: thread, AllowedActorIDs: []string{actor}}},
 	}
-	for _, id := range []string{"owner", "worker-a", "worker-b"} {
+	profileBytes := map[string][]byte{}
+	for _, id := range []string{"orchestrator", "worker-a", "worker-b"} {
 		role := "worker"
-		if id == "owner" {
+		if id == "orchestrator" {
 			role = "owner"
 		}
 		cfg.Agents = append(cfg.Agents, AgentConfig{AgentID: id, Role: role, CredentialSHA256: Digest([]byte(NewID())), ProfileID: id})
-		cfg.Profiles = append(cfg.Profiles, ProfileSnapshot{Bytes: mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}})})
+		profileBytes[id] = mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}})
 	}
+	profileBackendFixture(t, &cfg, profileBytes)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	s, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"), cfg)

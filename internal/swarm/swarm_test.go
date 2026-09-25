@@ -25,19 +25,12 @@ type fixture struct {
 	feature   Feature
 	instances map[string]string
 	tokens    map[string]string
+	profiles  map[string]Profile
 }
 
-func profileBackendFixture(t *testing.T, cfg *Config) {
+func profileBackendFixture(t *testing.T, cfg *Config, profiles map[string][]byte) {
 	t.Helper()
-	profiles := map[string][]byte{}
 	claims := map[string]LaunchClaim{}
-	for _, snapshot := range cfg.Profiles {
-		var p TextProfile
-		if err := json.Unmarshal(snapshot.Bytes, &p); err != nil {
-			t.Fatal(err)
-		}
-		profiles[p.ID] = snapshot.Bytes
-	}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Tenant-ID") != cfg.TenantID || r.Header.Get("X-Project-ID") != cfg.ProjectID {
 			w.WriteHeader(403)
@@ -121,7 +114,8 @@ func profileBackendFixture(t *testing.T, cfg *Config) {
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	ctx := context.Background()
-	f := &fixture{t: t, instances: map[string]string{}, tokens: map[string]string{}}
+	f := &fixture{t: t, instances: map[string]string{}, tokens: map[string]string{}, profiles: map[string]Profile{}}
+	profileBytes := map[string][]byte{}
 	tenant, project := NewID(), NewID()
 	f.feature = Feature{FeatureID: NewID(), TenantID: tenant, ProjectID: project, OwnerAgentID: "orchestrator", ChannelID: "channel", ThreadTS: "123.4", AllowedActorIDs: []string{"human"}}
 	f.cfg = Config{TenantID: tenant, ProjectID: project, Features: []Feature{f.feature}}
@@ -134,9 +128,10 @@ func newFixture(t *testing.T) *fixture {
 		f.tokens[id] = token
 		f.instances[id] = NewID()
 		f.cfg.Agents = append(f.cfg.Agents, AgentConfig{AgentID: id, Role: role, CredentialSHA256: Digest([]byte(token)), ProfileID: id})
-		f.cfg.Profiles = append(f.cfg.Profiles, ProfileSnapshot{Bytes: mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return only JSON", Tools: []string{}, Extensions: []string{}})})
+		profileBytes[id] = mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return only JSON", Tools: []string{}, Extensions: []string{}})
+		f.profiles[id] = Profile{ID: id, Revision: Digest(profileBytes[id]), Generation: 1, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal"}
 	}
-	profileBackendFixture(t, &f.cfg)
+	profileBackendFixture(t, &f.cfg, profileBytes)
 	s, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"), f.cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -205,7 +200,7 @@ func (f *fixture) ownerTurn() string {
 }
 func (f *fixture) dispatch(turn, worker string) Envelope {
 	f.t.Helper()
-	return Envelope{ProtocolVersion: 1, MessageID: NewID(), Type: "task.dispatch", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: worker, OwnerTurnID: turn, JobID: NewID(), AttemptID: NewID(), SentAt: f.s.stamp(), Payload: mustJSON(DispatchPayload{Goal: "Compute result", Scope: "Only supplied text", ExpectedResult: []string{"Correct sum"}, Context: TaskContext{Text: worker + "-secret", Refs: []ContextRef{}}, Profile: f.s.profiles[worker], AcceptBy: f.s.now().UTC().Add(60 * time.Second).Format(time.RFC3339Nano), RunTimeoutSeconds: 600})}
+	return Envelope{ProtocolVersion: 1, MessageID: NewID(), Type: "task.dispatch", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: worker, OwnerTurnID: turn, JobID: NewID(), AttemptID: NewID(), SentAt: f.s.stamp(), Payload: mustJSON(DispatchPayload{Goal: "Compute result", Scope: "Only supplied text", ExpectedResult: []string{"Correct sum"}, Context: TaskContext{Text: worker + "-secret", Refs: []ContextRef{}}, Profile: f.profiles[worker], AcceptBy: f.s.now().UTC().Add(60 * time.Second).Format(time.RFC3339Nano), RunTimeoutSeconds: 600})}
 }
 func (f *fixture) event(d Envelope, kind string, payload any, causeID string) Envelope {
 	f.t.Helper()
@@ -213,7 +208,7 @@ func (f *fixture) event(d Envelope, kind string, payload any, causeID string) En
 }
 func (f *fixture) started(d Envelope) (Envelope, Envelope) {
 	f.t.Helper()
-	a := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.s.profiles[d.ToAgentID].Revision}, d.MessageID)
+	a := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.profiles[d.ToAgentID].Revision}, d.MessageID)
 	f.post(d.ToAgentID, a, 201)
 	start := f.event(d, "task.started", StartedPayload{a.MessageID}, a.MessageID)
 	f.post(d.ToAgentID, start, 201)
@@ -395,7 +390,7 @@ func TestDeadlinesFailUnavailableAndLateStartSeparately(t *testing.T) {
 	a, b := f.dispatch(turn, "worker-a"), f.dispatch(turn, "worker-b")
 	f.post("orchestrator", a, 201)
 	f.post("orchestrator", b, 201)
-	accepted := f.event(b, "task.accepted", AcceptedPayload{b.MessageID, f.s.profiles["worker-b"].Revision}, b.MessageID)
+	accepted := f.event(b, "task.accepted", AcceptedPayload{b.MessageID, f.profiles["worker-b"].Revision}, b.MessageID)
 	f.post("worker-b", accepted, 201)
 	now = now.Add(31 * time.Second)
 	late := f.event(b, "task.started", StartedPayload{accepted.MessageID}, accepted.MessageID)
@@ -423,7 +418,7 @@ func TestDeadlinesFailUnavailableAndLateStartSeparately(t *testing.T) {
 	if count != 2 {
 		t.Fatal("deadline duplicated terminal events")
 	}
-	lateAccepted := f.event(a, "task.accepted", AcceptedPayload{a.MessageID, f.s.profiles["worker-a"].Revision}, a.MessageID)
+	lateAccepted := f.event(a, "task.accepted", AcceptedPayload{a.MessageID, f.profiles["worker-a"].Revision}, a.MessageID)
 	f.post("worker-a", lateAccepted, 409)
 }
 func TestCommitFailureRollsBackJobAndDoesNotReturnReceipt(t *testing.T) {
@@ -471,7 +466,7 @@ func TestMailboxAtomicACKBoundsAndTerminalReserve(t *testing.T) {
 	d := f.dispatch(turn, "worker-a")
 	f.post("orchestrator", d, 201)
 	f.s.mailboxLimit = 1
-	accepted := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.s.profiles["worker-a"].Revision}, d.MessageID)
+	accepted := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.profiles["worker-a"].Revision}, d.MessageID)
 	ar := f.post("worker-a", accepted, 201)
 	// A full ordinary mailbox rejects the whole transition, including its state change.
 	started := f.event(d, "task.started", StartedPayload{accepted.MessageID}, accepted.MessageID)
@@ -612,7 +607,7 @@ func TestPendingTerminalNotificationKeepsSequenceAndFIFO(t *testing.T) {
 	owner := f.ownerTurn()
 	d := f.dispatch(owner, "worker-a")
 	f.post("orchestrator", d, 201)
-	accepted := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.s.profiles["worker-a"].Revision}, d.MessageID)
+	accepted := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.profiles["worker-a"].Revision}, d.MessageID)
 	ar := f.post("worker-a", accepted, 201)
 	f.call("orchestrator", "POST", "/acks", AckRequest{[]int64{ar.MailboxSeq}}, 200)
 	start := f.event(d, "task.started", StartedPayload{accepted.MessageID}, accepted.MessageID)

@@ -51,9 +51,6 @@ func TestWebProfileJournalNeverDuplicatesUnknownLaunch(t *testing.T) {
 	if err := j.launch(seq); err == nil {
 		t.Fatal("duplicate launch accepted")
 	}
-	if err := j.recover(); err != nil {
-		t.Fatal(err)
-	}
 	if obs, err := j.pendingProfileObservations(); err != nil || len(obs) != 0 {
 		t.Fatalf("unknown launch generated observation: %+v %v", obs, err)
 	}
@@ -65,6 +62,26 @@ func TestWebProfileJournalNeverDuplicatesUnknownLaunch(t *testing.T) {
 	}
 	if err := j.observed(seq, claim.ClaimID); err != nil {
 		t.Fatal(err)
+	}
+	if err := j.correctionLaunch(seq); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.correctionLaunch(seq); err == nil {
+		t.Fatal("duplicate correction launch accepted")
+	}
+	if err := j.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if obs, err := j.pendingProfileObservations(); err != nil || len(obs) != 0 {
+		t.Fatalf("unknown correction launch generated observation: %+v %v", obs, err)
+	}
+	var source, revision, model, reasoning string
+	var snapshot []byte
+	if err := j.db.QueryRow(`SELECT source,revision,model,reasoning,snapshot FROM profile_launches WHERE seq=?`, seq).Scan(&source, &revision, &model, &reasoning, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if source != "web" || revision != p.Revision || model != p.Model || reasoning != p.Reasoning || string(snapshot) != string(p.Bytes) {
+		t.Fatal("correction changed pinned web profile")
 	}
 	if obs, err := j.pendingProfileObservations(); err != nil || len(obs) != 0 {
 		t.Fatalf("observation remained pending: %+v %v", obs, err)

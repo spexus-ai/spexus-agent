@@ -9,7 +9,7 @@ import (
 
 func finishReviewedResult(t *testing.T, f *fixture, dispatch Envelope, verdict, reply string, beforeFinish ...func()) (string, OwnerFinishRequest, OwnerFinishReceipt) {
 	t.Helper()
-	accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.s.profiles[dispatch.ToAgentID].Revision}, dispatch.MessageID)
+	accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.profiles[dispatch.ToAgentID].Revision}, dispatch.MessageID)
 	accepted.ProtocolVersion = 2
 	f.post(dispatch.ToAgentID, accepted, 201)
 	started := f.event(dispatch, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)
@@ -75,7 +75,7 @@ func TestActionFreeReplyCannotCompleteUnreviewedResult(t *testing.T) {
 	dispatch.ProtocolVersion = f.s.wireVersion()
 	f.post("orchestrator", dispatch, 201)
 	f.finish(initial, "", []ActionReceipt{{MessageID: dispatch.MessageID, Status: "stored"}}, 201)
-	accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.s.profiles[dispatch.ToAgentID].Revision}, dispatch.MessageID)
+	accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.profiles[dispatch.ToAgentID].Revision}, dispatch.MessageID)
 	accepted.ProtocolVersion = f.s.wireVersion()
 	f.post(dispatch.ToAgentID, accepted, 201)
 	started := f.event(dispatch, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)
@@ -228,7 +228,7 @@ func TestDeniedEarlierJobDoesNotBlockNewIndependentFinalReply(t *testing.T) {
 	blocked.ProtocolVersion = 2
 	f.post("orchestrator", blocked, 201)
 	f.finish(initial, "", []ActionReceipt{{MessageID: blocked.MessageID, Status: "stored"}}, 201)
-	accepted := f.event(blocked, "task.accepted", AcceptedPayload{DispatchMessageID: blocked.MessageID, ProfileRevision: f.s.profiles[blocked.ToAgentID].Revision}, blocked.MessageID)
+	accepted := f.event(blocked, "task.accepted", AcceptedPayload{DispatchMessageID: blocked.MessageID, ProfileRevision: f.profiles[blocked.ToAgentID].Revision}, blocked.MessageID)
 	accepted.ProtocolVersion = 2
 	f.post(blocked.ToAgentID, accepted, 201)
 	started := f.event(blocked, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)

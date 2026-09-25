@@ -34,7 +34,7 @@ func TestWebCoordinatorClaimsRequireLocalTypedExecution(t *testing.T) {
 	turnID := f.ownerTurn()
 	worker := f.dispatch(turnID, "worker-a")
 	f.post("orchestrator", worker, 201)
-	base := LaunchClaimRequest{SchemaVersion: 1, ExecutionRef: ExecutionRef{WorkerAttemptID: worker.AttemptID}, ExpectedGeneration: 1, ExpectedRevision: f.s.profiles["worker-a"].Revision}
+	base := LaunchClaimRequest{SchemaVersion: 1, ExecutionRef: ExecutionRef{WorkerAttemptID: worker.AttemptID}, ExpectedGeneration: 1, ExpectedRevision: f.profiles["worker-a"].Revision}
 	f.call("worker-a", "POST", "/agent-profiles/worker-a/launch-claims", base, 409)
 	accepted := f.event(worker, "task.accepted", AcceptedPayload{DispatchMessageID: worker.MessageID, ProfileRevision: base.ExpectedRevision}, worker.MessageID)
 	f.post("worker-a", accepted, 201)
@@ -45,7 +45,7 @@ func TestWebCoordinatorClaimsRequireLocalTypedExecution(t *testing.T) {
 	if claim.ExecutionRef != base.ExecutionRef || claim.Revision != base.ExpectedRevision || claim.Generation != 1 {
 		t.Fatalf("claim changed execution identity: %+v", claim)
 	}
-	ownerRequest := LaunchClaimRequest{SchemaVersion: 1, ExecutionRef: ExecutionRef{OwnerTurnID: turnID}, ExpectedGeneration: 1, ExpectedRevision: f.s.profiles["orchestrator"].Revision}
+	ownerRequest := LaunchClaimRequest{SchemaVersion: 1, ExecutionRef: ExecutionRef{OwnerTurnID: turnID}, ExpectedGeneration: 1, ExpectedRevision: f.profiles["orchestrator"].Revision}
 	f.call("worker-a", "POST", "/agent-profiles/worker-a/launch-claims", ownerRequest, 409)
 	f.call("orchestrator", "POST", "/agent-profiles/orchestrator/launch-claims", ownerRequest, 201)
 }

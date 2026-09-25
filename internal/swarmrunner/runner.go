@@ -20,7 +20,7 @@ type Runner struct {
 	targets       []targetProfile
 	client        *Client
 	journal       *Journal
-	model         Model
+	model         LaunchModel
 	mu            sync.Mutex
 	active        swarm.Delivery
 	cancel        context.CancelFunc
@@ -288,7 +288,7 @@ func (r *Runner) current(ctx context.Context, d swarm.Delivery) (swarm.Attempt, 
 	}
 	return swarm.Attempt{}, errors.New("foreign_attempt")
 }
-func (r *Runner) run(ctx context.Context, d swarm.Delivery, input string, p profile, claim swarm.LaunchClaim) (string, bool, error) {
+func (r *Runner) run(ctx context.Context, d swarm.Delivery, input string, p profile, claim swarm.LaunchClaim, correction bool) (string, bool, error) {
 	runctx, cancel := context.WithCancel(ctx)
 	r.mu.Lock()
 	r.active = d
@@ -315,7 +315,12 @@ func (r *Runner) run(ctx context.Context, d swarm.Delivery, input string, p prof
 	if control != nil {
 		return "", true, nil
 	}
-	if e = r.journal.launch(d.MailboxSeq); e != nil {
+	if correction {
+		e = r.journal.correctionLaunch(d.MailboxSeq)
+	} else {
+		e = r.journal.launch(d.MailboxSeq)
+	}
+	if e != nil {
 		return "", false, e
 	}
 	model := r.model
@@ -337,19 +342,7 @@ func (r *Runner) run(ctx context.Context, d swarm.Delivery, input string, p prof
 		}
 		return r.observeLaunch(runctx, d, p, claim)
 	}
-	if m, ok := model.(LaunchModel); ok {
-		output, cancelled, e = m.RunWithLaunch(runctx, sessionKey, input, r.reportActivity, launched)
-	} else if m, ok := model.(ActivityModel); ok {
-		if e = launched(); e != nil {
-			return "", false, e
-		}
-		output, cancelled, e = m.RunWithActivity(runctx, sessionKey, input, r.reportActivity)
-	} else {
-		if e = launched(); e != nil {
-			return "", false, e
-		}
-		output, cancelled, e = model.Run(runctx, sessionKey, input)
-	}
+	output, cancelled, e = model.RunWithLaunch(runctx, sessionKey, input, r.reportActivity, launched)
 	return output, cancelled, e
 }
 func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
@@ -420,7 +413,7 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 	if e != nil {
 		return e
 	}
-	raw, cancelled, runErr := r.run(ctx, d, input, prelaunch, claim)
+	raw, cancelled, runErr := r.run(ctx, d, input, prelaunch, claim, false)
 	if e := r.journal.modelOutput(d.MailboxSeq, raw); e != nil {
 		return e
 	}
@@ -431,6 +424,19 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 		result = failedResult("model_execution_failed")
 	} else {
 		result, e = r.workerResult(d, raw)
+		if e != nil && ctx.Err() == nil {
+			correction := input + "\nYour preceding FINAL JSON failed strict validation. Return the complete corrected JSON object only. For a blocked result, blocker has exactly reason, context, question, options, recommendation and kind; never add dependency_id or blocked_work. The runtime creates IDs. Do not claim that the work was completed."
+			corrected, wasCancelled, retryErr := r.run(ctx, d, correction, prelaunch, claim, true)
+			cancelled, runErr = wasCancelled, retryErr
+			if corrected != "" {
+				if journalErr := r.journal.modelOutput(d.MailboxSeq, corrected); journalErr != nil {
+					return journalErr
+				}
+			}
+			if !cancelled && runErr == nil {
+				result, e = r.workerResult(d, corrected)
+			}
+		}
 		if cancelled {
 			result = cancelResult(false, nil)
 		} else if runErr != nil {
@@ -549,7 +555,7 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 	if e != nil {
 		return e
 	}
-	raw, cancelled, runErr := r.run(ctx, d, input, prelaunch, claim)
+	raw, cancelled, runErr := r.run(ctx, d, input, prelaunch, claim, false)
 	if e := r.journal.modelOutput(d.MailboxSeq, raw); e != nil {
 		return e
 	}
@@ -573,6 +579,7 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 				}
 			}
 		}
+		var reviewErr *reviewPreflightError
 		summaryMissing := false
 		if outputErr == nil && d.Type == "task.result" && len(messages) == 0 && strings.TrimSpace(ownerResult.Reply) == "" {
 			job, jobErr := r.job(ctx, d.JobID)
@@ -583,6 +590,37 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 		}
 		if summaryMissing {
 			outputErr = errors.New("empty final summary")
+		}
+		if (errors.As(outputErr, &reviewErr) || summaryMissing) && ctx.Err() == nil {
+			correction := input + "\nYour preceding FINAL JSON was rejected before any actions were published: "
+			if summaryMissing {
+				correction += "The final reply was empty. This result was already accepted; return actions:[] and a concise, nonempty human-facing summary of the recorded results."
+			} else {
+				correction += reviewErr.Error() + ". Return a complete corrected FINAL JSON. For a pending task.result, review only this event's job_id, attempt_id and message_id; do not repeat reviews of earlier attempts. If the trusted job shows this result was already accepted, return actions:[] and only summarize the recorded outcome."
+			}
+			corrected, wasCancelled, retryErr := r.run(ctx, d, correction, prelaunch, claim, true)
+			cancelled, runErr = wasCancelled, retryErr
+			if corrected != "" {
+				raw = corrected
+				if err := r.journal.modelOutput(d.MailboxSeq, raw); err != nil {
+					return err
+				}
+			}
+			if !cancelled && runErr == nil {
+				ownerResult, messages, outputErr = r.ownerActions(d, turn, corrected)
+				if outputErr != nil && d.Type == "task.result" {
+					job, jobErr := r.job(ctx, d.JobID)
+					if jobErr != nil {
+						return jobErr
+					}
+					if reviewedTrigger(d, job) {
+						if reply, ok := plainSummary(corrected); ok {
+							ownerResult = ownerOutput{Actions: []action{}, Reply: reply}
+							messages, outputErr = nil, nil
+						}
+					}
+				}
+			}
 		}
 	}
 	if cancelled {

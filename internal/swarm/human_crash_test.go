@@ -19,7 +19,7 @@ func TestHumanContinuationCommitLostReceiptAndRestart(t *testing.T) {
 	dispatch.ProtocolVersion = 2
 	f.post("orchestrator", dispatch, 201)
 	f.finish(initial, "", []ActionReceipt{{MessageID: dispatch.MessageID, Status: "stored"}}, 201)
-	accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.s.profiles["worker-a"].Revision}, dispatch.MessageID)
+	accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.profiles["worker-a"].Revision}, dispatch.MessageID)
 	accepted.ProtocolVersion = 2
 	f.post("worker-a", accepted, 201)
 	started := f.event(dispatch, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)

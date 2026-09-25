@@ -22,7 +22,6 @@ type Store struct {
 	lock           *os.File
 	cfg            Config
 	profileBackend *profileBackend
-	profiles       map[string]Profile // fixture assertions only; never an execution source
 	now            func() time.Time
 	mailboxLimit   int
 	mailboxBytes   int
@@ -54,7 +53,6 @@ const schema = `
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS scope (id INTEGER PRIMARY KEY CHECK(id=1),tenant_id TEXT NOT NULL,project_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (agent_id TEXT PRIMARY KEY,role TEXT NOT NULL,credential_sha256 TEXT NOT NULL,profile_id TEXT NOT NULL,instance_id TEXT NOT NULL DEFAULT '',heartbeat TEXT);
-CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY,revision TEXT NOT NULL,snapshot BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS features (id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,project_id TEXT NOT NULL,owner_agent_id TEXT NOT NULL REFERENCES agents(agent_id),data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY,feature_id TEXT NOT NULL REFERENCES features(id),current_attempt_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS attempts (seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,job_id TEXT NOT NULL REFERENCES jobs(id),agent_id TEXT NOT NULL REFERENCES agents(agent_id),state TEXT NOT NULL,data BLOB NOT NULL);
@@ -120,13 +118,7 @@ func openStore(ctx context.Context, path string, cfg Config, serviceStart bool) 
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{db: db, lock: lock, cfg: cfg, profiles: map[string]Profile{}, now: time.Now, mailboxLimit: 1000, mailboxBytes: 10 * 1024 * 1024, mailboxReserve: 40, humanWake: make(chan struct{}, 1), slackWake: make(chan struct{}, 1)}
-	for _, snapshot := range cfg.Profiles {
-		var p TextProfile
-		if json.Unmarshal(snapshot.Bytes, &p) == nil {
-			s.profiles[p.ID] = Profile{ID: p.ID, Revision: Digest(snapshot.Bytes), Generation: 1, Model: p.Model, Reasoning: p.Reasoning}
-		}
-	}
+	s := &Store{db: db, lock: lock, cfg: cfg, now: time.Now, mailboxLimit: 1000, mailboxBytes: 10 * 1024 * 1024, mailboxReserve: 40, humanWake: make(chan struct{}, 1), slackWake: make(chan struct{}, 1)}
 	s.profileBackend, err = newProfileBackend(cfg.AgentProfiles, cfg.TenantID, cfg.ProjectID)
 	if err != nil {
 		s.Close()

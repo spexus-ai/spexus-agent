@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,36 +28,46 @@ type modelFunc func(context.Context, string, string) (string, bool, error)
 func (f modelFunc) Run(ctx context.Context, key, input string) (string, bool, error) {
 	return f(ctx, key, input)
 }
-func profileFixture(t *testing.T) (profile, string) {
+func (f modelFunc) RunWithLaunch(ctx context.Context, key, input string, _ func(string), launched func() error) (string, bool, error) {
+	if err := launched(); err != nil {
+		return "", false, err
+	}
+	return f(ctx, key, input)
+}
+func profileFixture(t *testing.T) profile {
 	t.Helper()
 	p := swarm.TextProfile{ID: "worker-a", Model: "test/model", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}}
 	b, _ := json.Marshal(p)
-	file := filepath.Join(t.TempDir(), "profile.json")
-	if e := os.WriteFile(file, b, 0600); e != nil {
-		t.Fatal(e)
-	}
-	return profile{TextProfile: p, Revision: swarm.Digest(b), Generation: 1, Bytes: b}, file
+	return profile{TextProfile: p, Revision: swarm.Digest(b), Generation: 1, Bytes: b}
 }
 func runnerFixture(t *testing.T, handler http.Handler) (*Runner, *httptest.Server) {
 	t.Helper()
-	p, file := profileFixture(t)
+	p := profileFixture(t)
+	ownerText := swarm.TextProfile{ID: "orchestrator", Model: p.Model, Reasoning: p.Reasoning, Prompt: p.Prompt, Tools: []string{}, Extensions: []string{}}
+	ownerRaw, _ := json.Marshal(ownerText)
+	owner := profile{TextProfile: ownerText, Revision: swarm.Digest(ownerRaw), Generation: 1, Bytes: ownerRaw}
 	claimID := swarm.NewID()
 	wrapper := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		path := q.URL.Path
-		if path == swarm.APIPrefix+"/agent-profiles/worker-a/active" {
-			writeJSON(w, swarm.ActiveProfile{Slot: "worker-a", Role: "worker", ProfileID: "worker-a", Enabled: true, Generation: 1, ActiveRevision: p.Revision, SnapshotJSON: p.Bytes, SnapshotBytesBase64: base64.StdEncoding.EncodeToString(p.Bytes), AllowedModels: []string{p.Model}})
+		selected := p
+		slot, role := "worker-a", "worker"
+		if strings.Contains(path, "/agent-profiles/orchestrator/") {
+			selected, slot, role = owner, "owner", "owner"
+		}
+		if path == swarm.APIPrefix+"/agent-profiles/"+selected.ID+"/active" {
+			writeJSON(w, swarm.ActiveProfile{Slot: slot, Role: role, ProfileID: selected.ID, Enabled: true, Generation: 1, ActiveRevision: selected.Revision, SnapshotJSON: selected.Bytes, SnapshotBytesBase64: base64.StdEncoding.EncodeToString(selected.Bytes), AllowedModels: []string{selected.Model}})
 			return
 		}
-		if path == swarm.APIPrefix+"/agent-profiles/worker-a/launch-claims" {
+		if path == swarm.APIPrefix+"/agent-profiles/"+selected.ID+"/launch-claims" {
 			var request swarm.LaunchClaimRequest
 			if err := json.NewDecoder(q.Body).Decode(&request); err != nil {
 				t.Error(err)
 			}
-			writeJSON(w, swarm.LaunchClaim{ClaimID: claimID, ExecutionRef: request.ExecutionRef, ProfileID: "worker-a", Generation: 1, Revision: p.Revision, SnapshotJSON: p.Bytes, SnapshotBytesBase64: base64.StdEncoding.EncodeToString(p.Bytes), State: "starting"})
+			writeJSON(w, swarm.LaunchClaim{ClaimID: claimID, ExecutionRef: request.ExecutionRef, ProfileID: selected.ID, Generation: 1, Revision: selected.Revision, SnapshotJSON: selected.Bytes, SnapshotBytesBase64: base64.StdEncoding.EncodeToString(selected.Bytes), State: "starting"})
 			return
 		}
-		if path == swarm.APIPrefix+"/agent-profiles/worker-a/observations" {
-			writeJSON(w, map[string]any{"profile_id": "worker-a", "claim_id": claimID, "revision": p.Revision, "outcome": "launched"})
+		if path == swarm.APIPrefix+"/agent-profiles/"+selected.ID+"/observations" {
+			writeJSON(w, map[string]any{"profile_id": selected.ID, "claim_id": claimID, "revision": selected.Revision, "outcome": "launched"})
 			return
 		}
 		handler.ServeHTTP(w, q)
@@ -71,7 +79,7 @@ func runnerFixture(t *testing.T, handler http.Handler) (*Runner, *httptest.Serve
 		t.Fatal(e)
 	}
 	t.Cleanup(func() { j.Close() })
-	r := &Runner{cfg: Config{TenantID: tenant, ProjectID: project, AgentID: "worker-a", InstanceID: swarm.NewID(), Role: "worker", ProfileID: "worker-a", AvailableModels: []string{p.Model}, ProfileFile: file}, profile: p, journal: j, client: &Client{http: s.Client(), base: s.URL + swarm.APIPrefix, token: "fixture", instance: swarm.NewID()}}
+	r := &Runner{cfg: Config{TenantID: tenant, ProjectID: project, AgentID: "worker-a", InstanceID: swarm.NewID(), Role: "worker", ProfileID: "worker-a", AvailableModels: []string{p.Model}}, profile: p, journal: j, client: &Client{http: s.Client(), base: s.URL + swarm.APIPrefix, token: "fixture", instance: swarm.NewID()}}
 	return r, s
 }
 func dispatchFixture(r *Runner) swarm.Delivery {
@@ -90,7 +98,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func TestWorkerRejectsMalformedBlockedResultWithoutSecondLaunch(t *testing.T) {
+func TestWorkerRejectsMalformedBlockedResultAfterOneCorrection(t *testing.T) {
 	var acceptedID string
 	var published []swarm.ResultPayload
 	handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
@@ -135,7 +143,7 @@ func TestWorkerRejectsMalformedBlockedResultWithoutSecondLaunch(t *testing.T) {
 	if err := r.process(ctx, d); err != nil {
 		t.Fatal(err)
 	}
-	if launches != 1 || len(published) != 1 || published[0].Outcome != "failed" {
+	if launches != 2 || len(published) != 1 || published[0].Outcome != "failed" {
 		t.Fatalf("launches=%d results=%+v", launches, published)
 	}
 }
@@ -380,6 +388,7 @@ func TestBookkeepingAndSessionIsolation(t *testing.T) {
 		t.Fatal("worker job reused session")
 	}
 	r.cfg.Role = "owner"
+	r.cfg.ProfileID = "orchestrator"
 	if r.cfg.session(a) != r.cfg.session(b) {
 		t.Fatal("same feature owner lost history")
 	}
@@ -391,6 +400,7 @@ func TestBookkeepingAndSessionIsolation(t *testing.T) {
 func TestOwnerWholeOutputValidatedBeforeAnyAction(t *testing.T) {
 	r, _ := runnerFixture(t, http.NotFoundHandler())
 	r.cfg.Role = "owner"
+	r.cfg.ProfileID = "orchestrator"
 	r.cfg.AgentID = "owner"
 	r.cfg.Targets = []Target{{AgentID: "worker-a", ProfileID: "worker-a"}}
 	r.targets = []targetProfile{{"worker-a", r.profile.wire()}}
@@ -427,10 +437,7 @@ func TestProfileAndOutputValidation(t *testing.T) {
 		_ = json.Unmarshal(b, &v)
 		v["tools"] = tools
 		b, _ = json.Marshal(v)
-		if e := os.WriteFile(r.cfg.ProfileFile, b, 0600); e != nil {
-			t.Fatal(e)
-		}
-		if _, e := loadProfile(r.cfg.ProfileFile); e == nil {
+		if _, e := swarm.ValidateWebTextProfile(b); e == nil {
 			t.Fatal("unsafe profile admitted")
 		}
 	}
@@ -496,9 +503,9 @@ func TestOwnerTurnControlCancelsActivePiBeforeACK(t *testing.T) {
 		}
 	})
 	r, _ = runnerFixture(t, handler)
-	r.cfg.Role, r.cfg.AgentID = "owner", "owner"
+	r.cfg.Role, r.cfg.AgentID, r.cfg.ProfileID = "owner", "orchestrator", "orchestrator"
 	turnID := swarm.NewID()
-	d = swarm.Delivery{Envelope: swarm.Envelope{ProtocolVersion: 1, MessageID: swarm.NewID(), Type: "turn.cancel", TenantID: tenant, ProjectID: project, FeatureID: feature, FromAgentID: "coordinator", ToAgentID: "owner", OwnerTurnID: turnID, SentAt: time.Now().UTC().Format(time.RFC3339Nano)}, MailboxSeq: 1}
+	d = swarm.Delivery{Envelope: swarm.Envelope{ProtocolVersion: 1, MessageID: swarm.NewID(), Type: "turn.cancel", TenantID: tenant, ProjectID: project, FeatureID: feature, FromAgentID: "coordinator", ToAgentID: "orchestrator", OwnerTurnID: turnID, SentAt: time.Now().UTC().Format(time.RFC3339Nano)}, MailboxSeq: 1}
 	d.Payload, _ = json.Marshal(swarm.CancelPayload{Reason: "urgent Slack message", RequestedBy: "human"})
 	r.active = swarm.Delivery{Envelope: swarm.Envelope{FeatureID: feature, OwnerTurnID: turnID}}
 	r.cancel = func() { cancelled.Store(true) }
@@ -517,7 +524,7 @@ func TestUrgentInputWinsRunnerJournalAndDeferredOrdinaryIsRetained(t *testing.T)
 		}
 		w.WriteHeader(404)
 	}))
-	r.cfg.Role, r.cfg.AgentID = "owner", "owner"
+	r.cfg.Role, r.cfg.AgentID, r.cfg.ProfileID = "owner", "orchestrator", "orchestrator"
 	delivery := func(seq int64, text string) swarm.Delivery {
 		payload, _ := json.Marshal(swarm.InputPayload{Text: text, Source: swarm.Source{Kind: "slack", EventID: fmt.Sprintf("source-%d", seq), ChannelID: "C", ThreadTS: "1.1", ActorID: "U"}})
 		return swarm.Delivery{Envelope: swarm.Envelope{ProtocolVersion: 1, MessageID: swarm.NewID(), Type: "agent.input", TenantID: tenant, ProjectID: project, FeatureID: feature, FromAgentID: "coordinator", ToAgentID: "owner", SentAt: time.Now().UTC().Format(time.RFC3339Nano), Payload: payload}, MailboxSeq: seq}
@@ -612,6 +619,7 @@ func TestOwnerReviewEvidenceRequiresObjects(t *testing.T) {
 		writeJSON(w, swarm.JobView{JobID: job, FeatureID: feature, CurrentAttemptID: attempt, Attempts: []swarm.Attempt{{AttemptID: attempt, AssignedAgentID: "worker-a", State: "succeeded", Review: "pending", ResultMessageID: resultID}}})
 	}))
 	r.cfg.Role = "owner"
+	r.cfg.ProfileID = "orchestrator"
 	r.cfg.AgentID = "owner"
 	d := dispatchFixture(r)
 	d.Type, d.MessageID = "task.result", resultID
@@ -643,7 +651,7 @@ func TestOwnerCannotSkipSuccessfulResultReview(t *testing.T) {
 	r, _ := runnerFixture(t, http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		writeJSON(w, swarm.JobView{JobID: job, FeatureID: feature, CurrentAttemptID: attempt, Attempts: []swarm.Attempt{{AttemptID: attempt, AssignedAgentID: "worker-a", State: "succeeded", Review: "pending", ResultMessageID: resultID, Result: &swarm.ResultPayload{Outcome: "succeeded", Summary: "file changed", Evidence: []swarm.Evidence{}}}}})
 	}))
-	r.cfg.Role, r.cfg.AgentID = "owner", "owner"
+	r.cfg.Role, r.cfg.AgentID, r.cfg.ProfileID = "owner", "orchestrator", "orchestrator"
 	d := dispatchFixture(r)
 	d.Type, d.MessageID = "task.result", resultID
 	if _, actions, err := r.ownerActions(d, swarm.NewID(), `{"actions":[],"reply":"Done."}`); err == nil || actions != nil {
@@ -694,7 +702,7 @@ func TestOwnerCorrectsStaleReviewBeforePublication(t *testing.T) {
 				}
 			})
 			r, _ := runnerFixture(t, handler)
-			r.cfg.Role, r.cfg.AgentID = "owner", "owner"
+			r.cfg.Role, r.cfg.AgentID, r.cfg.ProfileID = "owner", "orchestrator", "orchestrator"
 			r.targets = []targetProfile{{AgentID: "worker-a", Profile: r.profile.wire()}}
 			d := dispatchFixture(r)
 			d.Type, d.MessageID, d.ToAgentID = "task.result", resultA, "owner"
@@ -797,7 +805,7 @@ func TestAcceptedTaskResultRecoveryIsSummaryOnly(t *testing.T) {
 					}
 				})
 				r, _ := runnerFixture(t, handler)
-				r.cfg.Role, r.cfg.AgentID = "owner", "owner"
+				r.cfg.Role, r.cfg.AgentID, r.cfg.ProfileID = "owner", "orchestrator", "orchestrator"
 				d := dispatchFixture(r)
 				d.Type, d.MessageID, d.ToAgentID = "task.result", resultID, "owner"
 				d.MailboxSeq = 2

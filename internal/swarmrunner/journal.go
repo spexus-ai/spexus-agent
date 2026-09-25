@@ -103,7 +103,7 @@ func OpenJournal(dir string, version ...int) (*Journal, error) {
 		seq INTEGER PRIMARY KEY REFERENCES inbox(seq), profile_id TEXT NOT NULL,
 		ref_type TEXT NOT NULL, ref_id TEXT NOT NULL, claim_id TEXT NOT NULL,
 		generation INTEGER NOT NULL, revision TEXT NOT NULL, snapshot BLOB NOT NULL,
-		model TEXT NOT NULL, reasoning TEXT NOT NULL, state TEXT NOT NULL,
+		model TEXT NOT NULL, reasoning TEXT NOT NULL, source TEXT NOT NULL CHECK(source='web'), state TEXT NOT NULL,
 		launched_at TEXT NOT NULL DEFAULT '',
 		UNIQUE(ref_type,ref_id));`)
 	if e != nil {
@@ -226,13 +226,41 @@ func (j *Journal) launch(seq int64) error {
 	}
 	return tx.Commit()
 }
+
+// A completed, observed first prompt may need one strict-output correction.
+// This transition is called only in the same live execution; recovery never
+// schedules a second prompt. A crash while it is launching remains unknown.
+func (j *Journal) correctionLaunch(seq int64) error {
+	tx, err := j.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	r, err := tx.Exec(`UPDATE profile_launches SET state='launching' WHERE seq=? AND state='observed'`, seq)
+	if err != nil {
+		return err
+	}
+	n, err := r.RowsAffected()
+	if err != nil || n != 1 {
+		return errors.New("correction requires observed first launch")
+	}
+	r, err = tx.Exec(`UPDATE inbox SET launches=2 WHERE seq=? AND state='starting' AND launches=1`, seq)
+	if err != nil {
+		return err
+	}
+	n, err = r.RowsAffected()
+	if err != nil || n != 1 {
+		return errors.New("duplicate correction launch")
+	}
+	return tx.Commit()
+}
 func (j *Journal) pin(seq int64, p profile, claim swarm.LaunchClaim, ref swarm.ExecutionRef) error {
 	refType, refID := "worker_attempt", ref.WorkerAttemptID
 	if ref.OwnerTurnID != "" {
 		refType, refID = "owner_turn", ref.OwnerTurnID
 	}
-	_, err := j.db.Exec(`INSERT INTO profile_launches(seq,profile_id,ref_type,ref_id,claim_id,generation,revision,snapshot,model,reasoning,state)
-		VALUES(?,?,?,?,?,?,?,?,?,?,'claimed')`, seq, p.ID, refType, refID, claim.ClaimID, p.Generation, p.Revision, p.Bytes, p.Model, p.Reasoning)
+	_, err := j.db.Exec(`INSERT INTO profile_launches(seq,profile_id,ref_type,ref_id,claim_id,generation,revision,snapshot,model,reasoning,source,state)
+		VALUES(?,?,?,?,?,?,?,?,?,?,'web','claimed')`, seq, p.ID, refType, refID, claim.ClaimID, p.Generation, p.Revision, p.Bytes, p.Model, p.Reasoning)
 	return err
 }
 func (j *Journal) observed(seq int64, claimID string) error {

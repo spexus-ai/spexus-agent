@@ -18,9 +18,8 @@ import (
 )
 
 type Target struct {
-	AgentID     string `json:"agent_id"`
-	ProfileID   string `json:"profile_id"`
-	ProfileFile string `json:"-"` // offline fixture only; runtime JSON rejects profile_file
+	AgentID   string `json:"agent_id"`
+	ProfileID string `json:"profile_id"`
 }
 type Config struct {
 	WireVersion     int      `json:"wire_version,omitempty"`
@@ -33,7 +32,6 @@ type Config struct {
 	InstanceID      string   `json:"instance_id"`
 	Role            string   `json:"role"`
 	ProfileID       string   `json:"profile_id"`
-	ProfileFile     string   `json:"-"` // offline fixture only; runtime JSON rejects profile_file
 	StateDirectory  string   `json:"state_directory"`
 	Workspace       string   `json:"workspace"`
 	PiBinary        string   `json:"pi_binary"`
@@ -149,18 +147,6 @@ func profileFromActive(active swarm.ActiveProfile, expectedID string, available 
 	return p, nil
 }
 
-// loadProfile validates one operator import file; the runner never loads it.
-func loadProfile(path string) (profile, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return profile{}, err
-	}
-	p, err := swarm.ValidateTextProfile(b)
-	if err != nil {
-		return profile{}, err
-	}
-	return profile{TextProfile: p, Revision: swarm.Digest(b), Bytes: b}, nil
-}
 func (p profile) wire() swarm.Profile {
 	return swarm.Profile{ID: p.ID, Revision: p.Revision, Generation: p.Generation, Model: p.Model, Reasoning: p.Reasoning}
 }

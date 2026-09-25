@@ -229,25 +229,18 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	dir := t.TempDir()
-	ids := []string{swarm.NewID(), swarm.NewID(), swarm.NewID()}
+	ids := []string{"orchestrator", "worker-a", "worker-b"}
 	instances := []string{swarm.NewID(), swarm.NewID(), swarm.NewID()}
 	tokens := []string{swarm.NewID(), swarm.NewID(), swarm.NewID()}
 	cfg := swarm.Config{TenantID: provider.Tenant, ProjectID: provider.Project, WireVersion: 2, Human: &swarm.HumanConfig{BaseURL: provider.URL, CAFile: provider.CA, TokenFile: provider.Token, EpicID: provider.Epic, WriterID: provider.Writer, WorkspaceID: "W-P3-INTEGRATION"}}
-	profiles := make([]string, 3)
 	for i := range ids {
 		role := "worker"
 		if i == 0 {
 			role = "owner"
 		}
-		p := swarm.TextProfile{ID: fmt.Sprintf("%s-%d", role, i), Model: "fixture/test", Reasoning: "minimal", Prompt: "Text-only fixture", Tools: []string{}, Extensions: []string{}}
-		b, _ := json.Marshal(p)
-		profiles[i] = filepath.Join(dir, fmt.Sprintf("profile-%d.json", i))
-		if err = os.WriteFile(profiles[i], b, 0600); err != nil {
-			t.Fatal(err)
-		}
-		cfg.Profiles = append(cfg.Profiles, swarm.ProfileSnapshot{Bytes: b})
-		cfg.Agents = append(cfg.Agents, swarm.AgentConfig{AgentID: ids[i], Role: role, CredentialSHA256: swarm.Digest([]byte(tokens[i])), ProfileID: p.ID})
+		cfg.Agents = append(cfg.Agents, swarm.AgentConfig{AgentID: ids[i], Role: role, CredentialSHA256: swarm.Digest([]byte(tokens[i])), ProfileID: ids[i]})
 	}
+	profileServiceFixture(t, &cfg, "fixture/test")
 	// The provider keeps Slack source identities across test runs. Give every
 	// run its own realistic thread/message timestamps and event IDs so retries
 	// never conflict with previously committed PostgreSQL decisions.
@@ -296,9 +289,9 @@ func TestHumanEndToEndWithActualProvider(t *testing.T) {
 			t.Fatal(err)
 		}
 		states[i] = filepath.Join(private, "state")
-		rc := swarmrunner.Config{WireVersion: 2, CoordinatorURL: server.URL, CAFile: caPath, CredentialFile: credential, TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, AgentID: ids[i], InstanceID: instances[i], Role: cfg.Agents[i].Role, ProfileFile: profiles[i], StateDirectory: states[i], Workspace: private, PiBinary: binary, Targets: []swarmrunner.Target{}}
+		rc := swarmrunner.Config{WireVersion: 2, CoordinatorURL: server.URL, CAFile: caPath, CredentialFile: credential, TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, AgentID: ids[i], InstanceID: instances[i], Role: cfg.Agents[i].Role, ProfileID: ids[i], StateDirectory: states[i], Workspace: private, PiBinary: binary, AvailableModels: []string{"fixture/test"}, Targets: []swarmrunner.Target{}}
 		if i == 0 {
-			rc.Targets = []swarmrunner.Target{{AgentID: ids[1], ProfileFile: profiles[1]}, {AgentID: ids[2], ProfileFile: profiles[2]}}
+			rc.Targets = []swarmrunner.Target{{AgentID: ids[1], ProfileID: ids[1]}, {AgentID: ids[2], ProfileID: ids[2]}}
 		}
 		configPath := filepath.Join(private, "config.json")
 		writeJSON(t, configPath, rc)

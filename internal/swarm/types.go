@@ -21,9 +21,6 @@ type Config struct {
 	AgentProfiles *AgentProfileBackend `json:"agent_profiles"`
 	Agents        []AgentConfig        `json:"agents"`
 	Features      []Feature            `json:"features"`
-	// Profiles is excluded from the wire and never used for runtime dispatch.
-	// Existing in-process fixtures populate it to assert retained P2 behavior.
-	Profiles []ProfileSnapshot `json:"-"`
 }
 
 // AgentProfileBackend is coordinator-only. Runner credentials never include
@@ -52,10 +49,6 @@ type AgentConfig struct {
 	ProfileID        string `json:"profile_id"`
 }
 
-// Bytes is the exact UTF-8 JSON snapshot, not reserialized before hashing.
-type ProfileSnapshot struct {
-	Bytes json.RawMessage `json:"bytes"`
-}
 type TextProfile struct {
 	ID         string   `json:"id"`
 	Model      string   `json:"model"`
