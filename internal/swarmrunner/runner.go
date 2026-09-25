@@ -15,17 +15,18 @@ import (
 )
 
 type Runner struct {
-	cfg           Config
-	profile       profile
-	targets       []targetProfile
-	client        *Client
-	journal       *Journal
-	model         LaunchModel
-	mu            sync.Mutex
-	active        swarm.Delivery
-	cancel        context.CancelFunc
-	activityPhase string
-	activityCh    chan struct{}
+	cfg                    Config
+	profile                profile
+	targets                []targetProfile
+	client                 *Client
+	journal                *Journal
+	model                  LaunchModel
+	mu                     sync.Mutex
+	active                 swarm.Delivery
+	cancel                 context.CancelFunc
+	activityPhase          string
+	activityCh             chan struct{}
+	fixtureClaimBarrierDir string
 }
 
 func New(c Config) (*Runner, error) {

@@ -81,12 +81,13 @@ func runnerFixtureWithIntercept(t *testing.T, handler http.Handler, intercept fu
 	})
 	s := httptest.NewTLSServer(wrapper)
 	t.Cleanup(s.Close)
-	j, e := OpenJournal(t.TempDir())
+	stateDir := t.TempDir()
+	j, e := OpenJournal(stateDir)
 	if e != nil {
 		t.Fatal(e)
 	}
 	t.Cleanup(func() { j.Close() })
-	r := &Runner{cfg: Config{TenantID: tenant, ProjectID: project, AgentID: "worker-a", InstanceID: swarm.NewID(), Role: "worker", ProfileID: "worker-a", AvailableModels: []string{p.Model}}, profile: p, journal: j, client: &Client{http: s.Client(), base: s.URL + swarm.APIPrefix, token: "fixture", instance: swarm.NewID()}}
+	r := &Runner{cfg: Config{TenantID: tenant, ProjectID: project, AgentID: "worker-a", InstanceID: swarm.NewID(), Role: "worker", ProfileID: "worker-a", AvailableModels: []string{p.Model}, StateDirectory: stateDir}, profile: p, journal: j, client: &Client{http: s.Client(), base: s.URL + swarm.APIPrefix, token: "fixture", instance: swarm.NewID()}}
 	return r, s
 }
 func dispatchFixture(r *Runner) swarm.Delivery {

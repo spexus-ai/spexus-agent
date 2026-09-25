@@ -70,6 +70,9 @@ func (r *Runner) claimProfile(ctx context.Context, d swarm.Delivery, p profile) 
 	if err := r.journal.pin(d.MailboxSeq, p, claim, ref); err != nil {
 		return claim, err
 	}
+	if err := r.waitForLocalFixtureClaimRelease(ctx, d, p, claim); err != nil {
+		return claim, err
+	}
 	return claim, nil
 }
 
