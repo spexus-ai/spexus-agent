@@ -49,6 +49,8 @@ type targetProfile struct {
 	Profile swarm.Profile `json:"profile"`
 }
 
+var errProfileDisabled = errors.New("profile_disabled")
+
 var uuid = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func decode(b []byte, out any) error {
@@ -117,7 +119,7 @@ func (c Config) validate() error {
 func profileFromActive(active swarm.ActiveProfile, expectedID string, available []string) (profile, error) {
 	var p profile
 	b, e := base64.StdEncoding.DecodeString(active.SnapshotBytesBase64)
-	if e != nil || active.ProfileID != expectedID || active.Generation < 1 || !active.Enabled || swarm.Digest(b) != active.ActiveRevision || !bytes.Equal(b, active.SnapshotJSON) {
+	if e != nil || active.ProfileID != expectedID || active.Generation < 1 || swarm.Digest(b) != active.ActiveRevision || !bytes.Equal(b, active.SnapshotJSON) {
 		return p, errors.New("profile_unavailable")
 	}
 	p.TextProfile, e = swarm.ValidateWebTextProfile(b)
@@ -126,6 +128,9 @@ func profileFromActive(active swarm.ActiveProfile, expectedID string, available 
 	}
 	if p.ID != expectedID || len(p.Tools) != 0 || len(p.Extensions) != 0 {
 		return p, errors.New("profile_unavailable")
+	}
+	if !active.Enabled {
+		return p, errProfileDisabled
 	}
 	provider, model, ok := strings.Cut(p.Model, "/")
 	if !ok || provider == "" || model == "" {

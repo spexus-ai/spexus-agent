@@ -41,6 +41,10 @@ func profileFixture(t *testing.T) profile {
 	return profile{TextProfile: p, Revision: swarm.Digest(b), Generation: 1, Bytes: b}
 }
 func runnerFixture(t *testing.T, handler http.Handler) (*Runner, *httptest.Server) {
+	return runnerFixtureWithIntercept(t, handler, nil)
+}
+
+func runnerFixtureWithIntercept(t *testing.T, handler http.Handler, intercept func(http.ResponseWriter, *http.Request) bool) (*Runner, *httptest.Server) {
 	t.Helper()
 	p := profileFixture(t)
 	ownerText := swarm.TextProfile{ID: "orchestrator", Model: p.Model, Reasoning: p.Reasoning, Prompt: p.Prompt, Tools: []string{}, Extensions: []string{}}
@@ -48,6 +52,9 @@ func runnerFixture(t *testing.T, handler http.Handler) (*Runner, *httptest.Serve
 	owner := profile{TextProfile: ownerText, Revision: swarm.Digest(ownerRaw), Generation: 1, Bytes: ownerRaw}
 	claimID := swarm.NewID()
 	wrapper := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if intercept != nil && intercept(w, q) {
+			return
+		}
 		path := q.URL.Path
 		selected := p
 		slot, role := "worker-a", "worker"

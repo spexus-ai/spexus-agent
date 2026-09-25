@@ -11,9 +11,21 @@ import (
 	"github.com/spexus-ai/spexus-agent/internal/swarm"
 )
 
+func workerProfileReadFailure(err error) string {
+	if errors.Is(err, errProfileDisabled) {
+		return "profile_disabled_before_launch"
+	}
+	if transient(err) || errors.Is(err, context.DeadlineExceeded) {
+		return "profile_backend_unavailable"
+	}
+	return "profile_unavailable"
+}
+
 func (r *Runner) activeProfile(ctx context.Context, id string) (profile, error) {
 	var active swarm.ActiveProfile
-	if err := r.client.call(ctx, "GET", "/agent-profiles/"+id+"/active", nil, &active); err != nil {
+	// Each attempt gets one bounded authoritative read. A transient backend
+	// failure must finish visibly instead of retrying this queued input forever.
+	if err := r.client.once(ctx, "GET", "/agent-profiles/"+id+"/active", nil, &active); err != nil {
 		return profile{}, err
 	}
 	if id == "orchestrator" && (active.Slot != "owner" || active.Role != "owner") || id != "orchestrator" && (active.Slot != id || active.Role != "worker") {
@@ -172,7 +184,7 @@ func (r *Runner) refreshTargets(ctx context.Context) error {
 		p, err := r.activeProfile(ctx, target.ProfileID)
 		if err != nil {
 			var h *HTTPError
-			if errors.As(err, &h) && h.Code == "DISABLED" || strings.Contains(err.Error(), "profile_unavailable") {
+			if errors.Is(err, errProfileDisabled) || errors.As(err, &h) && h.Code == "DISABLED" || strings.Contains(err.Error(), "profile_unavailable") {
 				continue
 			}
 			return fmt.Errorf("target %s: %w", target.AgentID, err)

@@ -360,8 +360,11 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 		return e
 	}
 	currentProfile, e := r.activeProfile(ctx, r.cfg.ProfileID)
-	if e != nil || dispatch.Profile != currentProfile.wire() {
-		return r.workerFinish(ctx, d, failedResult("profile_unavailable"), d.MessageID)
+	if e != nil {
+		return r.workerFinish(ctx, d, failedResult(workerProfileReadFailure(e)), d.MessageID)
+	}
+	if dispatch.Profile != currentProfile.wire() {
+		return r.workerFinish(ctx, d, failedResult("profile_changed_before_launch"), d.MessageID)
 	}
 	accepted := r.envelope(d, "task.accepted", d.FromAgentID, swarm.AcceptedPayload{DispatchMessageID: d.MessageID, ProfileRevision: currentProfile.Revision}, ptr(d.MessageID))
 	if e = r.journal.queue(d.MailboxSeq, "message", "/messages", accepted); e != nil {
@@ -376,14 +379,20 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 		return r.rejectBeforeLaunch(ctx, d, "acceptance_rejected")
 	}
 	prelaunch, e := r.activeProfile(ctx, r.cfg.ProfileID)
-	if e != nil || prelaunch.wire() != dispatch.Profile || prelaunch.Generation != currentProfile.Generation {
+	if e != nil {
+		return r.workerFinish(ctx, d, failedResult(workerProfileReadFailure(e)), accepted.MessageID)
+	}
+	if prelaunch.wire() != dispatch.Profile || prelaunch.Generation != currentProfile.Generation {
 		return r.workerFinish(ctx, d, failedResult("profile_changed_before_launch"), accepted.MessageID)
 	}
 	claim, e := r.claimProfile(ctx, d, prelaunch)
 	if e != nil {
 		var denied *HTTPError
-		if errors.As(e, &denied) && (denied.Status == 412 || denied.Code == "DISABLED") {
-			return r.workerFinish(ctx, d, failedResult("profile_claim_denied"), accepted.MessageID)
+		if errors.As(e, &denied) && denied.Code == "DISABLED" {
+			return r.workerFinish(ctx, d, failedResult("profile_disabled_before_launch"), accepted.MessageID)
+		}
+		if errors.As(e, &denied) && denied.Status == 412 {
+			return r.workerFinish(ctx, d, failedResult("profile_changed_before_launch"), accepted.MessageID)
 		}
 		return r.journal.state(d.MailboxSeq, "interrupted", "profile_claim_unknown")
 	}
