@@ -38,6 +38,7 @@ func newHumanFixture(t *testing.T) *fixture {
 		f.cfg.Agents = append(f.cfg.Agents, AgentConfig{AgentID: id, Role: role, CredentialSHA256: Digest([]byte(token)), ProfileID: id})
 		f.cfg.Profiles = append(f.cfg.Profiles, ProfileSnapshot{Bytes: mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}})})
 	}
+	profileBackendFixture(t, &f.cfg)
 	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "state.db"), f.cfg)
 	if err != nil {
 		t.Fatal(err)

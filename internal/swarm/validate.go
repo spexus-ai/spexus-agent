@@ -112,7 +112,7 @@ func canonical(data []byte) ([]byte, error) {
 	return json.Marshal(value)
 }
 func validateConfig(c Config) error {
-	if !uuid(c.TenantID) || !uuid(c.ProjectID) || len(c.Agents) != 3 || len(c.Profiles) == 0 {
+	if !uuid(c.TenantID) || !uuid(c.ProjectID) || len(c.Agents) != 3 || c.AgentProfiles == nil || len(c.AgentProfiles.AllowedModels) == 0 {
 		return fmt.Errorf("invalid scope or three-agent configuration")
 	}
 	if c.WireVersion != 0 && c.WireVersion != 1 && c.WireVersion != 2 {
@@ -122,27 +122,20 @@ func validateConfig(c Config) error {
 		return fmt.Errorf("wire version 2 requires human backend configuration")
 	}
 	profiles := map[string]bool{}
-	for _, snap := range c.Profiles {
-		p, err := ValidateTextProfile(snap.Bytes)
-		if err != nil {
-			return err
-		}
-		if profiles[p.ID] {
-			return fmt.Errorf("duplicate profile")
-		}
-		profiles[p.ID] = true
+	for _, id := range []string{"orchestrator", "worker-a", "worker-b"} {
+		profiles[id] = true
 	}
 	agents := map[string]bool{}
 	tokens := map[string]bool{}
 	owners := 0
 	for _, a := range c.Agents {
 		digest, err := hex.DecodeString(a.CredentialSHA256)
-		if a.AgentID == "" || a.AgentID == "coordinator" || len(a.AgentID) > 128 || agents[a.AgentID] || tokens[a.CredentialSHA256] || err != nil || len(digest) != 32 || !profiles[a.ProfileID] {
+		if a.AgentID == "" || a.AgentID == "coordinator" || len(a.AgentID) > 128 || agents[a.AgentID] || tokens[a.CredentialSHA256] || err != nil || len(digest) != 32 || !profiles[a.ProfileID] || a.AgentID != a.ProfileID {
 			return fmt.Errorf("invalid agent configuration")
 		}
-		if a.Role == "owner" {
+		if a.Role == "owner" && a.ProfileID == "orchestrator" {
 			owners++
-		} else if a.Role != "worker" {
+		} else if a.Role != "worker" || a.ProfileID == "orchestrator" {
 			return fmt.Errorf("invalid role")
 		}
 		agents[a.AgentID] = true
@@ -177,6 +170,31 @@ func ValidateTextProfile(snapshot []byte) (TextProfile, error) {
 			return p, wireError(400, "unsafe_profile")
 		}
 		seen[tool] = true
+	}
+	return p, nil
+}
+
+// ValidateWebTextProfile enforces the canonical, text-only v1 execution
+// snapshot independently of the backend that supplied it.
+func ValidateWebTextProfile(snapshot []byte) (TextProfile, error) {
+	p, err := ValidateTextProfile(snapshot)
+	if err != nil {
+		return p, err
+	}
+	if len(p.Tools) != 0 || len(p.Extensions) != 0 || strings.TrimSpace(p.Prompt) == "" {
+		return p, wireError(400, "unsafe_profile")
+	}
+	validReasoning := map[string]bool{"minimal": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true, "ultra": true}
+	if !validReasoning[p.Reasoning] {
+		return p, wireError(400, "unsafe_profile")
+	}
+	provider, model, ok := strings.Cut(p.Model, "/")
+	if !ok || provider == "" || model == "" {
+		return p, wireError(400, "unsafe_profile")
+	}
+	canonical, err := json.Marshal(p)
+	if err != nil || !bytes.Equal(canonical, snapshot) {
+		return p, wireError(400, "noncanonical_profile")
 	}
 	return p, nil
 }
@@ -417,7 +435,7 @@ func validateEnvelope(e Envelope) error {
 		if err := required(e.Payload, "goal", "scope", "expected_result", "context", "profile"); err != nil {
 			return err
 		}
-		if !safeText(p.Goal, 8192) || !safeText(p.Scope, 8192) || len(p.ExpectedResult) < 1 || len(p.ExpectedResult) > 16 || len(p.Context.Text) > 64*1024 || p.Context.Refs == nil || len(p.Context.Refs) > 32 || !safeText(p.Profile.ID, 128) || len(p.Profile.Revision) != 64 || !safeText(p.Profile.Model, 256) || !safeText(p.Profile.Reasoning, 32) {
+		if !safeText(p.Goal, 8192) || !safeText(p.Scope, 8192) || len(p.ExpectedResult) < 1 || len(p.ExpectedResult) > 16 || len(p.Context.Text) > 64*1024 || p.Context.Refs == nil || len(p.Context.Refs) > 32 || !safeText(p.Profile.ID, 128) || len(p.Profile.Revision) != 64 || p.Profile.Generation < 1 || !safeText(p.Profile.Model, 256) || !safeText(p.Profile.Reasoning, 32) {
 			return wireError(400, "invalid_dispatch")
 		}
 		for _, v := range p.ExpectedResult {

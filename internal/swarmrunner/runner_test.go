@@ -2,6 +2,7 @@ package swarmrunner
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,25 +32,46 @@ func (f modelFunc) Run(ctx context.Context, key, input string) (string, bool, er
 }
 func profileFixture(t *testing.T) (profile, string) {
 	t.Helper()
-	p := swarm.TextProfile{ID: "worker", Model: "test/model", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}}
+	p := swarm.TextProfile{ID: "worker-a", Model: "test/model", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}}
 	b, _ := json.Marshal(p)
 	file := filepath.Join(t.TempDir(), "profile.json")
 	if e := os.WriteFile(file, b, 0600); e != nil {
 		t.Fatal(e)
 	}
-	return profile{p, swarm.Digest(b)}, file
+	return profile{TextProfile: p, Revision: swarm.Digest(b), Generation: 1, Bytes: b}, file
 }
 func runnerFixture(t *testing.T, handler http.Handler) (*Runner, *httptest.Server) {
 	t.Helper()
-	s := httptest.NewTLSServer(handler)
-	t.Cleanup(s.Close)
 	p, file := profileFixture(t)
+	claimID := swarm.NewID()
+	wrapper := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		path := q.URL.Path
+		if path == swarm.APIPrefix+"/agent-profiles/worker-a/active" {
+			writeJSON(w, swarm.ActiveProfile{Slot: "worker-a", Role: "worker", ProfileID: "worker-a", Enabled: true, Generation: 1, ActiveRevision: p.Revision, SnapshotJSON: p.Bytes, SnapshotBytesBase64: base64.StdEncoding.EncodeToString(p.Bytes), AllowedModels: []string{p.Model}})
+			return
+		}
+		if path == swarm.APIPrefix+"/agent-profiles/worker-a/launch-claims" {
+			var request swarm.LaunchClaimRequest
+			if err := json.NewDecoder(q.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			writeJSON(w, swarm.LaunchClaim{ClaimID: claimID, ExecutionRef: request.ExecutionRef, ProfileID: "worker-a", Generation: 1, Revision: p.Revision, SnapshotJSON: p.Bytes, SnapshotBytesBase64: base64.StdEncoding.EncodeToString(p.Bytes), State: "starting"})
+			return
+		}
+		if path == swarm.APIPrefix+"/agent-profiles/worker-a/observations" {
+			writeJSON(w, map[string]any{"profile_id": "worker-a", "claim_id": claimID, "revision": p.Revision, "outcome": "launched"})
+			return
+		}
+		handler.ServeHTTP(w, q)
+	})
+	s := httptest.NewTLSServer(wrapper)
+	t.Cleanup(s.Close)
 	j, e := OpenJournal(t.TempDir())
 	if e != nil {
 		t.Fatal(e)
 	}
 	t.Cleanup(func() { j.Close() })
-	r := &Runner{cfg: Config{TenantID: tenant, ProjectID: project, AgentID: "worker-a", InstanceID: swarm.NewID(), Role: "worker", ProfileFile: file}, profile: p, journal: j, client: &Client{http: s.Client(), base: s.URL + swarm.APIPrefix, token: "fixture", instance: swarm.NewID()}}
+	r := &Runner{cfg: Config{TenantID: tenant, ProjectID: project, AgentID: "worker-a", InstanceID: swarm.NewID(), Role: "worker", ProfileID: "worker-a", AvailableModels: []string{p.Model}, ProfileFile: file}, profile: p, journal: j, client: &Client{http: s.Client(), base: s.URL + swarm.APIPrefix, token: "fixture", instance: swarm.NewID()}}
 	return r, s
 }
 func dispatchFixture(r *Runner) swarm.Delivery {
@@ -68,7 +90,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func TestWorkerCorrectsMalformedBlockedResultBeforePublishing(t *testing.T) {
+func TestWorkerRejectsMalformedBlockedResultWithoutSecondLaunch(t *testing.T) {
 	var acceptedID string
 	var published []swarm.ResultPayload
 	handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
@@ -106,20 +128,14 @@ func TestWorkerCorrectsMalformedBlockedResultBeforePublishing(t *testing.T) {
 	r.model = modelFunc(func(_ context.Context, _, input string) (string, bool, error) {
 		launches++
 		base := `{"outcome":"blocked","summary":"Нужен формат","evidence":[],"error":null,"blocker":{"reason":"Формат выбирает человек","context":"A ждёт","question":"Короткий или подробный?","options":[{"id":"short","label":"Короткий"},{"id":"detailed","label":"Подробный"}],"recommendation":"short","kind":"choice"`
-		if launches == 1 {
-			return base + `,"blocked_work":"A"}}`, false, nil
-		}
-		if !strings.Contains(input, "strict validation") {
-			t.Error("correction prompt missing")
-		}
-		return base + `}}`, false, nil
+		return base + `,"blocked_work":"A"}}`, false, nil
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := r.process(ctx, d); err != nil {
 		t.Fatal(err)
 	}
-	if launches != 2 || len(published) != 1 || published[0].Outcome != "blocked" {
+	if launches != 1 || len(published) != 1 || published[0].Outcome != "failed" {
 		t.Fatalf("launches=%d results=%+v", launches, published)
 	}
 }
@@ -260,6 +276,9 @@ func TestJournalDurabilityAndProcessGeneration(t *testing.T) {
 	if e = j.starting(1, ""); e != nil {
 		t.Fatal(e)
 	}
+	if e = j.pin(1, profile{TextProfile: swarm.TextProfile{ID: "worker-a", Model: "test/model", Reasoning: "minimal"}, Revision: "fixture", Generation: 1, Bytes: []byte("fixture")}, swarm.LaunchClaim{ClaimID: swarm.NewID()}, swarm.ExecutionRef{WorkerAttemptID: swarm.NewID()}); e != nil {
+		t.Fatal(e)
+	}
 	if e = j.launch(1); e != nil {
 		t.Fatal(e)
 	}
@@ -373,6 +392,7 @@ func TestOwnerWholeOutputValidatedBeforeAnyAction(t *testing.T) {
 	r, _ := runnerFixture(t, http.NotFoundHandler())
 	r.cfg.Role = "owner"
 	r.cfg.AgentID = "owner"
+	r.cfg.Targets = []Target{{AgentID: "worker-a", ProfileID: "worker-a"}}
 	r.targets = []targetProfile{{"worker-a", r.profile.wire()}}
 	d := dispatchFixture(r)
 	data := dispatchAction{WorkerAgentID: "worker-a", DispatchPayload: swarm.DispatchPayload{Goal: "sum", Scope: "only text", ExpectedResult: []string{"3"}, Context: swarm.TaskContext{Text: "A", Refs: []swarm.ContextRef{}}, Profile: r.profile.wire()}}

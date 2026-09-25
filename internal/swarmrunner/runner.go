@@ -32,10 +32,6 @@ func New(c Config) (*Runner, error) {
 	if e := c.validate(); e != nil {
 		return nil, e
 	}
-	p, e := loadProfile(c.ProfileFile)
-	if e != nil {
-		return nil, e
-	}
 	client, e := NewClient(c)
 	if e != nil {
 		return nil, e
@@ -43,19 +39,10 @@ func New(c Config) (*Runner, error) {
 	if e = os.MkdirAll(c.Workspace, 0700); e != nil {
 		return nil, e
 	}
-	r := &Runner{cfg: c, profile: p, client: client, targets: []targetProfile{}, activityCh: make(chan struct{}, 1)}
+	r := &Runner{cfg: c, client: client, targets: []targetProfile{}, activityCh: make(chan struct{}, 1)}
 	for _, target := range c.Targets {
-		p, e := loadProfile(target.ProfileFile)
-		if e != nil {
-			return nil, e
-		}
-		r.targets = append(r.targets, targetProfile{target.AgentID, p.wire()})
+		r.targets = append(r.targets, targetProfile{AgentID: target.AgentID})
 	}
-	m, e := newModel(c, p)
-	if e != nil {
-		return nil, e
-	}
-	r.model = m
 	j, e := OpenJournal(c.StateDirectory, c.wireVersion())
 	if e != nil {
 		return nil, e
@@ -78,6 +65,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		return e
 	}
 	if e := r.journal.recover(); e != nil {
+		return e
+	}
+	if e := r.reconcileProfileObservations(ctx); e != nil {
 		return e
 	}
 	if e := r.heartbeat(ctx); e != nil {
@@ -115,6 +105,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	})
 	defer func() { cancel(); wg.Wait() }()
 	for ctx.Err() == nil {
+		if r.cfg.Role == "owner" {
+			if e := r.retryBlockedOwnerProfile(ctx); e != nil {
+				return e
+			}
+		}
 		if e := r.flush(ctx); e != nil {
 			return e
 		}
@@ -293,7 +288,7 @@ func (r *Runner) current(ctx context.Context, d swarm.Delivery) (swarm.Attempt, 
 	}
 	return swarm.Attempt{}, errors.New("foreign_attempt")
 }
-func (r *Runner) run(ctx context.Context, d swarm.Delivery, input string) (string, bool, error) {
+func (r *Runner) run(ctx context.Context, d swarm.Delivery, input string, p profile, claim swarm.LaunchClaim) (string, bool, error) {
 	runctx, cancel := context.WithCancel(ctx)
 	r.mu.Lock()
 	r.active = d
@@ -323,12 +318,37 @@ func (r *Runner) run(ctx context.Context, d swarm.Delivery, input string) (strin
 	if e = r.journal.launch(d.MailboxSeq); e != nil {
 		return "", false, e
 	}
+	model := r.model
+	if model == nil {
+		model, e = newModel(r.cfg, p)
+		if e != nil {
+			return "", false, e
+		}
+		if closer, ok := model.(interface{ Close() error }); ok {
+			defer closer.Close()
+		}
+	}
 	var output string
 	var cancelled bool
-	if m, ok := r.model.(ActivityModel); ok {
-		output, cancelled, e = m.RunWithActivity(runctx, r.cfg.session(d), input, r.reportActivity)
+	sessionKey := r.cfg.session(d) + "/" + p.Revision
+	launched := func() error {
+		if err := r.journal.physicalLaunch(d.MailboxSeq, claim.ClaimID); err != nil {
+			return err
+		}
+		return r.observeLaunch(runctx, d, p, claim)
+	}
+	if m, ok := model.(LaunchModel); ok {
+		output, cancelled, e = m.RunWithLaunch(runctx, sessionKey, input, r.reportActivity, launched)
+	} else if m, ok := model.(ActivityModel); ok {
+		if e = launched(); e != nil {
+			return "", false, e
+		}
+		output, cancelled, e = m.RunWithActivity(runctx, sessionKey, input, r.reportActivity)
 	} else {
-		output, cancelled, e = r.model.Run(runctx, r.cfg.session(d), input)
+		if e = launched(); e != nil {
+			return "", false, e
+		}
+		output, cancelled, e = model.Run(runctx, sessionKey, input)
 	}
 	return output, cancelled, e
 }
@@ -346,11 +366,11 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 	} else if e := decode(d.Payload, &dispatch); e != nil {
 		return e
 	}
-	currentProfile, e := loadProfile(r.cfg.ProfileFile)
-	if e != nil || currentProfile.wire() != r.profile.wire() || dispatch.Profile != r.profile.wire() {
+	currentProfile, e := r.activeProfile(ctx, r.cfg.ProfileID)
+	if e != nil || dispatch.Profile != currentProfile.wire() {
 		return r.workerFinish(ctx, d, failedResult("profile_unavailable"), d.MessageID)
 	}
-	accepted := r.envelope(d, "task.accepted", d.FromAgentID, swarm.AcceptedPayload{DispatchMessageID: d.MessageID, ProfileRevision: r.profile.Revision}, ptr(d.MessageID))
+	accepted := r.envelope(d, "task.accepted", d.FromAgentID, swarm.AcceptedPayload{DispatchMessageID: d.MessageID, ProfileRevision: currentProfile.Revision}, ptr(d.MessageID))
 	if e = r.journal.queue(d.MailboxSeq, "message", "/messages", accepted); e != nil {
 		return e
 	}
@@ -361,6 +381,18 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 		return e
 	} else if rejected {
 		return r.rejectBeforeLaunch(ctx, d, "acceptance_rejected")
+	}
+	prelaunch, e := r.activeProfile(ctx, r.cfg.ProfileID)
+	if e != nil || prelaunch.wire() != dispatch.Profile || prelaunch.Generation != currentProfile.Generation {
+		return r.workerFinish(ctx, d, failedResult("profile_changed_before_launch"), accepted.MessageID)
+	}
+	claim, e := r.claimProfile(ctx, d, prelaunch)
+	if e != nil {
+		var denied *HTTPError
+		if errors.As(e, &denied) && (denied.Status == 412 || denied.Code == "DISABLED") {
+			return r.workerFinish(ctx, d, failedResult("profile_claim_denied"), accepted.MessageID)
+		}
+		return r.journal.state(d.MailboxSeq, "interrupted", "profile_claim_unknown")
 	}
 	started := r.envelope(d, "task.started", d.FromAgentID, swarm.StartedPayload{AcceptedMessageID: accepted.MessageID}, ptr(accepted.MessageID))
 	if e = r.journal.queue(d.MailboxSeq, "message", "/messages", started); e != nil {
@@ -388,7 +420,7 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 	if e != nil {
 		return e
 	}
-	raw, cancelled, runErr := r.run(ctx, d, input)
+	raw, cancelled, runErr := r.run(ctx, d, input, prelaunch, claim)
 	if e := r.journal.modelOutput(d.MailboxSeq, raw); e != nil {
 		return e
 	}
@@ -399,21 +431,6 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 		result = failedResult("model_execution_failed")
 	} else {
 		result, e = r.workerResult(d, raw)
-		if e != nil && ctx.Err() == nil {
-			// A malformed FINAL object has not been published. Give Pi one
-			// bounded correction before turning the attempt into a failure.
-			correction := input + "\nYour preceding FINAL JSON failed strict validation. Return the complete corrected JSON object only. For a blocked result, blocker has exactly reason, context, question, options, recommendation and kind; never add dependency_id or blocked_work. The runtime creates IDs. Do not claim that the work was completed."
-			var corrected string
-			corrected, cancelled, runErr = r.run(ctx, d, correction)
-			if corrected != "" {
-				if journalErr := r.journal.modelOutput(d.MailboxSeq, corrected); journalErr != nil {
-					return journalErr
-				}
-			}
-			if !cancelled && runErr == nil {
-				result, e = r.workerResult(d, corrected)
-			}
-		}
 		if cancelled {
 			result = cancelResult(false, nil)
 		} else if runErr != nil {
@@ -468,6 +485,10 @@ func (r *Runner) workerFinish(ctx context.Context, d swarm.Delivery, result swar
 	return r.flush(ctx)
 }
 func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
+	currentProfile, e := r.activeProfile(ctx, r.cfg.ProfileID)
+	if e != nil {
+		return r.journal.state(d.MailboxSeq, "profile_blocked", "profile_unavailable")
+	}
 	turn := swarm.NewID()
 	if e := r.journal.starting(d.MailboxSeq, turn); e != nil {
 		return e
@@ -498,18 +519,37 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 		finish.Error = modelError("cancelled")
 		return r.ownerFinish(ctx, d, turn, finish, nil)
 	}
-	currentProfile, e := loadProfile(r.cfg.ProfileFile)
-	if e != nil || currentProfile.wire() != r.profile.wire() {
-		finish.Outcome = "failed"
-		finish.Reply = "profile_unavailable"
-		finish.Error = modelError("profile_unavailable")
-		return r.ownerFinish(ctx, d, turn, finish, nil)
+	prelaunch, e := r.activeProfile(ctx, r.cfg.ProfileID)
+	if e != nil || prelaunch.wire() != currentProfile.wire() || prelaunch.Generation != currentProfile.Generation {
+		if e = r.requeueOwnerProfile(ctx, d, turn); e != nil {
+			return r.journal.state(d.MailboxSeq, "profile_blocked", "profile_prelaunch_unknown")
+		}
+		return nil
+	}
+	if e = r.refreshTargets(ctx); e != nil {
+		if err := r.requeueOwnerProfile(ctx, d, turn); err != nil {
+			return r.journal.state(d.MailboxSeq, "profile_blocked", "target_profile_unavailable")
+		}
+		return nil
+	}
+	claim, e := r.claimProfile(ctx, d, prelaunch)
+	if e != nil {
+		var denied *HTTPError
+		if errors.As(e, &denied) && (denied.Status == 412 || denied.Code == "DISABLED") {
+			if err := r.requeueOwnerProfile(ctx, d, turn); err != nil {
+				return r.journal.state(d.MailboxSeq, "profile_blocked", "profile_denied_requeue_pending")
+			}
+			return nil
+		}
+		// A lost claim receipt may mean the claim committed. This execution
+		// requires manual reconciliation, even if an immediate readback is 404.
+		return r.journal.state(d.MailboxSeq, "interrupted", "profile_claim_unknown")
 	}
 	input, e := r.input(ctx, d)
 	if e != nil {
 		return e
 	}
-	raw, cancelled, runErr := r.run(ctx, d, input)
+	raw, cancelled, runErr := r.run(ctx, d, input, prelaunch, claim)
 	if e := r.journal.modelOutput(d.MailboxSeq, raw); e != nil {
 		return e
 	}
@@ -533,7 +573,6 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 				}
 			}
 		}
-		var reviewErr *reviewPreflightError
 		summaryMissing := false
 		if outputErr == nil && d.Type == "task.result" && len(messages) == 0 && strings.TrimSpace(ownerResult.Reply) == "" {
 			job, jobErr := r.job(ctx, d.JobID)
@@ -542,41 +581,8 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 			}
 			summaryMissing = reviewedTrigger(d, job)
 		}
-		if (errors.As(outputErr, &reviewErr) || summaryMissing) && ctx.Err() == nil {
-			// Nothing has entered the durable outbox yet. Give Pi one bounded
-			// correction in the same turn; a second mistake fails visibly.
-			correction := input + "\nYour preceding FINAL JSON was rejected before any actions were published: "
-			if summaryMissing {
-				correction += "The final reply was empty. This result was already accepted; return actions:[] and a concise, nonempty human-facing summary of the recorded results."
-			} else {
-				correction += reviewErr.Error() + ". Return a complete corrected FINAL JSON. For a pending task.result, review only this event's job_id, attempt_id and message_id; do not repeat reviews of earlier attempts. If the trusted job shows this result was already accepted, return actions:[] and only summarize the recorded outcome."
-			}
-			var corrected string
-			corrected, cancelled, runErr = r.run(ctx, d, correction)
-			if corrected != "" {
-				raw = corrected
-				if e := r.journal.modelOutput(d.MailboxSeq, raw); e != nil {
-					return e
-				}
-			}
-			if !cancelled && runErr == nil {
-				ownerResult, messages, outputErr = r.ownerActions(d, turn, corrected)
-				if outputErr != nil && d.Type == "task.result" {
-					job, jobErr := r.job(ctx, d.JobID)
-					if jobErr != nil {
-						return jobErr
-					}
-					if reviewedTrigger(d, job) {
-						if reply, ok := plainSummary(corrected); ok {
-							ownerResult = ownerOutput{Actions: []action{}, Reply: reply}
-							messages, outputErr = nil, nil
-						}
-					}
-				}
-				if summaryMissing && outputErr == nil && strings.TrimSpace(ownerResult.Reply) == "" {
-					outputErr = errors.New("empty final summary")
-				}
-			}
+		if summaryMissing {
+			outputErr = errors.New("empty final summary")
 		}
 	}
 	if cancelled {

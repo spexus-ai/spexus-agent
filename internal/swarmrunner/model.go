@@ -21,6 +21,9 @@ type Model interface {
 type ActivityModel interface {
 	RunWithActivity(context.Context, string, string, func(string)) (string, bool, error)
 }
+type LaunchModel interface {
+	RunWithLaunch(context.Context, string, string, func(string), func() error) (string, bool, error)
+}
 type piModel struct {
 	adapter   *piadapter.Adapter
 	workspace string
@@ -43,11 +46,19 @@ func (m *piModel) Run(ctx context.Context, key, input string) (string, bool, err
 	return m.RunWithActivity(ctx, key, input, nil)
 }
 func (m *piModel) RunWithActivity(ctx context.Context, key, input string, report func(string)) (string, bool, error) {
+	return m.RunWithLaunch(ctx, key, input, report, nil)
+}
+func (m *piModel) RunWithLaunch(ctx context.Context, key, input string, report func(string), launched func() error) (string, bool, error) {
 	s, e := m.adapter.StartPrompt(ctx, harness.SessionRequest{ProjectPath: m.workspace, ChannelID: "swarm", ThreadTS: key, Prompt: input})
 	if e != nil {
 		return "", false, e
 	}
 	defer s.Close()
+	if launched != nil {
+		if err := launched(); err != nil {
+			return "", false, err
+		}
+	}
 	var final string
 	cancelled := false
 	lastPhase := ""
@@ -340,7 +351,7 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 					target = &r.targets[i]
 				}
 			}
-			if target == nil || target.Profile != x.Profile {
+			if target == nil || r.targetProfile(x.WorkerAgentID, x.Profile) != nil {
 				return o, nil, errors.New("profile_unavailable")
 			}
 			if x.AcceptBy == "" {
@@ -517,12 +528,26 @@ func plannedState(dep swarm.Dependency, planned map[string]string) string {
 	return dep.State
 }
 func (r *Runner) targetProfile(agent string, profile swarm.Profile) error {
-	for _, target := range r.targets {
-		if target.AgentID == agent && target.Profile == profile {
-			return nil
+	bound := false
+	for _, target := range r.cfg.Targets {
+		if target.AgentID == agent && target.ProfileID == profile.ID {
+			bound = true
+			break
 		}
 	}
-	return errors.New("profile_unavailable")
+	if !bound {
+		return errors.New("profile_unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	active, err := r.activeProfile(ctx, profile.ID)
+	if err != nil {
+		return err
+	}
+	if active.wire() != profile {
+		return errors.New("profile_changed_before_dispatch")
+	}
+	return nil
 }
 func (r *Runner) actionDependency(d swarm.Delivery, id string) (swarm.Dependency, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

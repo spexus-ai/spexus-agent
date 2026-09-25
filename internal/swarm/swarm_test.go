@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,6 +25,97 @@ type fixture struct {
 	feature   Feature
 	instances map[string]string
 	tokens    map[string]string
+}
+
+func profileBackendFixture(t *testing.T, cfg *Config) {
+	t.Helper()
+	profiles := map[string][]byte{}
+	claims := map[string]LaunchClaim{}
+	for _, snapshot := range cfg.Profiles {
+		var p TextProfile
+		if err := json.Unmarshal(snapshot.Bytes, &p); err != nil {
+			t.Fatal(err)
+		}
+		profiles[p.ID] = snapshot.Bytes
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Tenant-ID") != cfg.TenantID || r.Header.Get("X-Project-ID") != cfg.ProjectID {
+			w.WriteHeader(403)
+			return
+		}
+		path := strings.TrimPrefix(r.URL.Path, "/api/v1/agent-profiles/")
+		parts := strings.Split(path, "/")
+		id := parts[0]
+		raw := profiles[id]
+		if raw == nil || len(parts) < 2 {
+			w.WriteHeader(404)
+			return
+		}
+		if parts[1] == "launch-claims" {
+			if r.Method == "GET" && len(parts) == 4 {
+				claim, ok := claims[id+":"+parts[2]+":"+parts[3]]
+				if !ok {
+					w.WriteHeader(404)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"schema_version": 1, "data": claim})
+				return
+			}
+			if r.Method == "POST" {
+				var request LaunchClaimRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				if request.ExpectedGeneration != 1 || request.ExpectedRevision != Digest(raw) {
+					w.WriteHeader(412)
+					return
+				}
+				kind, executionID := "worker_attempt", request.ExecutionRef.WorkerAttemptID
+				if request.ExecutionRef.OwnerTurnID != "" {
+					kind, executionID = "owner_turn", request.ExecutionRef.OwnerTurnID
+				}
+				key := id + ":" + kind + ":" + executionID
+				claim, ok := claims[key]
+				if !ok {
+					claim = LaunchClaim{ClaimID: NewID(), ExecutionRef: request.ExecutionRef, ProfileID: id, Generation: 1, Revision: Digest(raw), SnapshotJSON: raw, SnapshotBytesBase64: base64.StdEncoding.EncodeToString(raw), State: "starting"}
+					claims[key] = claim
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"schema_version": 1, "data": claim})
+				return
+			}
+		}
+		if parts[1] == "observations" && r.Method == "POST" {
+			var request LaunchObservationRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"schema_version": 1, "data": map[string]any{"profile_id": id, "claim_id": request.ClaimID, "revision": request.Revision, "outcome": request.Outcome}})
+			return
+		}
+		if r.Method != "GET" || parts[1] != "active" {
+			w.WriteHeader(404)
+			return
+		}
+		role, slot := "worker", id
+		if id == "orchestrator" {
+			role, slot = "owner", "owner"
+		}
+		response := struct {
+			SchemaVersion int           `json:"schema_version"`
+			Data          ActiveProfile `json:"data"`
+		}{1, ActiveProfile{Slot: slot, Role: role, ProfileID: id, Enabled: true, Generation: 1, ActiveRevision: Digest(raw), SnapshotJSON: raw, SnapshotBytesBase64: base64.StdEncoding.EncodeToString(raw), AllowedModels: []string{"openai-codex/gpt-6-luna"}}}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	t.Cleanup(server.Close)
+	ca := filepath.Join(t.TempDir(), "profile-ca.pem")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	token := filepath.Join(t.TempDir(), "profile-token")
+	if err := os.WriteFile(token, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.AgentProfiles = &AgentProfileBackend{BaseURL: server.URL, CAFile: ca, TokenFile: token, AllowedModels: []string{"openai-codex/gpt-6-luna"}}
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -42,6 +136,7 @@ func newFixture(t *testing.T) *fixture {
 		f.cfg.Agents = append(f.cfg.Agents, AgentConfig{AgentID: id, Role: role, CredentialSHA256: Digest([]byte(token)), ProfileID: id})
 		f.cfg.Profiles = append(f.cfg.Profiles, ProfileSnapshot{Bytes: mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return only JSON", Tools: []string{}, Extensions: []string{}})})
 	}
+	profileBackendFixture(t, &f.cfg)
 	s, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"), f.cfg)
 	if err != nil {
 		t.Fatal(err)

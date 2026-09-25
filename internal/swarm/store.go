@@ -21,7 +21,8 @@ type Store struct {
 	db             *sql.DB
 	lock           *os.File
 	cfg            Config
-	profiles       map[string]Profile
+	profileBackend *profileBackend
+	profiles       map[string]Profile // fixture assertions only; never an execution source
 	now            func() time.Time
 	mailboxLimit   int
 	mailboxBytes   int
@@ -120,6 +121,17 @@ func openStore(ctx context.Context, path string, cfg Config, serviceStart bool) 
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	s := &Store{db: db, lock: lock, cfg: cfg, profiles: map[string]Profile{}, now: time.Now, mailboxLimit: 1000, mailboxBytes: 10 * 1024 * 1024, mailboxReserve: 40, humanWake: make(chan struct{}, 1), slackWake: make(chan struct{}, 1)}
+	for _, snapshot := range cfg.Profiles {
+		var p TextProfile
+		if json.Unmarshal(snapshot.Bytes, &p) == nil {
+			s.profiles[p.ID] = Profile{ID: p.ID, Revision: Digest(snapshot.Bytes), Generation: 1, Model: p.Model, Reasoning: p.Reasoning}
+		}
+	}
+	s.profileBackend, err = newProfileBackend(cfg.AgentProfiles, cfg.TenantID, cfg.ProjectID)
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
 	if err = s.bootstrapMode(ctx, serviceStart); err != nil {
 		s.Close()
 		return nil, err
@@ -247,22 +259,6 @@ func (s *Store) bootstrapMode(ctx context.Context, serviceStart bool) error {
 	}
 	if count != len(s.cfg.Agents) {
 		return fmt.Errorf("agent configuration changed")
-	}
-	for _, snap := range s.cfg.Profiles {
-		var p TextProfile
-		_ = json.Unmarshal(snap.Bytes, &p)
-		ref := Profile{ID: p.ID, Revision: Digest(snap.Bytes), Model: p.Model, Reasoning: p.Reasoning}
-		s.profiles[p.ID] = ref
-		if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO profiles(id,revision,snapshot) VALUES(?,?,?)", p.ID, ref.Revision, []byte(snap.Bytes)); err != nil {
-			return err
-		}
-		var rev string
-		if err = tx.QueryRowContext(ctx, "SELECT revision FROM profiles WHERE id=?", p.ID).Scan(&rev); err != nil {
-			return err
-		}
-		if rev != ref.Revision {
-			return fmt.Errorf("profile snapshot changed: %s", p.ID)
-		}
 	}
 	for _, f := range s.cfg.Features {
 		if err = s.registerFeature(ctx, tx, f); err != nil {

@@ -57,7 +57,9 @@ func run(args []string) error {
 	cert := fs.String("tls-cert", "", "TLS certificate")
 	key := fs.String("tls-key", "", "TLS key")
 	slackPath := fs.String("slack-config", "", "private SlackAuth JSON file")
+	localFixture := fs.Bool("local-fixture", false, "isolated preview fixture without Slack connection or messages")
 	feature := fs.String("feature-id", "", "feature UUID for history")
+	fixtureText := fs.String("fixture-text", "", "isolated local fixture input text")
 	failedTurn := fs.String("failed-turn-id", "", "failed owner turn UUID for offline recovery")
 	inputSeq := fs.Int64("input-mailbox-seq", 0, "original task.result mailbox sequence")
 	resultMessage := fs.String("result-message-id", "", "original task.result message UUID")
@@ -90,6 +92,31 @@ func run(args []string) error {
 	var cfg swarm.Config
 	if err := load(*configPath, &cfg); err != nil {
 		return err
+	}
+	if args[0] == "inject-fixture" {
+		if !*localFixture || *feature == "" || strings.TrimSpace(*fixtureText) == "" {
+			return errors.New("inject-fixture requires --local-fixture, --feature-id and --fixture-text")
+		}
+		var selected *swarm.Feature
+		for i := range cfg.Features {
+			if cfg.Features[i].FeatureID == *feature {
+				selected = &cfg.Features[i]
+				break
+			}
+		}
+		if selected == nil || len(selected.AllowedActorIDs) == 0 {
+			return errors.New("fixture feature not configured")
+		}
+		store, err := swarm.Open(ctx, *state, cfg)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		receipt, _, err := store.Ingest(ctx, *feature, swarm.InputPayload{Text: *fixtureText, Source: swarm.Source{Kind: "slack", EventID: swarm.NewID(), ChannelID: selected.ChannelID, ThreadTS: selected.ThreadTS, ActorID: selected.AllowedActorIDs[0]}})
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(receipt)
 	}
 	if args[0] == "reconcile" {
 		if *coordinator == *container {
@@ -128,54 +155,74 @@ func run(args []string) error {
 	if args[0] != "serve" {
 		return errors.New("unknown command")
 	}
-	if *cert == "" || *key == "" || *slackPath == "" {
-		return errors.New("serve requires --tls-cert, --tls-key, --slack-config")
+	if *cert == "" || *key == "" || (!*localFixture && *slackPath == "") {
+		return errors.New("serve requires --tls-cert, --tls-key and either --slack-config or --local-fixture")
 	}
 	var auth config.SlackAuth
-	if err := load(*slackPath, &auth); err != nil {
-		return err
-	}
-	if auth.BotToken == "" || auth.AppToken == "" || auth.WorkspaceID == "" {
-		return errors.New("SlackAuth botToken, appToken and workspaceId required")
+	if !*localFixture {
+		if err := load(*slackPath, &auth); err != nil {
+			return err
+		}
+		if auth.BotToken == "" || auth.AppToken == "" || auth.WorkspaceID == "" {
+			return errors.New("SlackAuth botToken, appToken and workspaceId required")
+		}
 	}
 	store, err := swarm.Open(ctx, *state, cfg)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	if err = store.ProfilePreflight(ctx); err != nil {
+		return fmt.Errorf("agent profile preflight: %w", err)
+	}
 	if cfg.WireVersion == 2 {
 		if err = store.HumanPreflight(ctx); err != nil {
 			return fmt.Errorf("human provider preflight: %w", err)
 		}
 		for _, f := range cfg.Features {
-			if _, err = store.SlackWatermark(ctx, f.FeatureID); err != nil {
-				return fmt.Errorf("initialize Slack catchup: %w", err)
+			if !*localFixture {
+				if _, err = store.SlackWatermark(ctx, f.FeatureID); err != nil {
+					return fmt.Errorf("initialize Slack catchup: %w", err)
+				}
 			}
-			if err = store.SetRecoveryBarrier(ctx, f.FeatureID, "slack_startup"); err != nil {
+			reason := "slack_startup"
+			if *localFixture {
+				reason = ""
+			}
+			if err = store.SetRecoveryBarrier(ctx, f.FeatureID, reason); err != nil {
 				return fmt.Errorf("close Slack startup barrier: %w", err)
 			}
 		}
 	}
-	source := slack.NewSocketModeClient(auth.AppToken)
-	bridge := &swarmslack.Bridge{Store: store, Features: cfg.Features, API: swarmslack.NewAPI(auth.BotToken), Logf: log.Printf}
+	var source *slack.SocketModeClient
+	var bridge *swarmslack.Bridge
+	if !*localFixture {
+		source = slack.NewSocketModeClient(auth.AppToken)
+		bridge = &swarmslack.Bridge{Store: store, Features: cfg.Features, API: swarmslack.NewAPI(auth.BotToken), Logf: log.Printf}
+	}
 	server := &http.Server{Addr: *listen, Handler: store.Handler(), TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 35 * time.Second, WriteTimeout: 35 * time.Second, IdleTimeout: 60 * time.Second}
 	errorsCh := make(chan error, 4)
 	var workers sync.WaitGroup
-	workers.Add(3)
+	workers.Add(2)
+	if !*localFixture {
+		workers.Add(1)
+	}
 	go func() {
 		err := server.ListenAndServeTLS(*cert, *key)
 		if !errors.Is(err, http.ErrServerClosed) {
 			errorsCh <- err
 		}
 	}()
-	go func() {
-		defer workers.Done()
-		if cfg.WireVersion == 2 {
-			errorsCh <- bridge.RunHuman(ctx, source, auth.WorkspaceID)
-		} else {
-			errorsCh <- bridge.Run(ctx, source)
-		}
-	}()
+	if !*localFixture {
+		go func() {
+			defer workers.Done()
+			if cfg.WireVersion == 2 {
+				errorsCh <- bridge.RunHuman(ctx, source, auth.WorkspaceID)
+			} else {
+				errorsCh <- bridge.Run(ctx, source)
+			}
+		}()
+	}
 	go func() {
 		defer workers.Done()
 		tick := time.NewTicker(time.Second)
@@ -220,7 +267,9 @@ func run(args []string) error {
 		cancel()
 	}
 	cancel()
-	source.Close()
+	if source != nil {
+		source.Close()
+	}
 	shutdownCtx, done := context.WithTimeout(context.Background(), 10*time.Second)
 	defer done()
 	shutdownErr := server.Shutdown(shutdownCtx)

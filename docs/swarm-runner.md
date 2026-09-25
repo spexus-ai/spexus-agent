@@ -11,22 +11,26 @@ Config JSON fields:
   "credential_file": "/run/secrets/runtime-token",
   "tenant_id": "UUID",
   "project_id": "UUID",
-  "agent_id": "UUID",
+  "agent_id": "orchestrator",
   "instance_id": "UUID",
   "role": "owner",
-  "profile_file": "/run/profiles/owner.json",
+  "profile_id": "orchestrator",
+  "available_models": ["openai-codex/gpt-6-luna"],
   "state_directory": "/var/lib/swarm",
   "workspace": "/workspace",
   "pi_binary": "pi",
   "targets": [
-    {"agent_id": "WORKER_UUID", "profile_file": "/run/profiles/worker-a.json"}
+    {"agent_id": "worker-a", "profile_id": "worker-a"},
+    {"agent_id": "worker-b", "profile_id": "worker-b"}
   ]
 }
 ```
 
-Worker config uses role `worker` and `targets: []`. Each profile is the exact immutable UTF-8 JSON `swarm.TextProfile` snapshot used by coordinator: `id`, `model` (`provider/model`), `reasoning`, `prompt`, `tools: []`, `extensions: []`. Files are hashed as read, without reserialization. No extra tool or extension is accepted. Targets provide only allowed dispatch profile metadata to the owner; the actual owner model chooses dispatch/review/cancel. Runtime fills IDs and authority. Pi credentials are runtime mounted into its normal auth location (`PI_CODING_AGENT_DIR`); they are never config/profile/prompt fields.
+Worker config uses role `worker`, its bound `profile_id`, and `targets: []`. No editable profile file is mounted. The coordinator reads the scoped active snapshot from the backend before dispatch, and the runner reads it again before each start. Exact canonical UTF-8 bytes and SHA-256 are checked independently; the dispatch includes generation and digest. An atomic backend launch claim must match both before Pi starts. The runner pins the claim, bytes, model, and reasoning in SQLite. `available_models` is the deployment's actual Pi model allowlist; a backend-selected model outside it is denied. Tools and extensions stay empty. Pi credentials are runtime mounted into its normal auth location (`PI_CODING_AGENT_DIR`); they are never config/profile/prompt fields.
 
 State directory is private, writable and persistent. It contains `runner.db`, an exclusive process lock, and `sessions/`. Workspace is private and may be empty; Pi tools and autoloaders are disabled. The configured instance_id is fixed for one process generation: restart requires the documented offline binding reconciliation, with proof that the previous process stopped. Journal startup never replays an input whose starting marker exists. Pending durable outbox can resume delivery; it never grants permission for a new model launch.
+
+After Pi `StartPrompt` confirms a physical launch, the runner persists that fact before reporting `launched` to the backend. On observation transport failure or restart, only that durable physical-launch record is retried; a claim without launch evidence remains unknown and never causes another Pi start. A changed/disabled profile prevents a new start while an already running attempt keeps its pinned revision.
 
 Client validates HTTPS CA/hostname with TLS1.2+, supplies bearer/instance headers, and uses only `/internal/agent/v1`. Coordinator must be ready before runner starts; initial heartbeat binds identity. Normal mailbox and control mailbox are polled separately, with heartbeat every10s. Retry retains request IDs. Definitive HTTP rejections are recorded; transient network/429/503 failures retain the durable outbox.
 
