@@ -60,6 +60,11 @@ func run(args []string) error {
 	localFixture := fs.Bool("local-fixture", false, "isolated preview fixture without Slack connection or messages")
 	feature := fs.String("feature-id", "", "feature UUID for history")
 	fixtureText := fs.String("fixture-text", "", "isolated local fixture input text")
+	fixtureEventID := fs.String("fixture-event-id", "", "stable isolated fixture source ID")
+	requestID := fs.String("request-id", "", "existing human request UUID for a wire-v2 fixture decision")
+	decisionKind := fs.String("decision-kind", "", "answer or deny for a wire-v2 fixture decision")
+	decisionText := fs.String("decision-text", "", "trusted fixture decision text")
+	decisionOptionID := fs.String("decision-option-id", "", "existing option ID for a choice answer")
 	failedTurn := fs.String("failed-turn-id", "", "failed owner turn UUID for offline recovery")
 	inputSeq := fs.Int64("input-mailbox-seq", 0, "original task.result mailbox sequence")
 	resultMessage := fs.String("result-message-id", "", "original task.result message UUID")
@@ -93,9 +98,12 @@ func run(args []string) error {
 	if err := load(*configPath, &cfg); err != nil {
 		return err
 	}
-	if args[0] == "inject-fixture" {
-		if !*localFixture || *feature == "" || strings.TrimSpace(*fixtureText) == "" {
-			return errors.New("inject-fixture requires --local-fixture, --feature-id and --fixture-text")
+	if args[0] == "inject-fixture" || args[0] == "stop-fixture" || args[0] == "continue-fixture" || args[0] == "decide-fixture" {
+		if !*localFixture || *feature == "" || *fixtureEventID == "" || args[0] == "inject-fixture" && strings.TrimSpace(*fixtureText) == "" {
+			return errors.New("fixture command requires --local-fixture, --feature-id and --fixture-event-id; inject-fixture also requires --fixture-text")
+		}
+		if args[0] == "decide-fixture" && (cfg.WireVersion != 2 || cfg.Human == nil || *requestID == "" || *decisionKind != "answer" && *decisionKind != "deny") {
+			return errors.New("decide-fixture requires wire_version 2, configured human backend, --request-id and --decision-kind answer|deny")
 		}
 		var selected *swarm.Feature
 		for i := range cfg.Features {
@@ -112,7 +120,23 @@ func run(args []string) error {
 			return err
 		}
 		defer store.Close()
-		receipt, _, err := store.Ingest(ctx, *feature, swarm.InputPayload{Text: *fixtureText, Source: swarm.Source{Kind: "slack", EventID: swarm.NewID(), ChannelID: selected.ChannelID, ThreadTS: selected.ThreadTS, ActorID: selected.AllowedActorIDs[0]}})
+		if args[0] == "decide-fixture" {
+			receipt, err := store.DecideLocalFixture(ctx, *feature, *requestID, *fixtureEventID, *decisionKind, *decisionText, *decisionOptionID, selected.AllowedActorIDs[0])
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(receipt)
+		}
+		var receipt swarm.LocalFixtureReceipt
+		if args[0] == "inject-fixture" {
+			receipt, err = store.InjectLocalFixture(ctx, *feature, swarm.InputPayload{Text: *fixtureText, Source: swarm.Source{Kind: "test", EventID: *fixtureEventID, ChannelID: selected.ChannelID, ThreadTS: selected.ThreadTS, ActorID: selected.AllowedActorIDs[0]}})
+		} else {
+			kind := "stop"
+			if args[0] == "continue-fixture" {
+				kind = "continue"
+			}
+			receipt, err = store.ControlLocalFixture(ctx, *feature, *fixtureEventID, kind, selected.AllowedActorIDs[0])
+		}
 		if err != nil {
 			return err
 		}
