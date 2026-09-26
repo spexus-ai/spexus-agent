@@ -21,7 +21,7 @@ type Store struct {
 	db             *sql.DB
 	lock           *os.File
 	cfg            Config
-	profiles       map[string]Profile
+	profileBackend *profileBackend
 	now            func() time.Time
 	mailboxLimit   int
 	mailboxBytes   int
@@ -53,7 +53,6 @@ const schema = `
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS scope (id INTEGER PRIMARY KEY CHECK(id=1),tenant_id TEXT NOT NULL,project_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (agent_id TEXT PRIMARY KEY,role TEXT NOT NULL,credential_sha256 TEXT NOT NULL,profile_id TEXT NOT NULL,instance_id TEXT NOT NULL DEFAULT '',heartbeat TEXT);
-CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY,revision TEXT NOT NULL,snapshot BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS features (id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,project_id TEXT NOT NULL,owner_agent_id TEXT NOT NULL REFERENCES agents(agent_id),data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY,feature_id TEXT NOT NULL REFERENCES features(id),current_attempt_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS attempts (seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,job_id TEXT NOT NULL REFERENCES jobs(id),agent_id TEXT NOT NULL REFERENCES agents(agent_id),state TEXT NOT NULL,data BLOB NOT NULL);
@@ -119,7 +118,12 @@ func openStore(ctx context.Context, path string, cfg Config, serviceStart bool) 
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{db: db, lock: lock, cfg: cfg, profiles: map[string]Profile{}, now: time.Now, mailboxLimit: 1000, mailboxBytes: 10 * 1024 * 1024, mailboxReserve: 40, humanWake: make(chan struct{}, 1), slackWake: make(chan struct{}, 1)}
+	s := &Store{db: db, lock: lock, cfg: cfg, now: time.Now, mailboxLimit: 1000, mailboxBytes: 10 * 1024 * 1024, mailboxReserve: 40, humanWake: make(chan struct{}, 1), slackWake: make(chan struct{}, 1)}
+	s.profileBackend, err = newProfileBackend(cfg.AgentProfiles, cfg.TenantID, cfg.ProjectID)
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
 	if err = s.bootstrapMode(ctx, serviceStart); err != nil {
 		s.Close()
 		return nil, err
@@ -247,22 +251,6 @@ func (s *Store) bootstrapMode(ctx context.Context, serviceStart bool) error {
 	}
 	if count != len(s.cfg.Agents) {
 		return fmt.Errorf("agent configuration changed")
-	}
-	for _, snap := range s.cfg.Profiles {
-		var p TextProfile
-		_ = json.Unmarshal(snap.Bytes, &p)
-		ref := Profile{ID: p.ID, Revision: Digest(snap.Bytes), Model: p.Model, Reasoning: p.Reasoning}
-		s.profiles[p.ID] = ref
-		if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO profiles(id,revision,snapshot) VALUES(?,?,?)", p.ID, ref.Revision, []byte(snap.Bytes)); err != nil {
-			return err
-		}
-		var rev string
-		if err = tx.QueryRowContext(ctx, "SELECT revision FROM profiles WHERE id=?", p.ID).Scan(&rev); err != nil {
-			return err
-		}
-		if rev != ref.Revision {
-			return fmt.Errorf("profile snapshot changed: %s", p.ID)
-		}
 	}
 	for _, f := range s.cfg.Features {
 		if err = s.registerFeature(ctx, tx, f); err != nil {

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,12 +25,97 @@ type fixture struct {
 	feature   Feature
 	instances map[string]string
 	tokens    map[string]string
+	profiles  map[string]Profile
+}
+
+func profileBackendFixture(t *testing.T, cfg *Config, profiles map[string][]byte) {
+	t.Helper()
+	claims := map[string]LaunchClaim{}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Tenant-ID") != cfg.TenantID || r.Header.Get("X-Project-ID") != cfg.ProjectID {
+			w.WriteHeader(403)
+			return
+		}
+		path := strings.TrimPrefix(r.URL.Path, "/api/v1/agent-profiles/")
+		parts := strings.Split(path, "/")
+		id := parts[0]
+		raw := profiles[id]
+		if raw == nil || len(parts) < 2 {
+			w.WriteHeader(404)
+			return
+		}
+		if parts[1] == "launch-claims" {
+			if r.Method == "GET" && len(parts) == 4 {
+				claim, ok := claims[id+":"+parts[2]+":"+parts[3]]
+				if !ok {
+					w.WriteHeader(404)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"schema_version": 1, "data": claim})
+				return
+			}
+			if r.Method == "POST" {
+				var request LaunchClaimRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				if request.ExpectedGeneration != 1 || request.ExpectedRevision != Digest(raw) {
+					w.WriteHeader(412)
+					return
+				}
+				kind, executionID := "worker_attempt", request.ExecutionRef.WorkerAttemptID
+				if request.ExecutionRef.OwnerTurnID != "" {
+					kind, executionID = "owner_turn", request.ExecutionRef.OwnerTurnID
+				}
+				key := id + ":" + kind + ":" + executionID
+				claim, ok := claims[key]
+				if !ok {
+					claim = LaunchClaim{ClaimID: NewID(), ExecutionRef: request.ExecutionRef, ProfileID: id, Generation: 1, Revision: Digest(raw), SnapshotJSON: raw, SnapshotBytesBase64: base64.StdEncoding.EncodeToString(raw), State: "starting"}
+					claims[key] = claim
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"schema_version": 1, "data": claim})
+				return
+			}
+		}
+		if parts[1] == "observations" && r.Method == "POST" {
+			var request LaunchObservationRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"schema_version": 1, "data": map[string]any{"profile_id": id, "claim_id": request.ClaimID, "revision": request.Revision, "outcome": request.Outcome}})
+			return
+		}
+		if r.Method != "GET" || parts[1] != "active" {
+			w.WriteHeader(404)
+			return
+		}
+		role, slot := "worker", id
+		if id == "orchestrator" {
+			role, slot = "owner", "owner"
+		}
+		response := struct {
+			SchemaVersion int           `json:"schema_version"`
+			Data          ActiveProfile `json:"data"`
+		}{1, ActiveProfile{Slot: slot, Role: role, ProfileID: id, Enabled: true, Generation: 1, ActiveRevision: Digest(raw), SnapshotJSON: raw, SnapshotBytesBase64: base64.StdEncoding.EncodeToString(raw), AllowedModels: []string{"openai-codex/gpt-6-luna"}}}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	t.Cleanup(server.Close)
+	ca := filepath.Join(t.TempDir(), "profile-ca.pem")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	token := filepath.Join(t.TempDir(), "profile-token")
+	if err := os.WriteFile(token, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.AgentProfiles = &AgentProfileBackend{BaseURL: server.URL, CAFile: ca, TokenFile: token, AllowedModels: []string{"openai-codex/gpt-6-luna"}}
 }
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	ctx := context.Background()
-	f := &fixture{t: t, instances: map[string]string{}, tokens: map[string]string{}}
+	f := &fixture{t: t, instances: map[string]string{}, tokens: map[string]string{}, profiles: map[string]Profile{}}
+	profileBytes := map[string][]byte{}
 	tenant, project := NewID(), NewID()
 	f.feature = Feature{FeatureID: NewID(), TenantID: tenant, ProjectID: project, OwnerAgentID: "orchestrator", ChannelID: "channel", ThreadTS: "123.4", AllowedActorIDs: []string{"human"}}
 	f.cfg = Config{TenantID: tenant, ProjectID: project, Features: []Feature{f.feature}}
@@ -40,8 +128,10 @@ func newFixture(t *testing.T) *fixture {
 		f.tokens[id] = token
 		f.instances[id] = NewID()
 		f.cfg.Agents = append(f.cfg.Agents, AgentConfig{AgentID: id, Role: role, CredentialSHA256: Digest([]byte(token)), ProfileID: id})
-		f.cfg.Profiles = append(f.cfg.Profiles, ProfileSnapshot{Bytes: mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return only JSON", Tools: []string{}, Extensions: []string{}})})
+		profileBytes[id] = mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return only JSON", Tools: []string{}, Extensions: []string{}})
+		f.profiles[id] = Profile{ID: id, Revision: Digest(profileBytes[id]), Generation: 1, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal"}
 	}
+	profileBackendFixture(t, &f.cfg, profileBytes)
 	s, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"), f.cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +200,7 @@ func (f *fixture) ownerTurn() string {
 }
 func (f *fixture) dispatch(turn, worker string) Envelope {
 	f.t.Helper()
-	return Envelope{ProtocolVersion: 1, MessageID: NewID(), Type: "task.dispatch", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: worker, OwnerTurnID: turn, JobID: NewID(), AttemptID: NewID(), SentAt: f.s.stamp(), Payload: mustJSON(DispatchPayload{Goal: "Compute result", Scope: "Only supplied text", ExpectedResult: []string{"Correct sum"}, Context: TaskContext{Text: worker + "-secret", Refs: []ContextRef{}}, Profile: f.s.profiles[worker], AcceptBy: f.s.now().UTC().Add(60 * time.Second).Format(time.RFC3339Nano), RunTimeoutSeconds: 600})}
+	return Envelope{ProtocolVersion: 1, MessageID: NewID(), Type: "task.dispatch", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: worker, OwnerTurnID: turn, JobID: NewID(), AttemptID: NewID(), SentAt: f.s.stamp(), Payload: mustJSON(DispatchPayload{Goal: "Compute result", Scope: "Only supplied text", ExpectedResult: []string{"Correct sum"}, Context: TaskContext{Text: worker + "-secret", Refs: []ContextRef{}}, Profile: f.profiles[worker], AcceptBy: f.s.now().UTC().Add(60 * time.Second).Format(time.RFC3339Nano), RunTimeoutSeconds: 600})}
 }
 func (f *fixture) event(d Envelope, kind string, payload any, causeID string) Envelope {
 	f.t.Helper()
@@ -118,7 +208,7 @@ func (f *fixture) event(d Envelope, kind string, payload any, causeID string) En
 }
 func (f *fixture) started(d Envelope) (Envelope, Envelope) {
 	f.t.Helper()
-	a := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.s.profiles[d.ToAgentID].Revision}, d.MessageID)
+	a := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.profiles[d.ToAgentID].Revision}, d.MessageID)
 	f.post(d.ToAgentID, a, 201)
 	start := f.event(d, "task.started", StartedPayload{a.MessageID}, a.MessageID)
 	f.post(d.ToAgentID, start, 201)
@@ -300,7 +390,7 @@ func TestDeadlinesFailUnavailableAndLateStartSeparately(t *testing.T) {
 	a, b := f.dispatch(turn, "worker-a"), f.dispatch(turn, "worker-b")
 	f.post("orchestrator", a, 201)
 	f.post("orchestrator", b, 201)
-	accepted := f.event(b, "task.accepted", AcceptedPayload{b.MessageID, f.s.profiles["worker-b"].Revision}, b.MessageID)
+	accepted := f.event(b, "task.accepted", AcceptedPayload{b.MessageID, f.profiles["worker-b"].Revision}, b.MessageID)
 	f.post("worker-b", accepted, 201)
 	now = now.Add(31 * time.Second)
 	late := f.event(b, "task.started", StartedPayload{accepted.MessageID}, accepted.MessageID)
@@ -328,7 +418,7 @@ func TestDeadlinesFailUnavailableAndLateStartSeparately(t *testing.T) {
 	if count != 2 {
 		t.Fatal("deadline duplicated terminal events")
 	}
-	lateAccepted := f.event(a, "task.accepted", AcceptedPayload{a.MessageID, f.s.profiles["worker-a"].Revision}, a.MessageID)
+	lateAccepted := f.event(a, "task.accepted", AcceptedPayload{a.MessageID, f.profiles["worker-a"].Revision}, a.MessageID)
 	f.post("worker-a", lateAccepted, 409)
 }
 func TestCommitFailureRollsBackJobAndDoesNotReturnReceipt(t *testing.T) {
@@ -376,7 +466,7 @@ func TestMailboxAtomicACKBoundsAndTerminalReserve(t *testing.T) {
 	d := f.dispatch(turn, "worker-a")
 	f.post("orchestrator", d, 201)
 	f.s.mailboxLimit = 1
-	accepted := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.s.profiles["worker-a"].Revision}, d.MessageID)
+	accepted := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.profiles["worker-a"].Revision}, d.MessageID)
 	ar := f.post("worker-a", accepted, 201)
 	// A full ordinary mailbox rejects the whole transition, including its state change.
 	started := f.event(d, "task.started", StartedPayload{accepted.MessageID}, accepted.MessageID)
@@ -517,7 +607,7 @@ func TestPendingTerminalNotificationKeepsSequenceAndFIFO(t *testing.T) {
 	owner := f.ownerTurn()
 	d := f.dispatch(owner, "worker-a")
 	f.post("orchestrator", d, 201)
-	accepted := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.s.profiles["worker-a"].Revision}, d.MessageID)
+	accepted := f.event(d, "task.accepted", AcceptedPayload{d.MessageID, f.profiles["worker-a"].Revision}, d.MessageID)
 	ar := f.post("worker-a", accepted, 201)
 	f.call("orchestrator", "POST", "/acks", AckRequest{[]int64{ar.MailboxSeq}}, 200)
 	start := f.event(d, "task.started", StartedPayload{accepted.MessageID}, accepted.MessageID)

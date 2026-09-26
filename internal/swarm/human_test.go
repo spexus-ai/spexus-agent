@@ -19,7 +19,8 @@ import (
 
 func newHumanFixture(t *testing.T) *fixture {
 	t.Helper()
-	f := &fixture{t: t, instances: map[string]string{}, tokens: map[string]string{}}
+	f := &fixture{t: t, instances: map[string]string{}, tokens: map[string]string{}, profiles: map[string]Profile{}}
+	profileBytes := map[string][]byte{}
 	tenant, project := NewID(), NewID()
 	f.feature = Feature{FeatureID: NewID(), TenantID: tenant, ProjectID: project, OwnerAgentID: "orchestrator", ChannelID: "channel", ThreadTS: "123.4", AllowedActorIDs: []string{"human"}}
 	path := filepath.Join(t.TempDir(), "gateway.json")
@@ -36,8 +37,10 @@ func newHumanFixture(t *testing.T) *fixture {
 		f.tokens[id] = token
 		f.instances[id] = NewID()
 		f.cfg.Agents = append(f.cfg.Agents, AgentConfig{AgentID: id, Role: role, CredentialSHA256: Digest([]byte(token)), ProfileID: id})
-		f.cfg.Profiles = append(f.cfg.Profiles, ProfileSnapshot{Bytes: mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}})})
+		profileBytes[id] = mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}})
+		f.profiles[id] = Profile{ID: id, Revision: Digest(profileBytes[id]), Generation: 1, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal"}
 	}
+	profileBackendFixture(t, &f.cfg, profileBytes)
 	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "state.db"), f.cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +70,7 @@ func TestHumanGateAndSingleContinuation(t *testing.T) {
 	a := f.dispatch(turn, "worker-a")
 	a.ProtocolVersion = 2
 	f.post("orchestrator", a, 201)
-	accepted := f.event(a, "task.accepted", AcceptedPayload{DispatchMessageID: a.MessageID, ProfileRevision: f.s.profiles["worker-a"].Revision}, a.MessageID)
+	accepted := f.event(a, "task.accepted", AcceptedPayload{DispatchMessageID: a.MessageID, ProfileRevision: f.profiles["worker-a"].Revision}, a.MessageID)
 	accepted.ProtocolVersion = 2
 	f.post("worker-a", accepted, 201)
 	started := f.event(a, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)

@@ -263,7 +263,7 @@ func (s *Store) finishOwner(ctx context.Context, p Principal, id string, r Owner
 		// Keep the requested reply in the immutable finish for replay, but only
 		// publish it when this transaction proves the review is truly final.
 		replyReady := true
-		if s.wireVersion() == 2 && r.Outcome == "succeeded" && r.Reply != "" && (len(r.Actions) != 0 || triggerKind == "task.result") {
+		if r.Outcome == "succeeded" && r.Reply != "" && (triggerKind == "task.result" || s.wireVersion() == 2 && len(r.Actions) != 0) {
 			ready, err := s.finalReviewReady(ctx, tx, t, r.Actions)
 			if err != nil {
 				return err
@@ -317,10 +317,10 @@ type finalReviewState struct {
 }
 
 // A final review is ready only after the exact triggering result was accepted,
-// every job is accepted, no human question remains, and no newer owner input
-// is waiting. The check runs in the same transaction as owner finish.
+// the current work is terminal, no human question remains, and no newer owner
+// input is waiting. The check runs in the same transaction as owner finish.
 func (s *Store) finalReviewReady(ctx context.Context, tx *sql.Tx, t turnRecord, actions []ActionReceipt) (*finalReviewState, error) {
-	if s.wireVersion() != 2 || len(actions) > 1 {
+	if len(actions) > 1 {
 		return nil, nil
 	}
 	var row, size int64
@@ -383,7 +383,32 @@ func (s *Store) finalReviewReady(ctx context.Context, tx *sql.Tx, t turnRecord, 
 		}
 	}
 	var total, unfinished, openQuestions int
-	if err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(CASE
+	if s.wireVersion() == 1 {
+		// Scope a Slack reply to work dispatched since the latest human input.
+		// An older terminal failure must not suppress later requests in the
+		// same thread, while another running or unreviewed success must wait.
+		var latestInput, dispatchRow int64
+		if err = tx.QueryRowContext(ctx, `SELECT coalesce(max(id),0) FROM messages WHERE feature_id=? AND kind='agent.input'`, t.FeatureID).Scan(&latestInput); err != nil {
+			return nil, err
+		}
+		if err = tx.QueryRowContext(ctx, `SELECT id FROM messages WHERE feature_id=? AND attempt_id=? AND kind='task.dispatch'`, t.FeatureID, result.AttemptID).Scan(&dispatchRow); errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		} else if err != nil {
+			return nil, err
+		}
+		if dispatchRow <= latestInput {
+			return nil, nil
+		}
+		if err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(CASE
+			WHEN a.state='succeeded' AND json_extract(a.data,'$.review')='accepted' THEN 0
+			WHEN a.state IN ('failed','cancelled','interrupted') THEN 0
+			ELSE 1 END),0)
+			FROM jobs j JOIN attempts a ON a.id=j.current_attempt_id
+			JOIN messages m ON m.feature_id=j.feature_id AND m.attempt_id=a.id AND m.kind='task.dispatch'
+			WHERE j.feature_id=? AND m.id>?`, t.FeatureID, latestInput).Scan(&total, &unfinished); err != nil {
+			return nil, err
+		}
+	} else if err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(CASE
 		WHEN a.state IN ('succeeded','failed') AND json_extract(a.data,'$.review')='accepted' THEN 0
 		WHEN a.state='blocked' AND EXISTS (SELECT 1 FROM dependencies d WHERE d.job_id=j.id AND d.state IN ('denied','cancelled')) THEN 0
 		ELSE 1 END),0)

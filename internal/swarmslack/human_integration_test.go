@@ -39,13 +39,12 @@ func (f *durableFixture) Send(ctx context.Context, event slack.Event) error {
 
 func newHumanTransportStore(t *testing.T) (*swarm.Store, swarm.Feature) {
 	t.Helper()
-	owner := swarm.NewID()
-	profile := swarm.TextProfile{ID: "owner", Model: "fixture/test", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}}
-	profileBytes, _ := json.Marshal(profile)
-	cfg := swarm.Config{TenantID: swarm.NewID(), ProjectID: swarm.NewID(), WireVersion: 2, Human: &swarm.HumanConfig{BaseURL: "https://example.invalid", TokenFile: filepath.Join(t.TempDir(), "token.json"), EpicID: swarm.NewID(), WriterID: swarm.NewID(), WorkspaceID: "W"}, Agents: []swarm.AgentConfig{{AgentID: owner, Role: "owner", CredentialSHA256: swarm.Digest([]byte("secret")), ProfileID: "owner"}}, Profiles: []swarm.ProfileSnapshot{{Bytes: profileBytes}}}
-	for i, id := range []string{swarm.NewID(), swarm.NewID()} {
-		cfg.Agents = append(cfg.Agents, swarm.AgentConfig{AgentID: id, Role: "worker", CredentialSHA256: swarm.Digest([]byte{byte(i + 1)}), ProfileID: "owner"})
+	owner := "orchestrator"
+	cfg := swarm.Config{TenantID: swarm.NewID(), ProjectID: swarm.NewID(), WireVersion: 2, Human: &swarm.HumanConfig{BaseURL: "https://example.invalid", TokenFile: filepath.Join(t.TempDir(), "token.json"), EpicID: swarm.NewID(), WriterID: swarm.NewID(), WorkspaceID: "W"}, Agents: []swarm.AgentConfig{{AgentID: owner, Role: "owner", CredentialSHA256: swarm.Digest([]byte("secret")), ProfileID: owner}}}
+	for i, id := range []string{"worker-a", "worker-b"} {
+		cfg.Agents = append(cfg.Agents, swarm.AgentConfig{AgentID: id, Role: "worker", CredentialSHA256: swarm.Digest([]byte{byte(i + 1)}), ProfileID: id})
 	}
+	profileServiceFixture(t, &cfg, "fixture/test")
 	f := swarm.Feature{FeatureID: swarm.NewID(), TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, OwnerAgentID: owner, ChannelID: "C", ThreadTS: "1.000001", AllowedActorIDs: []string{"U"}}
 	cfg.Features = []swarm.Feature{f}
 	store, err := swarm.Open(context.Background(), filepath.Join(t.TempDir(), "swarm.db"), cfg)

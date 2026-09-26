@@ -14,13 +14,23 @@ const APIPrefix = "/internal/agent/v1"
 const MaxEnvelopeBytes = 128 * 1024
 
 type Config struct {
-	TenantID    string            `json:"tenant_id"`
-	ProjectID   string            `json:"project_id"`
-	WireVersion int               `json:"wire_version,omitempty"`
-	Human       *HumanConfig      `json:"human,omitempty"`
-	Agents      []AgentConfig     `json:"agents"`
-	Features    []Feature         `json:"features"`
-	Profiles    []ProfileSnapshot `json:"profiles"`
+	TenantID      string               `json:"tenant_id"`
+	ProjectID     string               `json:"project_id"`
+	WireVersion   int                  `json:"wire_version,omitempty"`
+	Human         *HumanConfig         `json:"human,omitempty"`
+	AgentProfiles *AgentProfileBackend `json:"agent_profiles"`
+	Agents        []AgentConfig        `json:"agents"`
+	Features      []Feature            `json:"features"`
+}
+
+// AgentProfileBackend is coordinator-only. Runner credentials never include
+// the backend JWT; the coordinator checks its own durable execution journal
+// before forwarding a launch claim.
+type AgentProfileBackend struct {
+	BaseURL       string   `json:"base_url"`
+	CAFile        string   `json:"ca_file"`
+	TokenFile     string   `json:"token_file"`
+	AllowedModels []string `json:"allowed_models"`
 }
 
 // HumanConfig is coordinator-only. Runners never receive backend credentials.
@@ -39,10 +49,6 @@ type AgentConfig struct {
 	ProfileID        string `json:"profile_id"`
 }
 
-// Bytes is the exact UTF-8 JSON snapshot, not reserialized before hashing.
-type ProfileSnapshot struct {
-	Bytes json.RawMessage `json:"bytes"`
-}
 type TextProfile struct {
 	ID         string   `json:"id"`
 	Model      string   `json:"model"`
@@ -52,10 +58,11 @@ type TextProfile struct {
 	Extensions []string `json:"extensions"`
 }
 type Profile struct {
-	ID        string `json:"id"`
-	Revision  string `json:"revision"`
-	Model     string `json:"model"`
-	Reasoning string `json:"reasoning"`
+	ID         string `json:"id"`
+	Revision   string `json:"revision"`
+	Generation int64  `json:"generation"`
+	Model      string `json:"model"`
+	Reasoning  string `json:"reasoning"`
 }
 
 func Digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }

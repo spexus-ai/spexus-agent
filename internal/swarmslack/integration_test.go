@@ -180,25 +180,18 @@ func eventually(t *testing.T, what string, fn func() bool) {
 func TestRealRunnerProcessesTwoWorkersAndDurableSlack(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	ids := []string{swarm.NewID(), swarm.NewID(), swarm.NewID()}
+	ids := []string{"orchestrator", "worker-a", "worker-b"}
 	instances := []string{swarm.NewID(), swarm.NewID(), swarm.NewID()}
 	tokens := []string{"test-owner-token", "test-worker-a-token", "test-worker-b-token"}
 	cfg := swarm.Config{TenantID: swarm.NewID(), ProjectID: swarm.NewID()}
-	profiles := make([]string, 3)
 	for i := range ids {
 		role := "worker"
 		if i == 0 {
 			role = "owner"
 		}
-		p := swarm.TextProfile{ID: role + fmt.Sprint(i), Model: "fixture/test", Reasoning: "minimal", Prompt: "Text-only integration fixture", Tools: []string{}, Extensions: []string{}}
-		b, _ := json.Marshal(p)
-		profiles[i] = filepath.Join(dir, fmt.Sprintf("profile%d.json", i))
-		if err := os.WriteFile(profiles[i], b, 0600); err != nil {
-			t.Fatal(err)
-		}
-		cfg.Profiles = append(cfg.Profiles, swarm.ProfileSnapshot{Bytes: b})
-		cfg.Agents = append(cfg.Agents, swarm.AgentConfig{AgentID: ids[i], Role: role, CredentialSHA256: swarm.Digest([]byte(tokens[i])), ProfileID: p.ID})
+		cfg.Agents = append(cfg.Agents, swarm.AgentConfig{AgentID: ids[i], Role: role, CredentialSHA256: swarm.Digest([]byte(tokens[i])), ProfileID: ids[i]})
 	}
+	profileServiceFixture(t, &cfg, "fixture/test")
 	f := swarm.Feature{FeatureID: swarm.NewID(), TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, OwnerAgentID: ids[0], ChannelID: "C-TEST", ThreadTS: "123.456", AllowedActorIDs: []string{"U-TEST"}}
 	cfg.Features = []swarm.Feature{f}
 	store, err := swarm.Open(ctx, filepath.Join(dir, "coordinator.db"), cfg)
@@ -227,9 +220,9 @@ func TestRealRunnerProcessesTwoWorkersAndDurableSlack(t *testing.T) {
 		tokenFile := filepath.Join(private, "token")
 		_ = os.WriteFile(tokenFile, []byte(tokens[i]), 0600)
 		states[i] = filepath.Join(private, "state")
-		c := swarmrunner.Config{CoordinatorURL: server.URL, CAFile: ca, CredentialFile: tokenFile, TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, AgentID: ids[i], InstanceID: instances[i], Role: cfg.Agents[i].Role, ProfileFile: profiles[i], StateDirectory: states[i], Workspace: private, PiBinary: binary, Targets: []swarmrunner.Target{}}
+		c := swarmrunner.Config{CoordinatorURL: server.URL, CAFile: ca, CredentialFile: tokenFile, TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, AgentID: ids[i], InstanceID: instances[i], Role: cfg.Agents[i].Role, ProfileID: ids[i], StateDirectory: states[i], Workspace: private, PiBinary: binary, AvailableModels: []string{"fixture/test"}, Targets: []swarmrunner.Target{}}
 		if i == 0 {
-			c.Targets = []swarmrunner.Target{{AgentID: ids[1], ProfileFile: profiles[1]}, {AgentID: ids[2], ProfileFile: profiles[2]}}
+			c.Targets = []swarmrunner.Target{{AgentID: ids[1], ProfileID: ids[1]}, {AgentID: ids[2], ProfileID: ids[2]}}
 		}
 		configPath := filepath.Join(private, "config.json")
 		writeJSON(t, configPath, c)
@@ -291,7 +284,7 @@ func TestRealRunnerProcessesTwoWorkersAndDurableSlack(t *testing.T) {
 				return false
 			}
 		}
-		return len(h.SlackOutbox) == 2 // The dispatch turn is visible as temporary status, not a persistent reply.
+		return len(h.SlackOutbox) == 1
 	})
 	for _, j := range h.Jobs {
 		a := j.Attempts[0]
@@ -367,7 +360,7 @@ func TestRealRunnerProcessesTwoWorkersAndDurableSlack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(after.Jobs) != 2 || len(after.Turns) != 3 || len(after.SlackOutbox) != 2 {
+	if len(after.Jobs) != 2 || len(after.Turns) != 3 || len(after.SlackOutbox) != 1 {
 		t.Fatal("duplicate/foreign input mutated business work")
 	}
 	// Slack accepted publication but its response was lost. Correlation lookup
@@ -385,7 +378,7 @@ func TestRealRunnerProcessesTwoWorkersAndDurableSlack(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(api.posts) != 2 {
+	if len(api.posts) != 1 {
 		t.Fatalf("Slack duplicate: %d posts", len(api.posts))
 	}
 	// Stop processes before inspecting their persistent journals.

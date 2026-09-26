@@ -184,7 +184,7 @@ func p3Scenario(t *testing.T, scenario string) {
 	p3Must(t, os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600))
 	token := filepath.Join(dir, "fixture-token")
 	p3Must(t, os.WriteFile(token, []byte("test-token-owner"), 0600))
-	c := Config{CoordinatorURL: server.URL, CAFile: ca, CredentialFile: token, TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, AgentID: "owner", InstanceID: swarm.NewID(), Role: "owner", ProfileFile: profiles[0], StateDirectory: filepath.Join(dir, "runner"), Workspace: filepath.Join(dir, "workspace"), Targets: []Target{{"worker-a", profiles[1]}, {"worker-b", profiles[2]}}}
+	c := Config{CoordinatorURL: server.URL, CAFile: ca, CredentialFile: token, TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, AgentID: "owner", InstanceID: swarm.NewID(), Role: "owner", ProfileFile: profiles[0], StateDirectory: filepath.Join(dir, "runner"), Workspace: filepath.Join(dir, "workspace"), Targets: []Target{{AgentID: "worker-a", ProfileFile: profiles[1]}, {AgentID: "worker-b", ProfileFile: profiles[2]}}}
 	p3Must(t, os.MkdirAll(c.Workspace, 0700))
 	configPath := filepath.Join(dir, "runner-config.json")
 	p3Write(t, configPath, c)

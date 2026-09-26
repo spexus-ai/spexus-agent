@@ -118,7 +118,9 @@ func TestHumanStrictOutputAndOwnerActions(t *testing.T) {
 	r, _ := runnerFixture(t, handler)
 	r.cfg.WireVersion = 2
 	r.cfg.Role = "owner"
+	r.cfg.ProfileID = "orchestrator"
 	r.cfg.AgentID = "orchestrator"
+	r.cfg.Targets = []Target{{AgentID: "worker-a", ProfileID: "worker-a"}}
 	r.targets = []targetProfile{{AgentID: "worker-a", Profile: r.profile.wire()}}
 	d := dispatchFixture(r)
 	d.Type = "human.decision"
@@ -237,7 +239,9 @@ func TestOwnerSelfResolutionAndResumeInOneTurn(t *testing.T) {
 	r, _ = runnerFixture(t, handler)
 	r.cfg.WireVersion = 2
 	r.cfg.Role = "owner"
+	r.cfg.ProfileID = "orchestrator"
 	r.cfg.AgentID = "orchestrator"
+	r.cfg.Targets = []Target{{AgentID: "worker-a", ProfileID: "worker-a"}}
 	r.targets = []targetProfile{{AgentID: "worker-a", Profile: r.profile.wire()}}
 	dispatch := swarm.DispatchPayload{Goal: "finish the task", Scope: "given recorded resolution", ExpectedResult: []string{"done"}, Context: swarm.TaskContext{Text: "original task, blocker and self-resolution", Refs: []swarm.ContextRef{}}, Profile: r.profile.wire()}
 	resolveData, _ := json.Marshal(swarm.ResolveDependencyPayload{DependencyID: depID, Resolution: "The documented rule permits this", Evidence: []swarm.Evidence{}})

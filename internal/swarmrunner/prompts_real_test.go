@@ -84,7 +84,7 @@ func TestRealPiOwnerContractDoesNotAccumulateInTurnHistory(t *testing.T) {
 		if strings.Contains(input, "Dispatch data:") || strings.Contains(input, "Wire v2 human requests:") {
 			t.Fatal("static instructions leaked into turn input")
 		}
-		if _, _, err := m.Run(ctx, c.session(d), input); err != nil {
+		if _, _, err := m.RunWithLaunch(ctx, c.session(d), input, nil, func() error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -108,7 +108,7 @@ func TestRealPiOwnerContractDoesNotAccumulateInTurnHistory(t *testing.T) {
 	if _, err := harness.CollectPromptStream(stream); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := m.Run(ctx, "legacy", "NEW_EVENT"); err != nil {
+	if _, _, err := m.RunWithLaunch(ctx, "legacy", "NEW_EVENT", nil, func() error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
