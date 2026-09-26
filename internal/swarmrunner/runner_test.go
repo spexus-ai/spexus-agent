@@ -155,6 +155,57 @@ func TestWorkerRejectsMalformedBlockedResultAfterOneCorrection(t *testing.T) {
 		t.Fatalf("launches=%d results=%+v", launches, published)
 	}
 }
+
+func TestWireOneWorkerCorrectsUnsupportedBlockedOutcome(t *testing.T) {
+	var acceptedID string
+	var published []swarm.ResultPayload
+	handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.URL.Path == swarm.APIPrefix+"/messages" {
+			var message swarm.Envelope
+			if err := json.NewDecoder(q.Body).Decode(&message); err != nil {
+				t.Error(err)
+			}
+			if message.Type == "task.accepted" {
+				acceptedID = message.MessageID
+			}
+			if message.Type == "task.result" {
+				var result swarm.ResultPayload
+				if err := json.Unmarshal(message.Payload, &result); err != nil {
+					t.Error(err)
+				}
+				published = append(published, result)
+			}
+			writeJSON(w, swarm.Receipt{MessageID: message.MessageID, Receipt: "stored", MailboxSeq: 2})
+			return
+		}
+		if strings.Contains(q.URL.Path, "/jobs/") {
+			writeJSON(w, swarm.JobView{JobID: job, FeatureID: feature, CurrentAttemptID: attempt, Attempts: []swarm.Attempt{{AttemptID: attempt, AssignedAgentID: "worker-a", State: "running", AcceptedMessageID: acceptedID}}})
+			return
+		}
+		t.Errorf("unexpected request %s", q.URL.Path)
+		w.WriteHeader(404)
+	})
+	r, _ := runnerFixture(t, handler)
+	d := dispatchFixture(r)
+	storeInput(t, r, d)
+	launches := 0
+	r.model = modelFunc(func(_ context.Context, _, input string) (string, bool, error) {
+		launches++
+		if launches == 1 {
+			return `{"outcome":"blocked","summary":"Кому нужен отчёт?","evidence":[],"error":null,"blocker":{"reason":"Нужна аудитория","context":"Неизвестна","question":"Кому?","options":[],"recommendation":"Уточнить","kind":"clarification"}}`, false, nil
+		}
+		if !strings.Contains(input, "wire v1") || !strings.Contains(input, "outcome blocked") {
+			t.Fatal("correction omitted the unsupported outcome")
+		}
+		return `{"outcome":"succeeded","summary":"Кому нужен отчёт?","evidence":[],"error":null}`, false, nil
+	})
+	if err := r.process(context.Background(), d); err != nil {
+		t.Fatal(err)
+	}
+	if launches != 2 || len(published) != 1 || published[0].Outcome != "succeeded" || published[0].Summary != "Кому нужен отчёт?" {
+		t.Fatalf("launches=%d results=%+v", launches, published)
+	}
+}
 func httpError(w http.ResponseWriter, status int, code string) {
 	w.WriteHeader(status)
 	writeJSON(w, map[string]any{"error": map[string]any{"code": code}})

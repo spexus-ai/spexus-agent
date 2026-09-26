@@ -282,6 +282,9 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 	if o.Actions == nil || len(o.Actions) > 8 || len(o.Reply) > 16*1024 {
 		return o, nil, errors.New("invalid owner output bounds")
 	}
+	if r.cfg.wireVersion() == 1 && d.Type == "task.result" && len(o.Actions) == 1 && o.Actions[0].Kind == "review" && strings.TrimSpace(o.Reply) == "" {
+		return o, nil, &reviewPreflightError{reason: "a review-only task.result turn needs a nonempty human-facing reply; report the verified result and any remaining limitation"}
+	}
 	if d.Type == "task.result" {
 		// Reject malformed review evidence before any dependent read, as with
 		// ordinary owner action validation.
@@ -304,15 +307,29 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 		}
 		if !reviewedTrigger(d, v) {
 			for _, attempt := range v.Attempts {
-				if attempt.AttemptID != d.AttemptID || attempt.ResultMessageID != d.MessageID || attempt.Result == nil || attempt.Result.Outcome != "succeeded" || attempt.Review != "pending" {
+				if attempt.AttemptID != d.AttemptID || attempt.ResultMessageID != d.MessageID || attempt.Result == nil || attempt.Review != "pending" {
 					continue
 				}
 				containsReview := false
 				for _, a := range o.Actions {
 					containsReview = containsReview || a.Kind == "review"
 				}
-				if !containsReview {
+				if attempt.Result.Outcome == "succeeded" && !containsReview {
 					return o, nil, &reviewPreflightError{reason: "a successful task.result needs an explicit review action before a reply or further dispatch"}
+				}
+				if attempt.Result.Outcome == "failed" && !containsReview {
+					for _, a := range o.Actions {
+						if a.Kind != "dispatch" {
+							continue
+						}
+						var retry dispatchAction
+						if err := decode(a.Data, &retry); err != nil {
+							return o, nil, err
+						}
+						if retry.JobID != d.JobID {
+							return o, nil, &reviewPreflightError{reason: "retry a failed task.result with the same job_id, or review the failure before dispatching a separate job"}
+						}
+					}
 				}
 			}
 		}

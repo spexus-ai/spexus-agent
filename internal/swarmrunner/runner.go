@@ -435,7 +435,12 @@ func (r *Runner) worker(ctx context.Context, d swarm.Delivery) error {
 	} else {
 		result, e = r.workerResult(d, raw)
 		if e != nil && ctx.Err() == nil {
-			correction := input + "\nYour preceding FINAL JSON failed strict validation. Return the complete corrected JSON object only. For a blocked result, blocker has exactly reason, context, question, options, recommendation and kind; never add dependency_id or blocked_work. The runtime creates IDs. Do not claim that the work was completed."
+			correction := input + "\nYour preceding FINAL JSON failed strict validation: " + e.Error() + ". Return the complete corrected JSON object only. Do not claim that the work was completed."
+			if r.cfg.wireVersion() == 1 {
+				correction += " This runtime uses wire v1: outcome blocked and the blocker field are not supported. If the assigned task asks for a clarifying question as its result, return outcome succeeded and put that question in summary. Otherwise return outcome failed with an error."
+			} else {
+				correction += " For a blocked result, blocker has exactly reason, context, question, options, recommendation and kind; never add dependency_id or blocked_work. The runtime creates IDs."
+			}
 			corrected, wasCancelled, retryErr := r.run(ctx, d, correction, prelaunch, claim, true)
 			cancelled, runErr = wasCancelled, retryErr
 			if corrected != "" {
@@ -606,7 +611,7 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 			if summaryMissing {
 				correction += "The final reply was empty. This result was already accepted; return actions:[] and a concise, nonempty human-facing summary of the recorded results."
 			} else {
-				correction += reviewErr.Error() + ". Return a complete corrected FINAL JSON. For a pending task.result, review only this event's job_id, attempt_id and message_id; do not repeat reviews of earlier attempts. If the trusted job shows this result was already accepted, return actions:[] and only summarize the recorded outcome."
+				correction += reviewErr.Error() + ". Return a complete corrected FINAL JSON. For a pending task.result, review only this event's job_id, attempt_id and message_id; do not repeat reviews of earlier attempts. If retrying a failed result, reuse its job_id. If the trusted job shows this result was already accepted, return actions:[] and only summarize the recorded outcome."
 			}
 			corrected, wasCancelled, retryErr := r.run(ctx, d, correction, prelaunch, claim, true)
 			cancelled, runErr = wasCancelled, retryErr
