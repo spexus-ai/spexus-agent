@@ -8,19 +8,23 @@ import (
 )
 
 func finishReviewedResult(t *testing.T, f *fixture, dispatch Envelope, verdict, reply string, beforeFinish ...func()) (string, OwnerFinishRequest, OwnerFinishReceipt) {
+	return finishReviewedResultWire(t, f, dispatch, verdict, reply, 2, beforeFinish...)
+}
+
+func finishReviewedResultWire(t *testing.T, f *fixture, dispatch Envelope, verdict, reply string, version int, beforeFinish ...func()) (string, OwnerFinishRequest, OwnerFinishReceipt) {
 	t.Helper()
 	accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.profiles[dispatch.ToAgentID].Revision}, dispatch.MessageID)
-	accepted.ProtocolVersion = 2
+	accepted.ProtocolVersion = version
 	f.post(dispatch.ToAgentID, accepted, 201)
 	started := f.event(dispatch, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)
-	started.ProtocolVersion = 2
+	started.ProtocolVersion = version
 	f.post(dispatch.ToAgentID, started, 201)
 	result := f.event(dispatch, "task.result", resultPayload(), started.MessageID)
-	result.ProtocolVersion = 2
+	result.ProtocolVersion = version
 	receipt := f.post(dispatch.ToAgentID, result, 201)
 	turnID := NewID()
 	f.call("orchestrator", "POST", "/owner-turns/start", OwnerStartRequest{TurnID: turnID, FeatureID: f.feature.FeatureID, InputMailboxSeq: receipt.MailboxSeq}, 201)
-	review := Envelope{ProtocolVersion: 2, MessageID: NewID(), Type: "task.review", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: dispatch.ToAgentID, OwnerTurnID: turnID, JobID: dispatch.JobID, AttemptID: dispatch.AttemptID, CausationID: cause(result.MessageID), SentAt: f.s.stamp(), Payload: mustJSON(ReviewPayload{ResultMessageID: result.MessageID, Verdict: verdict, Reason: "Checked", Evidence: []Evidence{}})}
+	review := Envelope{ProtocolVersion: version, MessageID: NewID(), Type: "task.review", TenantID: f.cfg.TenantID, ProjectID: f.cfg.ProjectID, FeatureID: f.feature.FeatureID, FromAgentID: "orchestrator", ToAgentID: dispatch.ToAgentID, OwnerTurnID: turnID, JobID: dispatch.JobID, AttemptID: dispatch.AttemptID, CausationID: cause(result.MessageID), SentAt: f.s.stamp(), Payload: mustJSON(ReviewPayload{ResultMessageID: result.MessageID, Verdict: verdict, Reason: "Checked", Evidence: []Evidence{}})}
 	f.post("orchestrator", review, 201)
 	for _, hook := range beforeFinish {
 		hook()
@@ -31,6 +35,51 @@ func finishReviewedResult(t *testing.T, f *fixture, dispatch Envelope, verdict, 
 		t.Fatal(err)
 	}
 	return turnID, request, finished
+}
+
+func TestWireOneParallelReviewsPublishOneFinalReply(t *testing.T) {
+	f := newFixture(t)
+	initial := f.ownerTurn()
+	a := f.dispatch(initial, "worker-a")
+	b := f.dispatch(initial, "worker-b")
+	f.post("orchestrator", a, 201)
+	f.post("orchestrator", b, 201)
+	f.finish(initial, "", []ActionReceipt{{MessageID: a.MessageID, Status: "stored"}, {MessageID: b.MessageID, Status: "stored"}}, 201)
+
+	_, _, first := finishReviewedResultWire(t, f, a, "accepted", "Первый результат готов.", 1)
+	if first.ReplyStatus != "none" || len(f.history().SlackOutbox) != 0 {
+		t.Fatalf("first worker replied before second finished: %+v", first)
+	}
+	_, _, last := finishReviewedResultWire(t, f, b, "accepted", "Оба результата проверены.", 1)
+	if last.ReplyStatus != "queued" {
+		t.Fatalf("final worker reply was not queued: %+v", last)
+	}
+	if outbox := f.history().SlackOutbox; len(outbox) != 1 || outbox[0].Text != "Оба результата проверены." {
+		t.Fatalf("expected one consolidated reply: %+v", outbox)
+	}
+}
+
+func TestWireOneEarlierFailedJobDoesNotHideNewReply(t *testing.T) {
+	f := newFixture(t)
+	first := f.ownerTurn()
+	failed := f.dispatch(first, "worker-a")
+	f.post("orchestrator", failed, 201)
+	f.finish(first, "", []ActionReceipt{{MessageID: failed.MessageID, Status: "stored"}}, 201)
+	accepted := f.event(failed, "task.accepted", AcceptedPayload{DispatchMessageID: failed.MessageID, ProfileRevision: f.profiles[failed.ToAgentID].Revision}, failed.MessageID)
+	f.post(failed.ToAgentID, accepted, 201)
+	started := f.event(failed, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)
+	f.post(failed.ToAgentID, started, 201)
+	result := f.event(failed, "task.result", ResultPayload{Outcome: "failed", Summary: "Model output was invalid", Evidence: []Evidence{}, Error: &TaskError{Code: "model_output_invalid", Message: "model_output_invalid"}, Origin: "worker"}, started.MessageID)
+	f.post(failed.ToAgentID, result, 201)
+
+	next := f.ownerTurn()
+	current := f.dispatch(next, "worker-b")
+	f.post("orchestrator", current, 201)
+	f.finish(next, "", []ActionReceipt{{MessageID: current.MessageID, Status: "stored"}}, 201)
+	_, _, finished := finishReviewedResultWire(t, f, current, "accepted", "Новая работа завершена.", 1)
+	if finished.ReplyStatus != "queued" {
+		t.Fatalf("earlier terminal failure hid current reply: %+v", finished)
+	}
 }
 
 func TestFinalReviewReplyRequiresFeatureCompletionAndIsIdempotent(t *testing.T) {
