@@ -39,3 +39,20 @@ func TestOwnerInputCarriesRecordedHumanBlockerContext(t *testing.T) {
 		t.Fatalf("owner lost the canonical context needed to explain the question: %+v", got)
 	}
 }
+
+func TestOwnerInputNamesWorkerCapabilitiesForRouting(t *testing.T) {
+	r := &Runner{
+		cfg: Config{Role: "owner"},
+		targets: []targetProfile{
+			{AgentID: "worker-a", Capabilities: []string{"Draft requirement text"}},
+			{AgentID: "worker-b", Capabilities: []string{"Review requirement text"}},
+		},
+	}
+	prompt, err := r.input(context.Background(), swarm.Delivery{Envelope: swarm.Envelope{Type: "agent.input", Payload: json.RawMessage(`{"text":"Draft an epic"}`)}})
+	if err != nil { t.Fatal(err) }
+	var input struct { Workers []targetProfile `json:"available_workers"` }
+	if err := json.Unmarshal([]byte(prompt), &input); err != nil { t.Fatal(err) }
+	if len(input.Workers) != 2 || input.Workers[0].AgentID != "worker-a" || input.Workers[0].Capabilities[0] != "Draft requirement text" || input.Workers[1].Capabilities[0] != "Review requirement text" {
+		t.Fatalf("orchestrator cannot route by capabilities: %+v", input.Workers)
+	}
+}

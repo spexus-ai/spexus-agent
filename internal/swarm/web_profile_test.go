@@ -6,7 +6,7 @@ import (
 )
 
 func TestWebProfileRejectsNoncanonicalAndUnsafeSnapshots(t *testing.T) {
-	p := TextProfile{ID: "worker-a", Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}}
+	p := TextProfile{ID: "worker-a", Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}, Capabilities: []string{"Text work"}}
 	canonical, err := json.Marshal(p)
 	if err != nil {
 		t.Fatal(err)

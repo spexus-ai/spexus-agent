@@ -50,12 +50,13 @@ type AgentConfig struct {
 }
 
 type TextProfile struct {
-	ID         string   `json:"id"`
-	Model      string   `json:"model"`
-	Reasoning  string   `json:"reasoning"`
-	Prompt     string   `json:"prompt"`
-	Tools      []string `json:"tools"`
-	Extensions []string `json:"extensions"`
+	ID           string   `json:"id"`
+	Model        string   `json:"model"`
+	Reasoning    string   `json:"reasoning"`
+	Prompt       string   `json:"prompt"`
+	Tools        []string `json:"tools"`
+	Extensions   []string `json:"extensions"`
+	Capabilities []string `json:"capabilities"`
 }
 type Profile struct {
 	ID         string `json:"id"`

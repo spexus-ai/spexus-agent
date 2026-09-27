@@ -56,7 +56,11 @@ func TestHumanActualProviderContract(t *testing.T) {
 			role = "owner"
 		}
 		cfg.Agents = append(cfg.Agents, AgentConfig{AgentID: id, Role: role, CredentialSHA256: Digest([]byte(NewID())), ProfileID: id})
-		profileBytes[id] = mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}})
+		capabilities := []string{}
+		if id != "orchestrator" {
+			capabilities = []string{"Text work"}
+		}
+		profileBytes[id] = mustJSON(TextProfile{ID: id, Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}, Capabilities: capabilities})
 	}
 	profileBackendFixture(t, &cfg, profileBytes)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -36,7 +36,7 @@ func (f modelFunc) RunWithLaunch(ctx context.Context, key, input string, _ func(
 }
 func profileFixture(t *testing.T) profile {
 	t.Helper()
-	p := swarm.TextProfile{ID: "worker-a", Model: "test/model", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}}
+	p := swarm.TextProfile{ID: "worker-a", Model: "test/model", Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}, Capabilities: []string{"Text work"}}
 	b, _ := json.Marshal(p)
 	return profile{TextProfile: p, Revision: swarm.Digest(b), Generation: 1, Bytes: b}
 }
@@ -47,7 +47,7 @@ func runnerFixture(t *testing.T, handler http.Handler) (*Runner, *httptest.Serve
 func runnerFixtureWithIntercept(t *testing.T, handler http.Handler, intercept func(http.ResponseWriter, *http.Request) bool) (*Runner, *httptest.Server) {
 	t.Helper()
 	p := profileFixture(t)
-	ownerText := swarm.TextProfile{ID: "orchestrator", Model: p.Model, Reasoning: p.Reasoning, Prompt: p.Prompt, Tools: []string{}, Extensions: []string{}}
+	ownerText := swarm.TextProfile{ID: "orchestrator", Model: p.Model, Reasoning: p.Reasoning, Prompt: p.Prompt, Tools: []string{}, Extensions: []string{}, Capabilities: []string{}}
 	ownerRaw, _ := json.Marshal(ownerText)
 	owner := profile{TextProfile: ownerText, Revision: swarm.Digest(ownerRaw), Generation: 1, Bytes: ownerRaw}
 	claimID := swarm.NewID()
@@ -462,7 +462,7 @@ func TestOwnerWholeOutputValidatedBeforeAnyAction(t *testing.T) {
 	r.cfg.ProfileID = "orchestrator"
 	r.cfg.AgentID = "owner"
 	r.cfg.Targets = []Target{{AgentID: "worker-a", ProfileID: "worker-a"}}
-	r.targets = []targetProfile{{"worker-a", r.profile.wire()}}
+	r.targets = []targetProfile{{AgentID: "worker-a", Profile: r.profile.wire()}}
 	d := dispatchFixture(r)
 	data := dispatchAction{WorkerAgentID: "worker-a", DispatchPayload: swarm.DispatchPayload{Goal: "sum", Scope: "only text", ExpectedResult: []string{"3"}, Context: swarm.TaskContext{Text: "A", Refs: []swarm.ContextRef{}}, Profile: r.profile.wire()}}
 	raw, _ := json.Marshal(data)

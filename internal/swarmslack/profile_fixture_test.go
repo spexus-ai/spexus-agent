@@ -21,7 +21,11 @@ func profileServiceFixture(t *testing.T, cfg *swarm.Config, model string) {
 	t.Helper()
 	profiles := map[string][]byte{}
 	for _, id := range []string{"orchestrator", "worker-a", "worker-b"} {
-		raw, err := json.Marshal(swarm.TextProfile{ID: id, Model: model, Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}})
+		capabilities := []string{}
+		if id != "orchestrator" {
+			capabilities = []string{"Text work"}
+		}
+		raw, err := json.Marshal(swarm.TextProfile{ID: id, Model: model, Reasoning: "minimal", Prompt: "Return JSON", Tools: []string{}, Extensions: []string{}, Capabilities: capabilities})
 		if err != nil {
 			t.Fatal(err)
 		}

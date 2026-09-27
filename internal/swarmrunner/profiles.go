@@ -192,7 +192,7 @@ func (r *Runner) refreshTargets(ctx context.Context) error {
 			}
 			return fmt.Errorf("target %s: %w", target.AgentID, err)
 		}
-		result = append(result, targetProfile{AgentID: target.AgentID, Profile: p.wire()})
+		result = append(result, targetProfile{AgentID: target.AgentID, Profile: p.wire(), Capabilities: p.Capabilities})
 	}
 	r.targets = result
 	return nil

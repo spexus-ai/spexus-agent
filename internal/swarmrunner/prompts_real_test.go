@@ -66,7 +66,7 @@ func TestRealPiOwnerContractDoesNotAccumulateInTurnHistory(t *testing.T) {
 		Role: "owner", WireVersion: 2, PiBinary: binary,
 		Workspace: dir, StateDirectory: filepath.Join(dir, "state"),
 	}
-	p := profile{TextProfile: swarm.TextProfile{ID: "owner", Model: "prototype-test/test-model", Reasoning: "off", Prompt: "PROFILE_RULE", Tools: []string{}, Extensions: []string{}}}
+	p := profile{TextProfile: swarm.TextProfile{ID: "owner", Model: "prototype-test/test-model", Reasoning: "off", Prompt: "PROFILE_RULE", Tools: []string{}, Extensions: []string{}, Capabilities: []string{}}}
 	m, err := newModel(c, p)
 	if err != nil {
 		t.Fatal(err)

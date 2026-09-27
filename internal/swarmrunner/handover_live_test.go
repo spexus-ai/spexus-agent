@@ -45,15 +45,15 @@ func TestRealPiWorkspaceHandover(t *testing.T) {
 	write("calc.test.js", "import { test } from 'node:test';\nimport { strict as assert } from 'node:assert';\nimport { add } from './calc.js';\n\ntest('add sums two numbers', () => assert.equal(add(2, 3), 5));\n")
 	profiles := map[string]swarm.TextProfile{
 		"orchestrator": {
-			ID: "orchestrator", Model: "openai-codex/gpt-6-luna", Reasoning: "low", Tools: []string{}, Extensions: []string{},
+			ID: "orchestrator", Model: "openai-codex/gpt-6-luna", Reasoning: "low", Tools: []string{}, Extensions: []string{}, Capabilities: []string{},
 			Prompt: `This is a two-stage workspace handover experiment. On the initial agent.input, dispatch exactly one job to coder: fix add in calc.js so node --test passes, preserving Checkpoint. On coder's task.result, review that exact result; if it succeeded, also dispatch exactly one job to reviewer in the same actions array, after the review action. The reviewer must inspect the actual calc.js and calc.test.js files in its mounted workspace, verify the fix, and report the exact Checkpoint value found there. Do not include or guess the Checkpoint value in the dispatch. On reviewer's task.result, review it and give a concise final reply. Never dispatch reviewer before the coder result or dispatch coder twice. Both workers have their own supplied profiles. Use only the structured runtime protocol.`,
 		},
 		"coder": {
-			ID: "coder", Model: "openai-codex/gpt-6-luna", Reasoning: "low", Tools: []string{"read", "edit", "write", "bash"}, Extensions: []string{},
+			ID: "coder", Model: "openai-codex/gpt-6-luna", Reasoning: "low", Tools: []string{"read", "edit", "write", "bash"}, Extensions: []string{}, Capabilities: []string{"Code changes"},
 			Prompt: `You are the coding worker. In your current workspace, inspect calc.js, fix add so node --test passes, and run that test with bash. Preserve the Checkpoint constant. Report the actual file change and test result in structured evidence. Do not ask another agent to edit for you.`,
 		},
 		"reviewer": {
-			ID: "reviewer", Model: "openai-codex/gpt-6-luna", Reasoning: "low", Tools: []string{"read"}, Extensions: []string{},
+			ID: "reviewer", Model: "openai-codex/gpt-6-luna", Reasoning: "low", Tools: []string{"read"}, Extensions: []string{}, Capabilities: []string{"Code review"},
 			Prompt: `You are an independent read-only reviewer. Use the read tool to inspect calc.js and calc.test.js in your current workspace. Verify that add satisfies the test. Quote the exact Checkpoint constant value in your evidence so the experiment can prove you saw the handed-over filesystem. Do not edit files or claim to have run a test.`,
 		},
 	}

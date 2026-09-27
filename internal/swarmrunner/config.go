@@ -45,8 +45,9 @@ type profile struct {
 	Bytes      []byte
 }
 type targetProfile struct {
-	AgentID string        `json:"agent_id"`
-	Profile swarm.Profile `json:"profile"`
+	AgentID      string        `json:"agent_id"`
+	Profile      swarm.Profile `json:"profile"`
+	Capabilities []string      `json:"capabilities"`
 }
 
 var errProfileDisabled = errors.New("profile_disabled")

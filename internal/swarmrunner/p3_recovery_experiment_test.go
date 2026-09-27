@@ -87,7 +87,7 @@ func p3OpenRunner(t *testing.T, c Config) *Runner {
 		if e != nil {
 			t.Fatal(e)
 		}
-		r.targets = append(r.targets, targetProfile{target.AgentID, p.wire()})
+		r.targets = append(r.targets, targetProfile{AgentID: target.AgentID, Profile: p.wire()})
 	}
 	return r
 }
@@ -131,7 +131,11 @@ func p3Scenario(t *testing.T, scenario string) {
 		if i == 0 {
 			role = "owner"
 		}
-		p := swarm.TextProfile{ID: id, Model: "fixture/deterministic", Reasoning: "minimal", Prompt: "P3 controlled crash fixture", Tools: []string{}, Extensions: []string{}}
+		capabilities := []string{}
+		if id != "owner" {
+			capabilities = []string{"Text work"}
+		}
+		p := swarm.TextProfile{ID: id, Model: "fixture/deterministic", Reasoning: "minimal", Prompt: "P3 controlled crash fixture", Tools: []string{}, Extensions: []string{}, Capabilities: capabilities}
 		b, e := json.Marshal(p)
 		p3Must(t, e)
 		path := filepath.Join(dir, id+".json")

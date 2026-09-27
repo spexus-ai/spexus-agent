@@ -174,6 +174,20 @@ func ValidateTextProfile(snapshot []byte) (TextProfile, error) {
 	return p, nil
 }
 
+func validCapabilities(id string, capabilities []string) bool {
+	if capabilities == nil || len(capabilities) > 12 || id == "orchestrator" && len(capabilities) != 0 || id != "orchestrator" && len(capabilities) == 0 {
+		return false
+	}
+	seen := make(map[string]bool, len(capabilities))
+	for _, capability := range capabilities {
+		if !safeText(capability, 160) || strings.TrimSpace(capability) != capability || strings.ContainsAny(capability, "\r\n\t") || seen[capability] {
+			return false
+		}
+		seen[capability] = true
+	}
+	return true
+}
+
 // ValidateWebTextProfile enforces the canonical, text-only v1 execution
 // snapshot independently of the backend that supplied it.
 func ValidateWebTextProfile(snapshot []byte) (TextProfile, error) {
@@ -181,7 +195,10 @@ func ValidateWebTextProfile(snapshot []byte) (TextProfile, error) {
 	if err != nil {
 		return p, err
 	}
-	if len(p.Tools) != 0 || len(p.Extensions) != 0 || strings.TrimSpace(p.Prompt) == "" {
+	if err := required(snapshot, "capabilities"); err != nil {
+		return p, err
+	}
+	if len(p.Tools) != 0 || len(p.Extensions) != 0 || strings.TrimSpace(p.Prompt) == "" || !validCapabilities(p.ID, p.Capabilities) {
 		return p, wireError(400, "unsafe_profile")
 	}
 	validReasoning := map[string]bool{"minimal": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true, "ultra": true}
@@ -435,7 +452,7 @@ func validateEnvelope(e Envelope) error {
 		if err := required(e.Payload, "goal", "scope", "expected_result", "context", "profile"); err != nil {
 			return err
 		}
-		if !safeText(p.Goal, 8192) || !safeText(p.Scope, 8192) || len(p.ExpectedResult) < 1 || len(p.ExpectedResult) > 16 || len(p.Context.Text) > 64*1024 || p.Context.Refs == nil || len(p.Context.Refs) > 32 || !safeText(p.Profile.ID, 128) || len(p.Profile.Revision) != 64 || p.Profile.Generation < 1 || !safeText(p.Profile.Model, 256) || !safeText(p.Profile.Reasoning, 32) {
+		if !safeText(p.Goal, 8192) || !safeText(p.Scope, 8192) || len(p.ExpectedResult) < 1 || len(p.ExpectedResult) > 16 || !safeText(p.Context.Text, 64*1024) || p.Context.Refs == nil || len(p.Context.Refs) > 32 || !safeText(p.Profile.ID, 128) || len(p.Profile.Revision) != 64 || p.Profile.Generation < 1 || !safeText(p.Profile.Model, 256) || !safeText(p.Profile.Reasoning, 32) {
 			return wireError(400, "invalid_dispatch")
 		}
 		for _, v := range p.ExpectedResult {

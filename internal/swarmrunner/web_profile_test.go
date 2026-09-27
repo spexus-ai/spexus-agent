@@ -196,7 +196,7 @@ func TestWebWorkerClaimRaceReportsEditOrDisable(t *testing.T) {
 }
 
 func TestWebActiveProfilePinsExactBytesAndAvailableModel(t *testing.T) {
-	p := swarm.TextProfile{ID: "orchestrator", Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Own the feature", Tools: []string{}, Extensions: []string{}}
+	p := swarm.TextProfile{ID: "orchestrator", Model: "openai-codex/gpt-6-luna", Reasoning: "minimal", Prompt: "Own the feature", Tools: []string{}, Extensions: []string{}, Capabilities: []string{}}
 	raw, err := json.Marshal(p)
 	if err != nil {
 		t.Fatal(err)
