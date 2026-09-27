@@ -610,6 +610,8 @@ func (r *Runner) owner(ctx context.Context, d swarm.Delivery) error {
 			correction := input + "\nYour preceding FINAL JSON was rejected before any actions were published: "
 			if summaryMissing {
 				correction += "The final reply was empty. This result was already accepted; return actions:[] and a concise, nonempty human-facing summary of the recorded results."
+			} else if strings.Contains(reviewErr.reason, "a review-only task.result turn needs a nonempty human-facing reply") {
+				correction += "The worker result is still pending review. Keep the review action for this event's job_id, attempt_id and message_id, and add a concise nonempty human-facing reply in the same FINAL JSON. actions:[] is invalid until the review is stored."
 			} else {
 				correction += reviewErr.Error() + ". Return a complete corrected FINAL JSON. For a pending task.result, review only this event's job_id, attempt_id and message_id; do not repeat reviews of earlier attempts. If retrying a failed result, reuse its job_id. If the trusted job shows this result was already accepted, return actions:[] and only summarize the recorded outcome."
 			}
