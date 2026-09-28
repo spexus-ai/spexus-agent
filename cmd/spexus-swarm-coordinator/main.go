@@ -218,6 +218,13 @@ func run(args []string) error {
 			}
 		}
 	}
+	if cfg.WireVersion != 2 && !*localFixture {
+		for _, f := range cfg.Features {
+			if _, err = store.SlackWatermark(ctx, f.FeatureID); err != nil {
+				return fmt.Errorf("initialize Slack catchup: %w", err)
+			}
+		}
+	}
 	var source *slack.SocketModeClient
 	var bridge *swarmslack.Bridge
 	if !*localFixture {
@@ -243,7 +250,7 @@ func run(args []string) error {
 			if cfg.WireVersion == 2 {
 				errorsCh <- bridge.RunHuman(ctx, source, auth.WorkspaceID)
 			} else {
-				errorsCh <- bridge.Run(ctx, source)
+				errorsCh <- bridge.RunLegacyDurable(ctx, source)
 			}
 		}()
 	}
