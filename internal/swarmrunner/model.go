@@ -15,18 +15,15 @@ import (
 	"github.com/spexus-ai/spexus-agent/internal/swarm"
 )
 
-type Model interface {
-	Run(context.Context, string, string) (string, bool, error)
-}
-type ActivityModel interface {
-	RunWithActivity(context.Context, string, string, func(string)) (string, bool, error)
+type LaunchModel interface {
+	RunWithLaunch(context.Context, string, string, func(string), func() error) (string, bool, error)
 }
 type piModel struct {
 	adapter   *piadapter.Adapter
 	workspace string
 }
 
-func newModel(c Config, p profile) (Model, error) {
+func newModel(c Config, p profile) (LaunchModel, error) {
 	provider, model, _ := strings.Cut(p.Model, "/")
 	constructor := piadapter.New
 	if c.Role == "owner" {
@@ -39,15 +36,15 @@ func newModel(c Config, p profile) (Model, error) {
 	return &piModel{a, c.Workspace}, nil
 }
 func (m *piModel) Close() error { return m.adapter.Close() }
-func (m *piModel) Run(ctx context.Context, key, input string) (string, bool, error) {
-	return m.RunWithActivity(ctx, key, input, nil)
-}
-func (m *piModel) RunWithActivity(ctx context.Context, key, input string, report func(string)) (string, bool, error) {
+func (m *piModel) RunWithLaunch(ctx context.Context, key, input string, report func(string), launched func() error) (string, bool, error) {
 	s, e := m.adapter.StartPrompt(ctx, harness.SessionRequest{ProjectPath: m.workspace, ChannelID: "swarm", ThreadTS: key, Prompt: input})
 	if e != nil {
 		return "", false, e
 	}
 	defer s.Close()
+	if err := launched(); err != nil {
+		return "", false, err
+	}
 	var final string
 	cancelled := false
 	lastPhase := ""
@@ -285,6 +282,9 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 	if o.Actions == nil || len(o.Actions) > 8 || len(o.Reply) > 16*1024 {
 		return o, nil, errors.New("invalid owner output bounds")
 	}
+	if r.cfg.wireVersion() == 1 && d.Type == "task.result" && len(o.Actions) == 1 && o.Actions[0].Kind == "review" && strings.TrimSpace(o.Reply) == "" {
+		return o, nil, &reviewPreflightError{reason: "a review-only task.result turn needs a nonempty human-facing reply; report the verified result and any remaining limitation"}
+	}
 	if d.Type == "task.result" {
 		// Reject malformed review evidence before any dependent read, as with
 		// ordinary owner action validation.
@@ -307,15 +307,29 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 		}
 		if !reviewedTrigger(d, v) {
 			for _, attempt := range v.Attempts {
-				if attempt.AttemptID != d.AttemptID || attempt.ResultMessageID != d.MessageID || attempt.Result == nil || attempt.Result.Outcome != "succeeded" || attempt.Review != "pending" {
+				if attempt.AttemptID != d.AttemptID || attempt.ResultMessageID != d.MessageID || attempt.Result == nil || attempt.Review != "pending" {
 					continue
 				}
 				containsReview := false
 				for _, a := range o.Actions {
 					containsReview = containsReview || a.Kind == "review"
 				}
-				if !containsReview {
+				if attempt.Result.Outcome == "succeeded" && !containsReview {
 					return o, nil, &reviewPreflightError{reason: "a successful task.result needs an explicit review action before a reply or further dispatch"}
+				}
+				if attempt.Result.Outcome == "failed" && !containsReview {
+					for _, a := range o.Actions {
+						if a.Kind != "dispatch" {
+							continue
+						}
+						var retry dispatchAction
+						if err := decode(a.Data, &retry); err != nil {
+							return o, nil, err
+						}
+						if retry.JobID != d.JobID {
+							return o, nil, &reviewPreflightError{reason: "retry a failed task.result with the same job_id, or review the failure before dispatching a separate job"}
+						}
+					}
 				}
 			}
 		}
@@ -340,7 +354,7 @@ func (r *Runner) ownerActions(d swarm.Delivery, turn, raw string) (ownerOutput, 
 					target = &r.targets[i]
 				}
 			}
-			if target == nil || target.Profile != x.Profile {
+			if target == nil || r.targetProfile(x.WorkerAgentID, x.Profile) != nil {
 				return o, nil, errors.New("profile_unavailable")
 			}
 			if x.AcceptBy == "" {
@@ -517,12 +531,26 @@ func plannedState(dep swarm.Dependency, planned map[string]string) string {
 	return dep.State
 }
 func (r *Runner) targetProfile(agent string, profile swarm.Profile) error {
-	for _, target := range r.targets {
-		if target.AgentID == agent && target.Profile == profile {
-			return nil
+	bound := false
+	for _, target := range r.cfg.Targets {
+		if target.AgentID == agent && target.ProfileID == profile.ID {
+			bound = true
+			break
 		}
 	}
-	return errors.New("profile_unavailable")
+	if !bound {
+		return errors.New("profile_unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	active, err := r.activeProfile(ctx, profile.ID)
+	if err != nil {
+		return err
+	}
+	if active.wire() != profile {
+		return errors.New("profile_changed_before_dispatch")
+	}
+	return nil
 }
 func (r *Runner) actionDependency(d swarm.Delivery, id string) (swarm.Dependency, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -15,7 +15,7 @@ func TestFinalReviewWithoutReplyQueuesOneSummaryOnlyTurn(t *testing.T) {
 	f.finish(initial, "", []ActionReceipt{{MessageID: a.MessageID, Status: "stored"}, {MessageID: b.MessageID, Status: "stored"}}, 201)
 
 	reviewResult := func(dispatch Envelope) (int64, string, string) {
-		accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.s.profiles[dispatch.ToAgentID].Revision}, dispatch.MessageID)
+		accepted := f.event(dispatch, "task.accepted", AcceptedPayload{DispatchMessageID: dispatch.MessageID, ProfileRevision: f.profiles[dispatch.ToAgentID].Revision}, dispatch.MessageID)
 		accepted.ProtocolVersion = 2
 		f.post(dispatch.ToAgentID, accepted, 201)
 		started := f.event(dispatch, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)

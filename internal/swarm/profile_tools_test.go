@@ -6,7 +6,7 @@ import (
 )
 
 func TestTextProfileToolAllowlist(t *testing.T) {
-	profile := TextProfile{ID: "coder", Model: "provider/model", Reasoning: "low", Prompt: "Work in the mounted workspace", Tools: []string{"read", "edit", "write", "bash"}, Extensions: []string{}}
+	profile := TextProfile{ID: "coder", Model: "provider/model", Reasoning: "low", Prompt: "Work in the mounted workspace", Tools: []string{"read", "edit", "write", "bash"}, Extensions: []string{}, Capabilities: []string{"Code changes"}}
 	encode := func(p TextProfile) []byte {
 		t.Helper()
 		b, err := json.Marshal(p)

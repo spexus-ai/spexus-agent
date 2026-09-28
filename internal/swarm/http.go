@@ -87,6 +87,33 @@ func (s *Store) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	status := 200
 	var out any
 	switch {
+	case strings.HasPrefix(path, "/agent-profiles/"):
+		var id, suffix string
+		id, suffix, err = profileIDFromPath(path)
+		if err != nil {
+			err = wireError(404, "profile_not_found")
+			break
+		}
+		switch {
+		case suffix == "active" && r.Method == http.MethodGet:
+			out, err = s.profileFor(ctx, p, id)
+		case suffix == "launch-claims" && r.Method == http.MethodPost:
+			var v LaunchClaimRequest
+			err = body(r, &v, "schema_version", "execution_ref", "expected_generation", "expected_revision")
+			if err == nil {
+				out, err = s.claimProfile(ctx, p, id, v)
+				status = 201
+			}
+		case suffix == "observations" && r.Method == http.MethodPost:
+			var v LaunchObservationRequest
+			err = body(r, &v, "schema_version", "execution_ref", "claim_id", "revision", "outcome")
+			if err == nil {
+				out, err = s.observeProfile(ctx, p, id, v)
+				status = 201
+			}
+		default:
+			err = wireError(404, "not_found")
+		}
 	case path == "/agents/self/heartbeat" && r.Method == http.MethodPost:
 		var v HeartbeatRequest
 		err = body(r, &v, "instance_id", "active_attempt_id", "active_owner_turn_id")
@@ -153,12 +180,16 @@ func (s *Store) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/owner-turns/"):
 		tail := strings.TrimPrefix(path, "/owner-turns/")
 		id := strings.TrimSuffix(tail, "/finish")
+		id = strings.TrimSuffix(id, "/profile-requeue")
 		if !uuid(id) {
 			err = wireError(400, "invalid_turn")
 			break
 		}
 		if tail == id && r.Method == http.MethodGet {
 			out, err = s.ownerTurn(ctx, p, id)
+		} else if tail == id+"/profile-requeue" && r.Method == http.MethodPost {
+			out, err = s.requeueOwnerPrelaunch(ctx, p, id)
+			status = 201
 		} else if tail == id+"/finish" && r.Method == http.MethodPost {
 			var v OwnerFinishRequest
 			err = body(r, &v, "outcome", "reply", "actions", "error", "observation")

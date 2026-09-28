@@ -87,7 +87,7 @@ func p3OpenRunner(t *testing.T, c Config) *Runner {
 		if e != nil {
 			t.Fatal(e)
 		}
-		r.targets = append(r.targets, targetProfile{target.AgentID, p.wire()})
+		r.targets = append(r.targets, targetProfile{AgentID: target.AgentID, Profile: p.wire()})
 	}
 	return r
 }
@@ -131,7 +131,11 @@ func p3Scenario(t *testing.T, scenario string) {
 		if i == 0 {
 			role = "owner"
 		}
-		p := swarm.TextProfile{ID: id, Model: "fixture/deterministic", Reasoning: "minimal", Prompt: "P3 controlled crash fixture", Tools: []string{}, Extensions: []string{}}
+		capabilities := []string{}
+		if id != "owner" {
+			capabilities = []string{"Text work"}
+		}
+		p := swarm.TextProfile{ID: id, Model: "fixture/deterministic", Reasoning: "minimal", Prompt: "P3 controlled crash fixture", Tools: []string{}, Extensions: []string{}, Capabilities: capabilities}
 		b, e := json.Marshal(p)
 		p3Must(t, e)
 		path := filepath.Join(dir, id+".json")
@@ -184,7 +188,7 @@ func p3Scenario(t *testing.T, scenario string) {
 	p3Must(t, os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600))
 	token := filepath.Join(dir, "fixture-token")
 	p3Must(t, os.WriteFile(token, []byte("test-token-owner"), 0600))
-	c := Config{CoordinatorURL: server.URL, CAFile: ca, CredentialFile: token, TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, AgentID: "owner", InstanceID: swarm.NewID(), Role: "owner", ProfileFile: profiles[0], StateDirectory: filepath.Join(dir, "runner"), Workspace: filepath.Join(dir, "workspace"), Targets: []Target{{"worker-a", profiles[1]}, {"worker-b", profiles[2]}}}
+	c := Config{CoordinatorURL: server.URL, CAFile: ca, CredentialFile: token, TenantID: cfg.TenantID, ProjectID: cfg.ProjectID, AgentID: "owner", InstanceID: swarm.NewID(), Role: "owner", ProfileFile: profiles[0], StateDirectory: filepath.Join(dir, "runner"), Workspace: filepath.Join(dir, "workspace"), Targets: []Target{{AgentID: "worker-a", ProfileFile: profiles[1]}, {AgentID: "worker-b", ProfileFile: profiles[2]}}}
 	p3Must(t, os.MkdirAll(c.Workspace, 0700))
 	configPath := filepath.Join(dir, "runner-config.json")
 	p3Write(t, configPath, c)

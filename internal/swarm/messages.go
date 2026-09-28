@@ -228,7 +228,13 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 		if err = tx.QueryRowContext(ctx, "SELECT profile_id FROM agents WHERE agent_id=?", e.ToAgentID).Scan(&profileID); err != nil {
 			return r, false, err
 		}
-		if profileID != d.Profile.ID || s.profiles[profileID] != d.Profile {
+		configured, profileErr := s.backendProfile(ctx, profileID)
+		if profileErr != nil || !configured.Enabled || profileID != d.Profile.ID || configured.ActiveRevision != d.Profile.Revision || configured.Generation != d.Profile.Generation {
+			return r, false, wireError(422, "profile_unavailable")
+		}
+		var activeText TextProfile
+		_ = json.Unmarshal(configured.SnapshotJSON, &activeText)
+		if activeText.Model != d.Profile.Model || activeText.Reasoning != d.Profile.Reasoning {
 			return r, false, wireError(422, "profile_unavailable")
 		}
 		if d.AcceptBy == "" {
@@ -299,7 +305,13 @@ func (s *Store) applyMessage(ctx context.Context, tx *sql.Tx, p Principal, e Env
 		if err = tx.QueryRowContext(ctx, "SELECT profile_id FROM agents WHERE agent_id=?", e.ToAgentID).Scan(&profileID); err != nil {
 			return r, false, err
 		}
-		if profileID != p.Dispatch.Profile.ID || s.profiles[profileID] != p.Dispatch.Profile {
+		configured, profileErr := s.backendProfile(ctx, profileID)
+		if profileErr != nil || !configured.Enabled || profileID != p.Dispatch.Profile.ID || configured.ActiveRevision != p.Dispatch.Profile.Revision || configured.Generation != p.Dispatch.Profile.Generation {
+			return r, false, wireError(422, "profile_unavailable")
+		}
+		var activeText TextProfile
+		_ = json.Unmarshal(configured.SnapshotJSON, &activeText)
+		if activeText.Model != p.Dispatch.Profile.Model || activeText.Reasoning != p.Dispatch.Profile.Reasoning {
 			return r, false, wireError(422, "profile_unavailable")
 		}
 		if p.Dispatch.AcceptBy == "" {

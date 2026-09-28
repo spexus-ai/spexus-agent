@@ -284,10 +284,10 @@ func (s *Store) SettleSlackSource(ctx context.Context, in SlackSource) error {
 	})
 }
 
-// SlackWatermark creates the first cutover at the moment wire v2 starts. P2
-// thread history before that point is never interpreted as a new command.
+// SlackWatermark creates the first cutover when durable Slack ingress starts.
+// Earlier thread history is not interpreted as a new command.
 func (s *Store) SlackWatermark(ctx context.Context, featureID string) (string, error) {
-	if s.cfg.WireVersion != 2 || !uuid(featureID) {
+	if !uuid(featureID) {
 		return "", wireError(400, "invalid_feature")
 	}
 	var watermark string

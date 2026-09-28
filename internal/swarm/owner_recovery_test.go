@@ -23,7 +23,7 @@ func TestOfflineOwnerResultRedeliveryIsScopedAndIdempotent(t *testing.T) {
 	f.finish(initial, "", []ActionReceipt{{MessageID: a.MessageID, Status: "stored"}, {MessageID: b.MessageID, Status: "stored"}}, 201)
 	var ownerAcks []int64
 	startWorker := func(d Envelope) Envelope {
-		accepted := f.event(d, "task.accepted", AcceptedPayload{DispatchMessageID: d.MessageID, ProfileRevision: f.s.profiles[d.ToAgentID].Revision}, d.MessageID)
+		accepted := f.event(d, "task.accepted", AcceptedPayload{DispatchMessageID: d.MessageID, ProfileRevision: f.profiles[d.ToAgentID].Revision}, d.MessageID)
 		accepted.ProtocolVersion = 2
 		ownerAcks = append(ownerAcks, f.post(d.ToAgentID, accepted, 201).MailboxSeq)
 		started := f.event(d, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)
@@ -158,7 +158,7 @@ func TestOfflineOwnerSummaryFailureRedeliversAcceptedResultOnce(t *testing.T) {
 	d.ProtocolVersion = 2
 	f.post("orchestrator", d, 201)
 	f.finish(initial, "", []ActionReceipt{{MessageID: d.MessageID, Status: "stored"}}, 201)
-	accepted := f.event(d, "task.accepted", AcceptedPayload{DispatchMessageID: d.MessageID, ProfileRevision: f.s.profiles[d.ToAgentID].Revision}, d.MessageID)
+	accepted := f.event(d, "task.accepted", AcceptedPayload{DispatchMessageID: d.MessageID, ProfileRevision: f.profiles[d.ToAgentID].Revision}, d.MessageID)
 	accepted.ProtocolVersion = 2
 	f.post("worker-a", accepted, 201)
 	started := f.event(d, "task.started", StartedPayload{AcceptedMessageID: accepted.MessageID}, accepted.MessageID)

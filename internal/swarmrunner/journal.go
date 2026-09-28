@@ -99,6 +99,17 @@ func OpenJournal(dir string, version ...int) (*Journal, error) {
 		j.Close()
 		return nil, e
 	}
+	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS profile_launches (
+		seq INTEGER PRIMARY KEY REFERENCES inbox(seq), profile_id TEXT NOT NULL,
+		ref_type TEXT NOT NULL, ref_id TEXT NOT NULL, claim_id TEXT NOT NULL,
+		generation INTEGER NOT NULL, revision TEXT NOT NULL, snapshot BLOB NOT NULL,
+		model TEXT NOT NULL, reasoning TEXT NOT NULL, source TEXT NOT NULL CHECK(source='web'), state TEXT NOT NULL,
+		launched_at TEXT NOT NULL DEFAULT '',
+		UNIQUE(ref_type,ref_id));`)
+	if e != nil {
+		j.Close()
+		return nil, e
+	}
 	return j, nil
 }
 func (j *Journal) Close() error {
@@ -194,8 +205,107 @@ func (j *Journal) starting(seq int64, turn string) error {
 	return e
 }
 func (j *Journal) launch(seq int64) error {
-	_, e := j.db.Exec(`UPDATE inbox SET launches=launches+1 WHERE seq=? AND state='starting'`, seq)
-	return e
+	tx, e := j.db.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	var state string
+	if e = tx.QueryRow(`SELECT state FROM profile_launches WHERE seq=?`, seq).Scan(&state); e != nil || state != "claimed" {
+		return errors.New("launch requires a pinned claim")
+	}
+	var n int
+	if e = tx.QueryRow(`SELECT launches FROM inbox WHERE seq=? AND state='starting'`, seq).Scan(&n); e != nil || n != 0 {
+		return errors.New("duplicate or unknown launch")
+	}
+	if _, e = tx.Exec(`UPDATE inbox SET launches=1 WHERE seq=?`, seq); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(`UPDATE profile_launches SET state='launching' WHERE seq=?`, seq); e != nil {
+		return e
+	}
+	return tx.Commit()
+}
+
+// A completed, observed first prompt may need one strict-output correction.
+// This transition is called only in the same live execution; recovery never
+// schedules a second prompt. A crash while it is launching remains unknown.
+func (j *Journal) correctionLaunch(seq int64) error {
+	tx, err := j.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	r, err := tx.Exec(`UPDATE profile_launches SET state='launching' WHERE seq=? AND state='observed'`, seq)
+	if err != nil {
+		return err
+	}
+	n, err := r.RowsAffected()
+	if err != nil || n != 1 {
+		return errors.New("correction requires observed first launch")
+	}
+	r, err = tx.Exec(`UPDATE inbox SET launches=2 WHERE seq=? AND state='starting' AND launches=1`, seq)
+	if err != nil {
+		return err
+	}
+	n, err = r.RowsAffected()
+	if err != nil || n != 1 {
+		return errors.New("duplicate correction launch")
+	}
+	return tx.Commit()
+}
+func (j *Journal) pin(seq int64, p profile, claim swarm.LaunchClaim, ref swarm.ExecutionRef) error {
+	refType, refID := "worker_attempt", ref.WorkerAttemptID
+	if ref.OwnerTurnID != "" {
+		refType, refID = "owner_turn", ref.OwnerTurnID
+	}
+	_, err := j.db.Exec(`INSERT INTO profile_launches(seq,profile_id,ref_type,ref_id,claim_id,generation,revision,snapshot,model,reasoning,source,state)
+		VALUES(?,?,?,?,?,?,?,?,?,?,'web','claimed')`, seq, p.ID, refType, refID, claim.ClaimID, p.Generation, p.Revision, p.Bytes, p.Model, p.Reasoning)
+	return err
+}
+func (j *Journal) observed(seq int64, claimID string) error {
+	r, err := j.db.Exec(`UPDATE profile_launches SET state='observed' WHERE seq=? AND claim_id=? AND state='launched_unobserved'`, seq, claimID)
+	if err != nil {
+		return err
+	}
+	n, err := r.RowsAffected()
+	if err == nil && n != 1 {
+		return errors.New("profile observation has no launching claim")
+	}
+	return err
+}
+func (j *Journal) physicalLaunch(seq int64, claimID string) error {
+	r, err := j.db.Exec(`UPDATE profile_launches SET state='launched_unobserved',launched_at=? WHERE seq=? AND claim_id=? AND state='launching'`, time.Now().UTC().Format(time.RFC3339Nano), seq, claimID)
+	if err != nil {
+		return err
+	}
+	n, err := r.RowsAffected()
+	if err == nil && n != 1 {
+		return errors.New("physical launch has no starting claim")
+	}
+	return err
+}
+
+type pendingProfileObservation struct {
+	Seq                                          int64
+	ProfileID, RefType, RefID, ClaimID, Revision string
+}
+
+func (j *Journal) pendingProfileObservations() ([]pendingProfileObservation, error) {
+	rows, err := j.db.Query(`SELECT seq,profile_id,ref_type,ref_id,claim_id,revision FROM profile_launches WHERE state='launched_unobserved' ORDER BY seq`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []pendingProfileObservation
+	for rows.Next() {
+		var p pendingProfileObservation
+		if err := rows.Scan(&p.Seq, &p.ProfileID, &p.RefType, &p.RefID, &p.ClaimID, &p.Revision); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 func (j *Journal) modelOutput(seq int64, raw string) error {
 	if len(raw) > swarm.MaxEnvelopeBytes {

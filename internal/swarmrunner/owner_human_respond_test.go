@@ -12,6 +12,7 @@ func TestOwnerHumanResponseReferencesTrustedSlackSource(t *testing.T) {
 	r, _ := runnerFixture(t, http.NotFoundHandler())
 	r.cfg.WireVersion = 2
 	r.cfg.Role = "owner"
+	r.cfg.ProfileID = "orchestrator"
 	r.cfg.AgentID = "orchestrator"
 	d := dispatchFixture(r)
 	d.ProtocolVersion = 2
@@ -58,6 +59,7 @@ func TestOwnerHumanButtonDecisionUsesOnlyTrustedOption(t *testing.T) {
 	r, _ := runnerFixture(t, http.NotFoundHandler())
 	r.cfg.WireVersion = 2
 	r.cfg.Role = "owner"
+	r.cfg.ProfileID = "orchestrator"
 	r.cfg.AgentID = "orchestrator"
 	d := dispatchFixture(r)
 	d.ProtocolVersion, d.Type = 2, "agent.input"
